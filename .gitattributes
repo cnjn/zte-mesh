@@ -1,0 +1,15 @@
+# This repo is built and tested on Linux (and in GitHub Actions on ubuntu
+# runners). Shell scripts under openwrt/ are installed verbatim onto the router
+# and executed by BusyBox sh, so a stray CR would break `#!/bin/sh` and string
+# comparisons. Force LF for all text files, keep the committed runtime tarball
+# (and any other binary) out of the CRLF conversion entirely.
+* text=auto eol=lf
+
+*.tar.gz binary
+*.apk binary
+*.so binary
+*.bin binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary

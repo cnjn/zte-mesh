@@ -1,0 +1,240 @@
+name: Build lab tools
+
+# Host-architecture pieces the lab VM needs that a router package cannot carry:
+#
+#  * ns-run  - the sandbox launcher. The package ships the AArch64 build; the
+#              lab VM is x86_64, so it needs its own. Also proves the launcher
+#              still compiles for a foreign architecture (plain POSIX+rtnetlink).
+#  * libzte_mesh_shim.so - the LD_PRELOAD shim for the vendor daemon. It has to
+#              be built against the *factory* glibc (2.26) that sits in the
+#              runtime tarball, so it is linked with -nostdlib against that
+#              rootfs instead of the toolchain's own libc.
+#  * db-engine-probe - the ARM32 host side of the sandbox (parse_config, the
+#              service loop, controller-run). The one inside the runtime tarball
+#              was frozen at the pack date, so a source change that is not
+#              recompiled here keeps the device on the old behaviour while the
+#              config it is fed already uses the new keys.
+#
+# Everything lands in the runner's prebuilt/ and is published only as the
+# "lab-tools" artifact -- nothing is committed back (prebuilt/ is git-ignored).
+# The artifact is uploaded even when a build fails, so the *-build.log files are
+# always there to read; the job conclusion still reports the truth.
+# To ship a rebuilt db-engine-probe / shim, unpack the artifact into prebuilt/ and
+# run openwrt/repack-runtime.py (docs/DEVELOPMENT.md section 10).
+#
+# Nothing here is part of a router image.
+
+# Manual only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lab-tools
+  cancel-in-progress: true
+
+jobs:
+  lab-tools:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchains
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            musl-tools gcc-arm-linux-gnueabi libc6-dev-armel-cross \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross libc6-arm64-cross file
+          # The cross libc headers are what the aarch64 compiler searches first;
+          # without them it falls through to the host /usr/include and dies on
+          # bits/wordsize.h (32-bit host vs 64-bit target).
+          ls -d /usr/aarch64-linux-gnu/include >/dev/null || {
+            echo "no aarch64 libc headers installed" >&2; exit 1; }
+
+      - name: Build ns-run (aarch64, for the router-side lab)
+        id: nsrunarm
+        run: |
+          set +e
+          mkdir -p prebuilt
+          LOG=prebuilt/build-aarch64.log
+          : > "$LOG"
+          # Same rule again, this time for the router's own architecture: an
+          # ImmortalWrt aarch64 image has no compiler either, and its kernel has
+          # no CONFIG_COMPAT, so the AArch64 launcher needs the emulator switch.
+          {
+            echo "compiler: $(command -v aarch64-linux-gnu-gcc)"
+            echo "sysroot: $(aarch64-linux-gnu-gcc -print-sysroot)"
+            ls /usr/aarch64-linux-gnu/include 2>/dev/null | head -5
+          } >>"$LOG" 2>&1
+          rc=1
+          # Debian/Ubuntu cross gcc sometimes searches the host /usr/include first
+          # (mixed 32/64-bit glibc headers, "bits/wordsize.h not found"), so try
+          # the explicit sysroots before giving up on the default search path.
+          for opt in "--sysroot=/" "--sysroot=/usr/aarch64-linux-gnu" ""; do
+            echo "=== aarch64-linux-gnu-gcc $opt ===" >>"$LOG"
+            aarch64-linux-gnu-gcc $opt -O2 -std=c11 -static -Wall -Wextra -Werror \
+              -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
+              ns-run.c controller-net.c -o prebuilt/ns-run-aarch64 >>"$LOG" 2>&1 && { rc=0; break; }
+          done
+          echo "rc=$rc" >>"$LOG"
+          if [ $rc -eq 0 ]; then
+            file prebuilt/ns-run-aarch64 >>"$LOG" 2>&1
+            sha256sum prebuilt/ns-run-aarch64 > prebuilt/ns-run-aarch64.sha256
+          fi
+          cat "$LOG"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Build ns-run (x86_64)
+        id: nsrun
+        run: |
+          set +e
+          mkdir -p prebuilt
+          LOG=prebuilt/build.log
+          : > "$LOG"
+          # Same sources and flags as the Makefile's ns-run rule; only
+          # $(ROUTERCC) changes. Ubuntu's gcc predefines _FORTIFY_SOURCE, which
+          # turns the ignored write() return in controller-net.c into -Werror.
+          FLAGS="-O2 -std=c11 -static -Wall -Wextra -Werror -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+          rc=1
+          for cc in "musl-gcc" "gcc"; do
+            echo "=== ns-run with $cc ===" >>"$LOG"
+            $cc $FLAGS ns-run.c controller-net.c -o prebuilt/ns-run-x86_64 >>"$LOG" 2>&1 \
+              && { echo "built with $cc" >>"$LOG"; rc=0; break; }
+            echo "failed with $cc" >>"$LOG"
+          done
+          if [ $rc -eq 0 ]; then
+            file prebuilt/ns-run-x86_64 >>"$LOG" 2>&1
+            sha256sum prebuilt/ns-run-x86_64 > prebuilt/ns-run-x86_64.sha256
+          fi
+          cat "$LOG"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Build libzte_mesh_shim.so (ARM32, vendor glibc)
+        id: shim
+        run: |
+          set +e
+          LOG=prebuilt/shim-build.log
+          : > "$LOG"
+          mkdir -p build/runtime
+          tar -xzf openwrt/zte-mesh/zte-mesh-runtime.tar.gz -C build/runtime >>"$LOG" 2>&1
+          L=build/runtime/root/lib
+          # The Makefile's libzte_mesh_shim.so rule, with $(LIBDIR) pointing at
+          # the factory libraries from the runtime tarball: -nostdlib keeps the
+          # host toolchain's newer libc out of the picture, so the shim needs
+          # nothing newer than the gLibc 2.26 the daemon actually links against.
+          arm-linux-gnueabi-gcc -O2 -std=c11 -Wall -Wextra -Werror -fPIC -fvisibility=hidden \
+            -fno-unwind-tables -fno-asynchronous-unwind-tables \
+            -march=armv7-a -mfloat-abi=soft -shared -nostdlib \
+            -Wl,-z,defs -Wl,-soname,libzte_mesh_shim.so \
+            -L"$L" -Wl,-rpath-link,"$L" shim.c \
+            -l:libdl.so.2 -l:libc.so.6 -l:ld-linux.so.3 -lgcc \
+            -o prebuilt/libzte_mesh_shim.so >>"$LOG" 2>&1
+          rc=$?
+          echo "rc=$rc" >>"$LOG"
+          if [ $rc -eq 0 ]; then
+            file prebuilt/libzte_mesh_shim.so >>"$LOG" 2>&1
+            ls -l prebuilt/libzte_mesh_shim.so >>"$LOG"
+            sha256sum prebuilt/libzte_mesh_shim.so > prebuilt/libzte_mesh_shim.so.sha256
+          fi
+          cat "$LOG"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Build db-engine-probe (ARM32, vendor glibc)
+        id: probe
+        run: |
+          set +e
+          LOG=prebuilt/probe-build.log
+          : > "$LOG"
+          # The header set matters as much as the libraries here: the probe is
+          # linked with -nostdlib against the factory glibc 2.26 in the runtime
+          # tarball, so it must not reference symbols that only exist in a newer
+          # libc. Compiling on the runner's glibc 2.39 does exactly that --
+          # time()/clock_gettime()/ioctl() get redirected to __time64,
+          # __clock_gettime64 and __ioctl_time64, and sscanf() to __isoc23_sscanf,
+          # none of which glibc 2.26 defines (link error "undefined reference to
+          # __time64"; __isoc23_sscanf arrived in 2.38). bookworm's glibc 2.36
+          # predates the C23 redirection and, with _TIME_BITS pinned to 32, keeps
+          # the 32-bit time entry points the factory libc actually exports.
+          docker run --rm -e HOME=/tmp \
+            -v "$PWD:/src" -w /src debian:bookworm \
+            sh -c 'apt-get update -qq >/dev/null &&
+                   apt-get install -y --no-install-recommends \
+                     gcc-arm-linux-gnueabi libc6-dev-armel-cross make python3 >/dev/null &&
+                   arm-linux-gnueabi-gcc --version | head -1 &&
+                   ldd --version | head -1 &&
+                   python3 tools/build/bootstrap-out.py &&
+                   make out/db-engine-probe ARTIFACTS=out \
+                     ARMCC="arm-linux-gnueabi-gcc -D_TIME_BITS=32"' >>"$LOG" 2>&1
+          rc=$?
+          # The container writes out/ as root; only the copied binary has to stay
+          # writable by the runner (the commit step adds it).
+          sudo chown -R "$(id -u):$(id -g)" out 2>/dev/null
+          echo "rc=$rc" >>"$LOG"
+          if [ $rc -eq 0 ]; then
+            cp out/db-engine-probe prebuilt/db-engine-probe
+            file prebuilt/db-engine-probe >>"$LOG" 2>&1
+            ls -l prebuilt/db-engine-probe >>"$LOG"
+            # The one property that matters for this binary: no symbol newer than
+            # the factory glibc may have leaked in through the host headers.
+            arm-linux-gnueabi-nm -u prebuilt/db-engine-probe 2>/dev/null | grep -E '__time64|__clock_gettime64|__ioctl_time64|__isoc23_' >>"$LOG" 2>&1 &&
+              { echo "new-glibc symbols leaked into the link" >>"$LOG"; rc=3; }
+            sha256sum prebuilt/db-engine-probe > prebuilt/db-engine-probe.sha256
+          fi
+          cat "$LOG"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Build libzte_agent_mm.so (ARM32, vendor glibc)
+        id: agentmm
+        run: |
+          set +e
+          LOG=prebuilt/agent-mm-build.log
+          : > "$LOG"
+          # Same story as the shim, and the same reason it lives here: this is the
+          # library that turns the agent's "the row is written but the configuration
+          # manager is not there" (-3) into success, which is what lets an M2 finish
+          # instead of being retried. It was in spawn_daemon()'s LD_PRELOAD all along
+          # and simply never got built, so every enrollment on a device without cspd
+          # ended in "config failed" and another M1.
+          mkdir -p build/runtime
+          tar -xzf openwrt/zte-mesh/zte-mesh-runtime.tar.gz -C build/runtime >>"$LOG" 2>&1
+          L=build/runtime/root/lib
+          arm-linux-gnueabi-gcc -O2 -std=c11 -Wall -Wextra -Werror -fPIC -fvisibility=hidden \
+            -fno-unwind-tables -fno-asynchronous-unwind-tables \
+            -march=armv7-a -mfloat-abi=soft -shared -nostdlib \
+            -Wl,-z,defs -Wl,-soname,libzte_agent_mm.so \
+            -L"$L" -Wl,-rpath-link,"$L" agent-mm.c \
+            -l:libdl.so.2 -l:libc.so.6 -l:ld-linux.so.3 -lgcc \
+            -o prebuilt/libzte_agent_mm.so >>"$LOG" 2>&1
+          rc=$?
+          echo "rc=$rc" >>"$LOG"
+          if [ $rc -eq 0 ]; then
+            file prebuilt/libzte_agent_mm.so >>"$LOG" 2>&1
+            ls -l prebuilt/libzte_agent_mm.so >>"$LOG"
+            # The two interposed setters must be the only exported symbols, or the
+            # daemon would resolve something else through this library by accident.
+            arm-linux-gnueabi-nm -D --defined-only prebuilt/libzte_agent_mm.so >>"$LOG" 2>&1
+            sha256sum prebuilt/libzte_agent_mm.so > prebuilt/libzte_agent_mm.so.sha256
+          fi
+          cat "$LOG"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Upload as artifact (logs included, also on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-tools
+          path: prebuilt/*
+          if-no-files-found: error
+
+      - name: Fail if a build did not produce a binary
+        if: steps.nsrun.outputs.rc != '0' || steps.nsrunarm.outputs.rc != '0' || steps.shim.outputs.rc != '0' || steps.probe.outputs.rc != '0' || steps.agentmm.outputs.rc != '0'
+        run: |
+          echo "see the *-build.log files in the lab-tools artifact" >&2
+          exit 1
