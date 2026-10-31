@@ -116,18 +116,39 @@ return view.extend({
 				_('The ZTE Mesh runtime is not installed on this router.'));
 		}
 
+		var child = info.role === 'slave';
+		var local = info.role === 'main';   /* controller that also puts the profile on the air (rpcd reports "auto" as this) */
 		var running = info.running && state && state.running && !stale;
-		row(_('Controller'), running
+		row(child ? _('Child router') : local ? _('Main router') : _('Controller'), running
 			? badge(_('Running'), '#46a546')
 			: badge(info.running ? _('Starting or stalled') : _('Stopped'), '#b94a48'));
+		if (child)
+			row(_('Device role'), _('Child router, managed by the controller'));
+		else if (!local)
+			row(_('Device role'), _('Controller only: this router\'s own radios are not managed here'));
 
 		if (state && state.running) {
 			row(_('Controller address (AL MAC)'), state.al_mac || '-');
-			row(_('Self-organizing network'), uci.get('zte_mesh', 'main', 'mesh_v2') === '1'
-				? _('On (ZTE enhanced)') : _('Off (ZTE compatible)'));
+			if (!child) {
+				row(_('Self-organizing network'), uci.get('zte_mesh', 'main', 'mesh_v2') === '1'
+					? _('On (ZTE enhanced)') : _('Off (ZTE compatible)'));
+				row(_('Wi-Fi updates sent'), String(state.config_applied));
+			}
 			row(_('Wired port'), info.attached ? badge(_('Attached to the LAN bridge'), '#46a546')
 			                                   : badge(_('Not attached'), '#b94a48'));
-			row(_('Wi-Fi updates sent'), String(state.config_applied));
+		}
+
+		/* Both roles that put a profile into /etc/config/wireless report it: a child gets the profile from the
+		 * controller, a main router from its own configuration. wlan-sync runs outside the sandbox, so its last run is
+		 * reported from the file it leaves behind, not from the service state. */
+		if ((child || local) && info.sync) {
+			var sy = info.sync, syAge = sy.epoch > 0 ? Math.max(0, Math.round(Date.now() / 1000 - sy.epoch)) : -1;
+			row(_('Wi-Fi synchronisation'), [
+				sy.result === 'ok' ? badge(_('Applied'), '#46a546') : badge(_('Failed'), '#b94a48'),
+				syAge >= 0 ? ' ' + _('%d s ago').format(syAge) : '',
+				sy.bands ? ' · ' + sy.bands : '',
+				sy.message ? ' · ' + sy.message : ''
+			]);
 		}
 
 		if (state && state.config_error)
@@ -246,15 +267,33 @@ return view.extend({
 			});
 		}, 5);
 
-		var m = new form.Map('zte_mesh', _('ZTE Mesh'),
-			_('Manage ZTE child routers over the wired LAN. This router acts as the mesh controller; the child routers receive the Wi-Fi profile below.'));
+		/* The role decides which half of this page applies. A child takes its Wi-Fi profile, roaming thresholds and extra
+		 * networks from the controller, so those settings are not rendered there at all: an option that silently does
+		 * nothing is worse than a missing one, and one typed by accident is worse still. Changing the role reloads the
+		 * page (Save and Apply does), which is also when the service restarts, so the form is built once per role. */
+		/* uci.load() resolves to the list of package names it loaded, not to a
+		 * cursor: the data is in the module cache and is read back through
+		 * uci.get(). data[2] is only awaited for that side effect. */
+		var role = uci.get('zte_mesh', 'main', 'mesh_role') || 'master';
+		var child = (role === 'slave');
+		/* Main router: the controller that also broadcasts. "auto" is the name this role had before it was split into
+		 * three, and it still means the same thing, so a configuration written then is not shown as something else. */
+		var local = (role === 'main' || role === 'auto');
+
+		var m = new form.Map('zte_mesh', _('ZTE Mesh'), child
+			? _('This router is a mesh child: the controller manages it and gives it the Wi-Fi name, password and security.')
+			: local
+			? _('The main router: this router is the mesh controller and also broadcasts the Wi-Fi profile below, so it and its child routers put the same network on the air.')
+			: _('A controller without Wi-Fi of its own: it manages the child routers and gives them the Wi-Fi profile below. This router\'s own radios are left alone.'));
 		var s = m.section(form.NamedSection, 'main', 'zte_mesh');
 		s.addremove = false;
 		var o;
 
 		s.tab('general', _('General'));
-		s.tab('wifi', _('Wi-Fi profile'));
-		s.tab('policy', _('Roaming and steering'));
+		if (!child) {
+			s.tab('wifi', _('Wi-Fi profile'));
+			s.tab('policy', _('Roaming and steering'));
+		}
 
 		o = s.taboption('general', form.Flag, 'enabled', _('Enable'));
 		o.default = '1';
@@ -267,12 +306,27 @@ return view.extend({
 		o.description = _('The bridge the child routers are cabled to (up to 15 characters, default br-lan).');
 
 		o = s.taboption('general', form.ListValue, 'mesh_role', _('Device role'));
-		o.value('', _('Default (master)'));
-		o.value('master', _('Main router'));
-		o.value('auto', _('Adaptive'));
+		o.value('master', _('Controller only'));
+		o.value('main', _('Main router'));
+		o.value('slave', _('Child router'));
+		o.default = 'master';
 		o.optional = true;
-		o.description = _('The factory "main router / adaptive" switch. Only the controller role is supported. Changing from main router to adaptive restarts the mesh daemon twice and the child routers drop out of the topology for a short while; adding or removing this option restarts the service.');
+		o.description = _('Controller only: this router manages the child routers and gives them the Wi-Fi profile, but its own radios are left exactly as they are. That is the shape of most wired OpenWrt boxes at the head of a mesh, so it is the default. Main router: the same controller that also broadcasts the profile itself -- pick this when the box has Wi-Fi and should put the network on the air too. Child router: this router is a mesh agent, it hands nothing out and the controller gives it the Wi-Fi name, key and security. A child starts from the wireless network this router already broadcasts until the controller sends its own, so nothing has to be filled in here: the Wi-Fi, roaming and extra-network settings are hidden while the child role is selected. On the two roles that apply a profile here, a radio device that was switched off is switched on when the band is enabled, because a disabled radio puts nothing on the air; a radio switched off afterwards stays off until a different profile arrives. Changing the role restarts the service and reloads this page, and the child routers drop out of the topology for a short while.');
 
+		/* Only a child has a controller to reach over the radio. */
+		if (child) {
+		o = s.taboption('general', form.ListValue, 'backhaul', _('Backhaul to the controller'));
+		o.value('off', _('Off (main SSIDs only)'));
+		o.value('multi_ap', _('Multi-AP (4-address)'));
+		o.default = 'off';
+		o.optional = true;
+		o.description = _('How the child role reaches the controller over the radio. Off: only the main SSIDs are applied, as before. Multi-AP: the hidden backhaul network the controller sends becomes its own BSS marked as a Multi-AP backhaul, and the main SSIDs are marked as fronthaul, so the mesh control traffic crosses the radio as 4-address Ethernet. Requires a hostapd built with Multi-AP support (the full wpad, not wpad-basic); nothing is created until the controller has sent a backhaul network.');
+
+		}
+
+		/* Controller side: what this router pushes to its child routers. Not rendered on a child, where the service runs
+		 * with these features off (a child has no agents of its own) and changing a value only invites misconfiguration. */
+		if (!child) {
 		o = s.taboption('general', form.Flag, 'mesh_v2', _('Self-organizing network'));
 		o.default = '0';
 		o.rmempty = false;
@@ -295,7 +349,9 @@ return view.extend({
 			o = s.taboption('wifi', form.Flag, id + '_enabled', _('%s enabled').format(label));
 			o.default = '1';
 			o.rmempty = false;
-			o.description = _('Off switches the main network of this band off on the child routers.');
+			o.description = local
+				? _('Off switches the main network of this band off here and on the child routers.')
+				: _('Off switches the main network of this band off on the child routers.');
 
 			o = s.taboption('wifi', form.Value, id + '_ssid', _('%s network name (SSID)').format(label));
 			o.datatype = 'and(minlength(1),maxlength(31))';
@@ -320,9 +376,9 @@ return view.extend({
 				o.description = _('8 to 63 characters. Empty: the 2.4 GHz password.');
 			} else {
 				o.rmempty = false;
-				o.default = '00000000';
+				o.default = 'Ztemesh2631!';
 				o.placeholder = _('8 to 63 characters');
-				o.description = _('8 to 63 characters, default 00000000. Required: the controller does not start without one.');
+				o.description = _('8 to 63 characters, default Ztemesh2631!. Required: the controller does not start without one.');
 			}
 
 			if (five) {
@@ -579,6 +635,8 @@ return view.extend({
 		o.value('3', _('Extra network 3'));
 		o.optional = true;
 
+		}
+
 		var restart = E('button', {
 			'class': 'btn cbi-button cbi-button-action',
 			'click': ui.createHandlerFn(this, function() {
@@ -589,14 +647,22 @@ return view.extend({
 		}, _('Restart controller'));
 
 		return m.render().then(function(formNode) {
-			return E([
+			var sections = [
 				E('div', { 'class': 'cbi-section' }, [
 					E('h3', _('Status')), statusBox,
 					E('div', { 'class': 'cbi-page-actions', 'style': 'text-align:left' }, restart)
-				]),
-				E('div', { 'class': 'cbi-section' }, [ E('h3', _('Child routers')), nodesBox ]),
-				formNode
-			]);
+				])
+			];
+
+			/* dom.create() calls itself on every element of an array and takes html.charCodeAt(0) on what it
+			 * gets, so a null slot in this list is a TypeError ("Cannot read properties of null (reading
+			 * 'charCodeAt')") and the whole page comes up empty: exactly what happened on a child, where this
+			 * section does not exist. The section is left out of the list, not nulled out of it. */
+			if (!child)
+				sections.push(E('div', { 'class': 'cbi-section' }, [ E('h3', _('Child routers')), nodesBox ]));
+
+			sections.push(formNode);
+			return E(sections);
 		});
 	}
 });

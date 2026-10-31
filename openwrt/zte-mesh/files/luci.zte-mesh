@@ -66,8 +66,28 @@ call)
 		fi
 		attached=false
 		[ -e /sys/class/net/zmesh0/master ] && attached=true
-		printf '{ "installed": %s, "running": %s, "attached": %s, "age": %d, "state": %s }\n' \
-			"$installed" "$running" "$attached" "$age" "$state"
+		role=$(uci -q get zte_mesh.main.mesh_role 2>/dev/null)
+		# Three roles, reported under the names the form offers. "auto" is what a main router used to be called and
+		# is still accepted on input, so it is reported as "main"; anything unknown falls back to the default.
+		case "$role" in master|slave) ;; main|auto) role=main ;; *) role=master ;; esac
+		# What the Wi-Fi applier (usr/libexec/zte-mesh/wlan-sync) did last time it ran. It runs outside the sandbox
+		# and cannot be seen from inside it, so it leaves a plain key=value file next to the plan. Both roles that
+		# apply a profile here -- a child from the M2, a main router from its own configuration -- write it.
+		sync=null
+		if [ -s "$RUNDIR/wlan-sync.status" ]; then
+			sy_epoch=$(sed -n 's/^epoch=//p' "$RUNDIR/wlan-sync.status" | head -n 1)
+			sy_result=$(sed -n 's/^result=//p' "$RUNDIR/wlan-sync.status" | head -n 1)
+			sy_bands=$(sed -n 's/^bands=//p' "$RUNDIR/wlan-sync.status" | head -n 1)
+			sy_message=$(sed -n 's/^message=//p' "$RUNDIR/wlan-sync.status" | head -n 1)
+			case "$sy_epoch" in ''|*[!0-9]*) sy_epoch=-1 ;; esac
+			case "$sy_result" in ok|error) ;; *) sy_result=unknown ;; esac
+			sync=$(printf '{ "epoch": %s, "result": "%s", "bands": "%s", "message": "%s" }' \
+				"$sy_epoch" "$sy_result" \
+				"$(printf '%s' "$sy_bands" | tr -cd '0-9a-zA-Z _,-')" \
+				"$(printf '%s' "$sy_message" | tr -cd '0-9a-zA-Z _,-.:')")
+		fi
+		printf '{ "installed": %s, "running": %s, "attached": %s, "role": "%s", "sync": %s, "age": %d, "state": %s }\n' \
+			"$installed" "$running" "$attached" "$role" "$sync" "$age" "$state"
 		;;
 	restart)
 		( /etc/init.d/zte-mesh restart >/dev/null 2>&1 </dev/null & )

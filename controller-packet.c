@@ -19,6 +19,27 @@
 
 static const uint8_t peer[6] = {2, 0, 0, 0, 0x19, 0x0a};
 static unsigned int be16(const uint8_t *p) { return ((unsigned int)p[0] << 8) | p[1]; }
+/* TLV type:length list of a frame - no values, so it stays safe to log next to a WSC payload. Off unless
+ * ZTE_MESH_TRACE_TLV=1; WSC messages (CMDU 0x0009) always get it, because which TLVs an M1/M2 carries is the
+ * one thing that has to be compared by hand while that exchange is being matched. */
+static void trace_tlvs(const char *what, const uint8_t *frame, size_t bytes)
+{
+    char line[320];
+    size_t used = 0, at = 22;
+    if (!getenv("ZTE_MESH_TRACE_TLV") && be16(frame + 16) != 9)
+        return;
+    line[0] = 0;
+    while (at + 3 <= bytes && frame[at] && used < sizeof(line) - 24) {
+        size_t length = be16(frame + at + 1);
+        if (at + 3 + length > bytes)
+            break;
+        used += (size_t)snprintf(line + used, sizeof(line) - used, "%s%02x:%u", used ? "," : "", frame[at],
+                                 (unsigned int)length);
+        at += 3 + length;
+    }
+    printf("ZTE_PACKET_TLV %s cmdu=0x%04x bytes=%u tlvs=%s\n", what, be16(frame + 16), (unsigned int)bytes, line);
+    fflush(NULL);
+}
 int controller_topology_response_matches(const uint8_t *frame, size_t bytes, const uint8_t controller[6])
 {
     size_t at = 22, n;
@@ -107,6 +128,7 @@ static int wait_response(int fd, const uint8_t controller[6], int query)
         if (bytes < 0) break;
         if ((query == 1 && controller_topology_response_matches(frame, (size_t)bytes, controller)) ||
             (query >= 2 && controller_autoconfig_response_matches(frame, (size_t)bytes, controller, (unsigned int)query - 2))) {
+            trace_tlvs(query == 1 ? "topology-response" : "autoconfig-response", frame, (size_t)bytes);
             if (query == 1)
                 printf("ZTE_CONTROLLER_PACKET fixture=topology-response private_only=1 peer_received=1 cmdu=3 mid_match=1 tlv_sane=1 device_info=1 bytes=%u body_logged=0\n", (unsigned int)bytes);
             else
@@ -317,6 +339,149 @@ done:
     saved = errno;
     if (fd >= 0) close(fd);
     memset(reply, 0, sizeof(reply));
+    errno = saved;
+    return result;
+}
+
+/* The daemon's own frames, header and WSC message type only. */
+int controller_read_frame(int fd, struct controller_frame *frame)
+{
+    uint8_t buffer[1600];
+    ssize_t bytes;
+    size_t at;
+    if (fd < 0 || !frame)
+        return -1;
+    memset(frame, 0, sizeof(*frame));
+    bytes = recv(fd, buffer, sizeof(buffer), MSG_DONTWAIT);
+    if (bytes < 0)
+        return (errno == EAGAIN || errno == EINTR) ? 0 : -1;
+    if (bytes < 25 || buffer[12] != 0x89 || buffer[13] != 0x3a)
+        return 0;
+    trace_tlvs("daemon", buffer, (size_t)bytes);
+    memcpy(frame->src, buffer + 6, 6);
+    frame->cmdu = be16(buffer + 16);
+    frame->mid = be16(buffer + 18);
+    frame->bytes = (unsigned int)bytes;
+    for (at = 22; at + 3 <= (size_t)bytes && buffer[at];) {
+        size_t length = be16(buffer + at + 1);
+        if (at + 3 + length > (size_t)bytes)
+            break;
+        if (buffer[at] == 0x11) {
+            size_t p = 0;
+            if (length <= sizeof(frame->wsc)) {
+                memcpy(frame->wsc, buffer + at + 3, length);
+                frame->wsc_bytes = length;
+            }
+            while (length - p >= 4) {
+                unsigned int tag = be16(buffer + at + 3 + p), body = be16(buffer + at + 5 + p);
+                p += 4;
+                if (body > length - p)
+                    break;
+                if (tag == 0x1022 && body == 1)
+                    frame->wsc_message = buffer[at + 3 + p];
+                p += body;
+            }
+        }
+        if (buffer[at] == 0x0e && length == 1)
+            frame->band = buffer[at + 3]; /* Autoconfiguration Frequency Band */
+        if (buffer[at] == 0x80 && length >= 1) {
+            frame->service_count = buffer[at + 3]; /* entry count, then one value per entry */
+            frame->service_first = length >= 2 ? buffer[at + 4] : 0;
+        }
+        /* AP Radio Basic Capabilities. Its payload opens with the Radio Unique Identifier, which is what the
+         * M2 has to name back as its AP Radio Identifier; acdGetApRadioBasicCapabilitiesType() reads exactly
+         * these six bytes (memcpy(out, payload, 6)) before the operating-class list. */
+        if (buffer[at] == 0x85 && length >= 6) {
+            memcpy(frame->radio, buffer + at + 3, 6);
+            frame->radio_bytes = 6;
+        }
+        at += 3 + length;
+    }
+    memset(buffer, 0, sizeof(buffer));
+    return 1;
+}
+
+/* AP Autoconfiguration Response, built the way the factory controller builds it (the shape the
+ * controller_autoconfig_response_matches() validator was recovered against). */
+int controller_autoconfig_response(const uint8_t agent[6], unsigned int band, unsigned int mid)
+{
+    struct sockaddr_ll target = { .sll_family = AF_PACKET, .sll_protocol = htons(0x893a), .sll_halen = 6 };
+    uint8_t frame[64];
+    size_t used = 22;
+    int fd, result, saved;
+    const char *private = getenv("ZTE_MESH_DB_SANDBOX");
+    if (!agent || band > 1 || mid > 0xffff || !private || strcmp(private, "1"))
+        return -1;
+    target.sll_ifindex = (int)if_nametoindex("lab-peer");
+    if (!target.sll_ifindex)
+        return -1;
+    memset(frame, 0, sizeof(frame));
+    memcpy(frame, agent, 6);
+    memcpy(frame + 6, peer, 6);
+    frame[12] = 0x89; frame[13] = 0x3a;
+    frame[16] = 0x00; frame[17] = 0x08;              /* CMDU 0x0008 */
+    frame[18] = (uint8_t)(mid >> 8); frame[19] = (uint8_t)mid;
+    frame[21] = 0x80;                                /* last fragment */
+    frame[used++] = 0x0f; frame[used++] = 0; frame[used++] = 1; frame[used++] = 0;      /* Searched role: registrar */
+    frame[used++] = 0x10; frame[used++] = 0; frame[used++] = 1; frame[used++] = (uint8_t)band; /* frequency band */
+    /* Supported service: one entry, value 0. That value is a role, not a bit count - the agent declares 1
+     * for itself, so 0 is the Controller entry the factory response carries (and the shape
+     * controller_autoconfig_response_matches() was recovered from). */
+    frame[used++] = 0x80; frame[used++] = 0; frame[used++] = 2; frame[used++] = 1; frame[used++] = 0;
+    memcpy(target.sll_addr, agent, 6);
+    fd = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(0x893a));
+    if (fd < 0)
+        return -1;
+    result = sendto(fd, frame, used, 0, (struct sockaddr *)&target, sizeof(target)) == (ssize_t)used ? 0 : -1;
+    saved = errno;
+    close(fd);
+    errno = saved;
+    return result;
+}
+
+/* The agent's Topology Discovery (CMDU 0x0000) asks every other 1905 device to identify itself. A Multi-AP
+ * Controller answers with a Topology Query (CMDU 0x0002); the Supported Service TLV inside it is what the
+ * agent records, and until that record exists it drops the Autoconfiguration Response that follows.
+ * `service` selects the encoding of that TLV (I5TlvSupportedServiceTypeInsert fills it per role):
+ *   0 = one entry, value 0 (controller only)
+ *   1 = one entry, value 1 (agent only)
+ *   2 = two entries, values 0 and 1 (controller and agent) - what the factory writes for the combined role */
+int controller_topology_query(const uint8_t agent[6], unsigned int mid, unsigned int service)
+{
+    struct sockaddr_ll target = { .sll_family = AF_PACKET, .sll_protocol = htons(0x893a), .sll_halen = 6 };
+    uint8_t frame[64];
+    size_t used = 22;
+    int fd, result, saved;
+    const char *private = getenv("ZTE_MESH_DB_SANDBOX");
+    if (!agent || mid > 0xffff || service > 0xff || !private || strcmp(private, "1"))
+        return -1;
+    target.sll_ifindex = (int)if_nametoindex("lab-peer");
+    if (!target.sll_ifindex)
+        return -1;
+    memset(frame, 0, sizeof(frame));
+    memcpy(frame, agent, 6);
+    memcpy(frame + 6, peer, 6);
+    frame[12] = 0x89; frame[13] = 0x3a;
+    frame[16] = 0x00; frame[17] = 0x02;              /* CMDU 0x0002 */
+    frame[18] = (uint8_t)(mid >> 8); frame[19] = (uint8_t)mid;
+    frame[21] = 0x80;                                /* last fragment */
+    frame[used++] = 0x01; frame[used++] = 0; frame[used++] = 6; memcpy(frame + used, peer, 6); used += 6; /* AL MAC */
+    frame[used++] = 0x02; frame[used++] = 0; frame[used++] = 6; memcpy(frame + used, peer, 6); used += 6; /* MAC address */
+    frame[used++] = 0x80;
+    if (service > 1) {                       /* two entries: controller and agent */
+        frame[used++] = 0; frame[used++] = 3;
+        frame[used++] = 2; frame[used++] = 0; frame[used++] = 1;
+    } else {                                 /* one entry, value = service */
+        frame[used++] = 0; frame[used++] = 2;
+        frame[used++] = 1; frame[used++] = (uint8_t)service;
+    }
+    memcpy(target.sll_addr, agent, 6);
+    fd = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(0x893a));
+    if (fd < 0)
+        return -1;
+    result = sendto(fd, frame, used, 0, (struct sockaddr *)&target, sizeof(target)) == (ssize_t)used ? 0 : -1;
+    saved = errno;
+    close(fd);
     errno = saved;
     return result;
 }

@@ -1,0 +1,316 @@
+name: Build firmware (AArch32 compat)
+
+# Builds an ImmortalWrt image for a qualcommax/ipq807x board with a kernel that
+# can execute 32-bit ARM user space, then bakes the zte-mesh packages into it.
+#
+# Why a firmware and not a package: the vendor `multiapd` is ELF32 ARM
+# (e_machine 0x28, interpreter /lib/ld-linux.so.3). On an arm64 kernel that
+# needs CONFIG_COMPAT, and CONFIG_COMPAT is a *kernel* option - it cannot be
+# added to a running system, and the ImageBuilder behind
+# firmware-selector.immortalwrt.org has no way to set it. The stock
+# qualcommax config carries no CONFIG_COMPAT line at all (only
+# `# CONFIG_COMPAT_32BIT_TIME is not set`), which is exactly why the apk
+# installs and the page loads while the controller dies at execv with
+# `error=execv errno=8` (ENOEXEC).
+#
+# So this workflow compiles the kernel itself with CONFIG_COMPAT=y. Everything
+# else the runtime needs is already in the stock config: CONFIG_SYSVIPC and
+# CONFIG_PACKET come from target/linux/generic, and kmod-veth/kmod-sched-core
+# arrive as real modules because zte-mesh declares them (see build-apk.yml,
+# where they are only trimmed for the external-kernel zte target).
+#
+# Output: the board's sysupgrade image. Flashing it replaces the running
+# firmware; config is kept unless "-n" is used. Verify after boot with
+#   zcat /proc/config.gz | grep -E '^CONFIG_COMPAT='
+#
+# Trigger: manual only. Inputs pick the board and the tree to build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: 'Target device (e.g. xiaomi_ax3600, redmi_ax6, linksys_mx4200v1). See the job summary for the list.'
+        required: true
+        default: xiaomi_ax3600
+      ref:
+        description: 'ImmortalWrt branch or tag to build'
+        required: true
+        default: openwrt-25.12
+      extra_packages:
+        description: 'Extra packages to bake in, space separated (optional)'
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.device }}
+  cancel-in-progress: true
+
+env:
+  TARGET: qualcommax
+  SUBTARGET: ipq807x
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Check out this feed
+        uses: actions/checkout@v4
+        with:
+          path: zte-mesh
+
+      - name: Install host dependencies
+        run: |
+          # A kernel build needs more than a package build: bc/flex/bison for
+          # kconfig, libelf-dev for objtool, cpio for initramfs, and dtc comes
+          # from OpenWrt's own tools. python3-setuptools is needed by some
+          # package builds.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gawk unzip file wget python3 python3-setuptools \
+            rsync subversion git zstd libncurses-dev \
+            swig libssl-dev python3-dev lua5.1 liblua5.1-0-dev \
+            meson ninja-build xz-utils bc flex bison libelf-dev cpio
+
+      - name: Check out ImmortalWrt tree
+        run: |
+          git clone --depth 1 --branch "${{ inputs.ref }}" \
+            https://github.com/immortalwrt/immortalwrt.git owrt
+          git -C owrt rev-parse HEAD
+          test -d "owrt/target/linux/$TARGET/$SUBTARGET" || {
+            echo "no $TARGET/$SUBTARGET in ref ${{ inputs.ref }}" >&2; exit 1; }
+
+      - name: Resolve cache key
+        id: keys
+        run: echo "owrt=$(git -C owrt rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore build cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          # Same reasoning as build-apk.yml: staging_dir holds the install
+          # stamps for tools/ and toolchain/, and build_dir holds the per-package
+          # .built stamps. Keyed on the upstream revision only, so editing our
+          # own feed never throws the toolchain away.
+          path: |
+            owrt/dl
+            owrt/feeds
+            owrt/staging_dir
+            owrt/build_dir
+          key: fw-${{ steps.keys.outputs.owrt }}-${{ env.TARGET }}-${{ env.SUBTARGET }}
+          restore-keys: |
+            fw-${{ steps.keys.outputs.owrt }}-
+            fw-
+
+      - name: Link this feed
+        working-directory: owrt
+        run: |
+          # Start from the tree's own list (a bare `> feeds.conf` drops
+          # packages/luci/routing and then luci-base has no build rule at all),
+          # and only replace the zte_mesh entry, whose upstream src-git points at
+          # cnjn/zte-mesh.git and would shadow this checkout.
+          grep -vE '^[[:space:]]*src-(git|link|cdns|hg|svn|bzr)[[:space:]]+zte_mesh([[:space:]]|$)' \
+            feeds.conf.default > feeds.conf
+          FEED_DIR="$(cd ../zte-mesh/openwrt && pwd)"
+          printf 'src-link zte_mesh %s\n' "$FEED_DIR" >> feeds.conf
+          cat feeds.conf
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          test -f package/feeds/zte_mesh/zte-mesh/Makefile
+          test -f package/feeds/luci/luci-base/Makefile
+          echo "feeds ok: $(ls package/feeds)"
+
+      - name: Enable AArch32 user space in the kernel config
+        working-directory: owrt
+        run: |
+          # The board config file is versioned (config-6.12 on openwrt-25.12,
+          # config-6.18 on master), so locate it instead of hardcoding.
+          CFG=$(ls target/linux/$TARGET/config-* | head -1)
+          test -n "$CFG" || { echo "no $TARGET kernel config" >&2; exit 1; }
+          cp "$CFG" "$CFG.orig"
+
+          # Exact-symbol match only: CONFIG_COMPAT_BRK and
+          # CONFIG_ARCH_MMAP_RND_COMPAT_BITS_* must survive untouched.
+          sed -i -E '/^CONFIG_COMPAT=/d; /^# CONFIG_COMPAT is not set$/d' "$CFG"
+          printf 'CONFIG_COMPAT=y\n' >> "$CFG"
+
+          # Only touch it if the kernel still knows the symbol: it was folded away
+          # on newer trees, and writing an unknown symbol only produces noise.
+          if grep -qE '^#?[[:space:]]*CONFIG_COMPAT_32BIT_TIME([= ]|$)' "$CFG.orig"; then
+            sed -i -E '/^CONFIG_COMPAT_32BIT_TIME=/d; /^# CONFIG_COMPAT_32BIT_TIME is not set$/d' "$CFG"
+            printf 'CONFIG_COMPAT_32BIT_TIME=y\n' >> "$CFG"
+          fi
+
+          diff -u "$CFG.orig" "$CFG" || true
+          grep -E '^CONFIG_COMPAT' "$CFG"
+
+      - name: Configure the image
+        working-directory: owrt
+        env:
+          # Passed through the environment, not interpolated into the script:
+          # a device name or package list is data, never shell code.
+          DEVICE_IN: ${{ inputs.device }}
+          EXTRA_PACKAGES: ${{ inputs.extra_packages }}
+        run: |
+          DEVICE="$(printf '%s' "$DEVICE_IN" | tr ',' '_')"
+          echo "device: $DEVICE"
+          echo "DEVICE=$DEVICE" >> "$GITHUB_ENV"
+
+          # Fail with the real list rather than a defconfig that silently drops an
+          # unknown symbol and builds some other board.
+          if ! grep -qE "^define Device/${DEVICE}$" "target/linux/$TARGET/image/$SUBTARGET.mk"; then
+            echo "unknown device '$DEVICE' for $TARGET/$SUBTARGET. Candidates:" >&2
+            grep -E '^define Device/' "target/linux/$TARGET/image/$SUBTARGET.mk" \
+              | sed 's|define Device/|  |' >&2
+            exit 1
+          fi
+
+          cat >> .config <<EOF
+          CONFIG_TARGET_$TARGET=y
+          CONFIG_TARGET_${TARGET}_${SUBTARGET}=y
+          CONFIG_TARGET_${TARGET}_${SUBTARGET}_DEVICE_${DEVICE}=y
+          CONFIG_PACKAGE_zte-mesh=y
+          CONFIG_PACKAGE_luci-app-zte-mesh=y
+          CONFIG_PACKAGE_luci-i18n-zte-mesh-zh-cn=y
+          EOF
+
+          for pkg in $EXTRA_PACKAGES; do
+            echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+          done
+
+          make defconfig
+
+          grep -E "^CONFIG_TARGET_${TARGET}_${SUBTARGET}_DEVICE_" .config
+          grep -qE "^CONFIG_TARGET_${TARGET}_${SUBTARGET}_DEVICE_${DEVICE}=y" .config || {
+            echo "defconfig dropped the device selection" >&2; exit 1; }
+
+          # The whole point of this workflow: zte-mesh must be built in together
+          # with the modules it declares, or the controller stops with errno=2.
+          for pkg in zte-mesh luci-app-zte-mesh kmod-veth kmod-sched-core; do
+            grep -qE "^CONFIG_PACKAGE_${pkg}=y" .config || {
+              echo "CONFIG_PACKAGE_${pkg} is not =y: the image would be useless" >&2
+              grep -E "^CONFIG_PACKAGE_${pkg}=" .config >&2 || true
+              exit 1; }
+          done
+          echo "image config ok"
+
+      - name: Install host tools and target toolchain
+        working-directory: owrt
+        run: |
+          time make -j"$(nproc)" V=s tools/install
+          time make -j"$(nproc)" V=s toolchain/install
+
+      - name: Save build cache
+        # actions/cache's own save runs as a post step guarded by success(), so a
+        # failing image build would throw the toolchain away. Save it here, when
+        # it is known-good.
+        if: steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            owrt/dl
+            owrt/feeds
+            owrt/staging_dir
+            owrt/build_dir
+          key: fw-${{ steps.keys.outputs.owrt }}-${{ env.TARGET }}-${{ env.SUBTARGET }}
+
+      - name: Build image
+        working-directory: owrt
+        run: |
+          # A full `make world`: kernel + modules + selected packages + image.
+          # No V=s here on purpose: a world build prints tens of thousands of
+          # command lines and the log is uploaded as an artifact. The default
+          # verbosity keeps compiler errors, warnings and the failing rule.
+          LOG="$GITHUB_WORKSPACE/build.log"
+          : > "$LOG"
+          if ! make -j"$(nproc)" world >>"$LOG" 2>&1; then
+            {
+              echo "## FAILED: make world"
+              echo ""
+              echo "### error lines"
+              echo '```'
+              grep -nE 'ERROR:|error:|\*\*\* \[|Download failed|No such file or directory|cannot find|missing dependenc' \
+                "$LOG" | tail -40
+              echo '```'
+              echo "### context around the last make error"
+              echo '```'
+              grep -n -B15 -A3 '\*\*.*Error [0-9]' "$LOG" | tail -80
+              echo '```'
+              echo "### last 40 lines"
+              echo '```'
+              tail -40 "$LOG"
+              echo '```'
+            } > failure.txt
+            cat failure.txt
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              cat failure.txt >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 1
+          fi
+          tail -20 "$LOG"
+
+      - name: Verify the built kernel really has AArch32
+        working-directory: owrt
+        run: |
+          # Read the .config the kernel was actually compiled with, not the board
+          # file we edited: a stale .config or a silently dropped symbol would
+          # otherwise only show up on the router.
+          KC=$(find build_dir -maxdepth 4 -path '*linux-qualcommax*/linux-*' -name .config -print -quit)
+          test -n "$KC" || { echo "no built kernel .config found" >&2; exit 1; }
+          echo "kernel config: $KC"
+          grep -E '^CONFIG_COMPAT=' "$KC"
+          grep -qE '^CONFIG_COMPAT=y' "$KC" || {
+            echo "CONFIG_COMPAT did not reach the kernel build" >&2; exit 1; }
+          grep -E '^CONFIG_(SYSVIPC|PACKET)=' "$KC"
+
+      - name: Collect image
+        id: collect
+        run: |
+          mkdir -p dist
+          find owrt/bin/targets -name '*sysupgrade.bin' -exec cp -v {} dist/ \;
+          find owrt/bin/targets -name '*.itb' -exec cp -v {} dist/ \; || true
+          cp -v owrt/bin/targets/*/*/profiles.json dist/ 2>/dev/null || true
+          ls -la dist
+          test -n "$(ls dist/*sysupgrade.bin 2>/dev/null)" || {
+            echo "build finished but produced no sysupgrade image" >&2; exit 1; }
+          # Exclude the checksum file itself from the glob.
+          ( cd dist && sha256sum $(ls | grep -v '^SHA256SUMS$') > SHA256SUMS && cat SHA256SUMS )
+
+      - name: Write the run summary
+        if: always()
+        run: |
+          {
+            echo "## Image"
+            echo ""
+            echo "- device: \`${{ inputs.device }}\`"
+            echo "- tree: \`${{ inputs.ref }}\` @ \`${{ steps.keys.outputs.owrt }}\`"
+            echo "- kernel: \`CONFIG_COMPAT=y\` (AArch32 user space for the vendor multiapd)"
+            echo ""
+            echo "### After flashing"
+            echo '```sh'
+            echo 'zcat /proc/config.gz | grep -E "^CONFIG_COMPAT="'
+            echo '/etc/init.d/zte-mesh enable && /etc/init.d/zte-mesh start'
+            echo 'logread | grep ZTE_DB_SANDBOX'
+            echo '```'
+            echo ""
+            echo "A launcher line \`private_ipc=1 private_net=1 readonly_root=1\` and no"
+            echo "\`error=execv errno=8\` means the 32-bit runtime is finally executing."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload image
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-${{ env.TARGET }}-${{ env.SUBTARGET }}-${{ env.DEVICE }}-compat
+          path: dist/
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-build-log
+          path: build.log
+          if-no-files-found: ignore

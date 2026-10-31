@@ -1,0 +1,516 @@
+name: Build APK
+
+# Builds the four zte-mesh packages (zte-mesh, zte-mesh-launcher, luci-app-zte-mesh,
+# and the auto-generated luci-i18n-zte-mesh-zh-cn) as OpenWrt .apk files inside a
+# GitHub runner. The packages are compiled against the `zte/zx279133` target
+# from the cnjn/immortalwrt fork (branch `sr1010-zx279133`), which is the only
+# tree that carries that target.
+#
+# Two properties of that target drive the layout below:
+#
+#  * It uses an EXTERNAL kernel tree (Linux 6.18.38), and
+#    target/linux/zte/Makefile hard-errors without
+#    CONFIG_EXTERNAL_KERNEL_TREE. That symbol must be appended AFTER
+#    `make defconfig`: kconfig rewrites .config and resets it to the default "".
+#    Without it, building the kmod dependencies aborts with "The ZTE target
+#    requires CONFIG_EXTERNAL_KERNEL_TREE" and the toplevel only reports Error 2.
+#  * target/linux/zte/zx279133/config-6.18 sets
+#    CONFIG_EXTRA_FIRMWARE_DIR="../../immortalwrt/target/linux/zte/zx279133/
+#    firmware", relative to the kernel tree. So the layout has to be
+#    <dir>/immortalwrt + <dir>/linux-mainline-zte-zxslc-sr1010/linux-6.18.38.
+#
+# `make package/<pkg>/compile` walks the dependency graph in tmp/.packagedeps,
+# so every declared runtime dep of zte-mesh gets built first. Two of them are
+# pointless (or actively harmful) to build here, and a CI-only sed trims them
+# from DEPENDS before defconfig:
+#
+#  * +kmod-veth +kmod-sched-core - config-6.18 has neither CONFIG_VETH nor
+#    CONFIG_NET_SCH_INGRESS/CONFIG_NET_CLS_ACT, so on this target they can only
+#    ever be empty stubs, yet naming them drags package/kernel/linux (and hence
+#    a kernel build) into the graph.
+#  * +ip-full - iproute2 comes from kernel.org and pulls iptables
+#    (PKG_BUILD_DEPENDS) from netfilter.org; both answer 403 to automated
+#    fetches often enough to waste whole runs, and neither is needed to package
+#    a script-only feed.
+#
+# The .apk therefore declares @TARGET_zte alone. The kernel package is
+# additionally neutralised rather than avoided: package/kernel/linux has an
+# EMPTY Build/Compile and its install step only copies $(LINUX_DIR)/modules.builtin
+# and strings modules.builtin.modinfo, so two empty placeholder files in the
+# kernel tree make it a zero-second no-op if it enters the graph anyway
+# (package/Makefile hardcodes `package-y += kernel/linux`).
+#
+# SPEED: the cross toolchain (binutils -> gcc/initial -> musl -> gcc/final) is
+# by far the most expensive part (~30-45 min) and always produces the same
+# bytes for a given upstream commit. staging_dir + the host/toolchain build
+# trees are therefore cached, keyed on the upstream revisions only, so editing
+# our own packages never invalidates it. First run after a key change is slow;
+# later runs reach the package build in a couple of minutes.
+#
+# Trigger: manual only (workflow_dispatch). Pushes and pull requests used to
+# build as well, but a documentation or memory commit then cost a full 20-30
+# minute toolchain run and produced the same packages as the previous one.
+# Start it explicitly when a change to the packages is worth verifying.
+
+on:
+  workflow_dispatch:
+
+# A superseded run is worthless: cancel the old one instead of paying for two
+# full toolchain builds in parallel (and fighting over the same cache key).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Runtime dependencies are decided per target instead of by one blind sed: a
+# target that compiles its own kernel modules keeps +kmod-veth +kmod-sched-core,
+# so the packaged apk carries a real dependency and the board ends up with a
+# working veth pair; a target built against an external kernel tree that this
+# workflow never compiles cannot produce those kmods at all, and merely naming
+# them drags package/kernel/linux (and a kernel build) into the graph.
+env:
+  # zte/zx279133 points at an external kernel tree (see the header), which this
+  # workflow never compiles -> kmod-* deps could only ever be empty stubs.
+  # A target with an in-tree kernel (qualcommax/ipq807x) sets this to 'true';
+  # the firmware workflow in build-firmware.yml builds that target.
+  TARGET_BUILDS_KERNEL_MODULES: 'false'
+  # ip-full: iproute2 is fetched from kernel.org and build-depends on iptables
+  # (netfilter.org); both answer 403 to automated fetches often enough to waste
+  # whole runs. It is a runtime-only dep, so it stays out of the build graph.
+  TRIM_IP_FULL: 'true'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out this feed
+        uses: actions/checkout@v4
+        with:
+          path: zte-mesh
+
+      - name: Lint the LuCI view
+        run: |
+          # Guards against the failure that shipped in the first apk: the page
+          # died with "TypeError: cfg.get is not a function" because
+          # uci.load() resolves to the list of package names it loaded, not to a
+          # cursor. Config data must be read back through uci.get(package,
+          # section, option); keeping this check here means a regression fails
+          # the run instead of the router's browser console.
+          JS=zte-mesh/openwrt/luci-app-zte-mesh/htdocs/luci-static/resources/view/network/zte-mesh.js
+          node --check "$JS"
+          if grep -nE '\bcfg\.get[[:space:]]*\(' "$JS"; then
+            echo "cfg.get() used on a uci.load() result: read through uci.get()" >&2
+            exit 1
+          fi
+          grep -q "uci.get('zte_mesh', 'main', 'mesh_role')" "$JS" || {
+            echo "the role lookup no longer reads through uci.get()" >&2; exit 1; }
+          echo "view ok: $(wc -c < "$JS") bytes"
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gawk unzip file wget python3 \
+            rsync subversion git zstd libncurses-dev \
+            swig libssl-dev python3-dev lua5.1 liblua5.1-0-dev \
+            meson ninja-build xz-utils
+
+      - name: Check out ImmortalWrt tree
+        run: |
+          # The zte/zx279133 target only exists on this fork's branch.
+          mkdir -p sr1010
+          git clone --depth 1 --branch sr1010-zx279133 \
+            https://github.com/cnjn/immortalwrt.git sr1010/immortalwrt
+
+      - name: Check out the ZX279133 kernel tree
+        run: |
+          # Cloned two levels deep on purpose: config-6.18 resolves its
+          # CONFIG_EXTRA_FIRMWARE_DIR relative to this tree as
+          # ../../immortalwrt/target/linux/zte/zx279133/firmware.
+          # `codex/sr1010-mainline` is the branch the superproject pins as a
+          # submodule; a shallow clone of it is the whole kernel source.
+          git clone --depth 1 --branch codex/sr1010-mainline \
+            https://github.com/cnjn/linux-mainline-zte-zxslc-sr1010.git \
+            sr1010/linux-mainline-zte-zxslc-sr1010/linux-6.18.38
+
+          KERNEL_TREE="sr1010/linux-mainline-zte-zxslc-sr1010/linux-6.18.38"
+          test -f "$KERNEL_TREE/Makefile" || {
+            echo "kernel clone incomplete: no $KERNEL_TREE/Makefile" >&2
+            exit 1
+          }
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' "$KERNEL_TREE/Makefile"
+
+          # Neutralise package/kernel/linux. We never compile a kernel, and that
+          # package does not need one: its Build/Compile is empty and
+          # Package/kernel/install only (a) copies $(LINUX_DIR)/modules.builtin
+          # and (b) runs `strings` on modules.builtin.modinfo. Both files are
+          # produced by a real kernel build, so without them the install step
+          # dies on
+          #   make[2]: *** [Makefile:75: .../packages/.pkgdir/kernel.installed]
+          # even though nothing in our packages needs the kernel. Empty
+          # placeholders are enough: no built-in modules is the truth here,
+          # because no modules were built.
+          : > "$KERNEL_TREE/modules.builtin"
+          : > "$KERNEL_TREE/modules.builtin.modinfo"
+          ls -l "$KERNEL_TREE/modules.builtin" "$KERNEL_TREE/modules.builtin.modinfo"
+
+      - name: Resolve cache key
+        id: keys
+        run: |
+          # Only UPSTREAM revisions go into the key. Editing our own feed (the
+          # packages, docs, this workflow) must not throw away a perfectly good
+          # toolchain - that is the whole point of the cache.
+          echo "owrt=$(git -C sr1010/immortalwrt rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "kernel=$(git -C sr1010/linux-mainline-zte-zxslc-sr1010/linux-6.18.38 rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore build cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          # staging_dir holds the install stamps for tools/ and toolchain/, so a
+          # hit turns `make tools/install` + `make toolchain/install` (~30-45 min
+          # of binutils -> gcc/initial -> musl -> gcc/final) into a no-op. The
+          # matching build trees are cached too, because their `.built` stamps
+          # are what actually stop the rebuild - restoring only staging_dir
+          # would leave make with nothing to believe. `build_dir` is taken
+          # wholesale instead of listing subdirs so a partially restored cache
+          # cannot happen; ~2 GB compressed, well inside the 10 GB repo budget.
+          path: |
+            sr1010/immortalwrt/dl
+            sr1010/immortalwrt/feeds
+            sr1010/immortalwrt/staging_dir
+            sr1010/immortalwrt/build_dir
+          key: owrt-${{ steps.keys.outputs.owrt }}-${{ steps.keys.outputs.kernel }}
+          # A stale staging_dir is still useful (make rebuilds only what
+          # changed), so fall back to the previous generation on a branch bump.
+          restore-keys: |
+            owrt-${{ steps.keys.outputs.owrt }}-
+            owrt-
+
+      - name: Report cache status
+        run: |
+          echo "cache hit: ${{ steps.cache.outputs.cache-hit }}"
+          du -sh sr1010/immortalwrt/staging_dir 2>/dev/null || echo "no staging_dir yet"
+          df -h /
+
+      - name: Seed dl/ with the kernel tarball
+        run: |
+          # Fallback path only: on the normal branch kernel-headers symlinks the
+          # external tree and never opens this file. But if
+          # CONFIG_EXTERNAL_KERNEL_TREE is ever dropped, the (prerequisite-free)
+          # dl rule then finds a real archive with a real SHA256 instead of
+          # failing on the fork's placeholder `LINUX_KERNEL_HASH-6.18.38 = x`
+          # ("Cannot find appropriate hash command").
+          DL=sr1010/immortalwrt/dl/linux-6.18.38.tar.xz
+          mkdir -p sr1010/immortalwrt/dl
+          if [ -f "$DL" ]; then
+            # Restored from the cache (same kernel commit => same tree). Repack
+            # nothing; just re-derive the hash from the bytes actually on disk,
+            # because that is what the integrity check compares against.
+            echo "kernel tarball: restored from cache"
+          else
+            tar -C sr1010/linux-mainline-zte-zxslc-sr1010 --exclude=.git -cf - linux-6.18.38 \
+              | xz -T0 -3 > "$DL"
+            echo "kernel tarball: packed from the clone"
+          fi
+          SHA256=$(sha256sum "$DL" | cut -d' ' -f1)
+          sed -i "s|^LINUX_KERNEL_HASH-6.18.38 = .*|LINUX_KERNEL_HASH-6.18.38 = $SHA256|" \
+            sr1010/immortalwrt/target/linux/generic/kernel-6.18
+          echo "tarball: $(du -h "$DL" | cut -f1), sha256=$SHA256"
+
+      - name: Install feeds
+        working-directory: sr1010/immortalwrt
+        run: |
+          # Do NOT write feeds.conf from scratch: a bare `> feeds.conf` drops
+          # packages/luci/routing/telephony, and then
+          # `package/feeds/luci/luci-base/compile` has no rule at all
+          # ("No rule to make target"). Start from the fork's own list and only
+          # swap the zte_mesh entry, whose upstream src-git points at
+          # cnjn/zte-mesh.git and would shadow our checkout.
+          grep -vE '^[[:space:]]*src-(git|link|cdns|hg|svn|bzr)[[:space:]]+zte_mesh([[:space:]]|$)' \
+            feeds.conf.default > feeds.conf
+          FEED_DIR="$(cd ../../zte-mesh/openwrt && pwd)"
+          printf 'src-link zte_mesh %s\n' "$FEED_DIR" >> feeds.conf
+          cat feeds.conf
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          # Fail fast with a clear message instead of a cryptic make error later.
+          test -f package/feeds/zte_mesh/zte-mesh/Makefile || {
+            echo "zte_mesh feed not linked into package/feeds" >&2; exit 1; }
+          test -f package/feeds/luci/luci-base/Makefile || {
+            echo "luci feed missing: package/feeds/luci/luci-base" >&2; exit 1; }
+          echo "feeds ok: $(ls package/feeds)"
+
+      - name: Decide runtime deps for this target
+        working-directory: sr1010/immortalwrt
+        run: |
+          # Per-target decision, not a blanket sed. The switch lives in the
+          # workflow env block at the top so the rule is visible without reading
+          # this body:
+          #
+          #  TARGET_BUILDS_KERNEL_MODULES=false (this target)
+          #    config-6.18 has no CONFIG_VETH and no CONFIG_NET_SCH_INGRESS/
+          #    CONFIG_NET_CLS_ACT, and the kernel is an external tree we never
+          #    compile, so +kmod-veth/+kmod-sched-core could only ever be empty
+          #    stubs - yet naming them puts package/kernel/linux (and a kernel
+          #    build) in the graph.
+          #  TARGET_BUILDS_KERNEL_MODULES=true (e.g. qualcommax/ipq807x)
+          #    the in-tree kernel really builds those modules, so the deps stay
+          #    and the resulting apk carries them: without veth the launcher
+          #    stops at "error=private-service-network errno=2".
+          #
+          # Trimming happens in this build tree only; the source keeps the full
+          # DEPENDS so a packaged target still gets what it declares.
+          #
+          # Must run before `make defconfig`: defconfig resolves the dependencies
+          # and would pin CONFIG_PACKAGE_kmod-veth=m, dragging the kernel package
+          # back in even though DEPENDS no longer mentions it.
+          # The runtime deps moved with the compiled binaries: zte-mesh itself is
+          # arch:all now (scripts and the runtime tarball), and everything that
+          # only a real board can satisfy -- iproute2, the veth module -- is
+          # declared by zte-mesh-launcher, which is arch-tagged. Trimming has to
+          # happen there or the apk would still drag a kernel build in.
+          MK=../../zte-mesh/openwrt/zte-mesh-launcher/Makefile
+          echo "target builds kernel modules: $TARGET_BUILDS_KERNEL_MODULES"
+          echo "trim ip-full:                  $TRIM_IP_FULL"
+          echo "before: $(grep -n 'DEPENDS' "$MK")"
+
+          if [ "$TRIM_IP_FULL" = 'true' ]; then
+            sed -i -E 's/[[:space:]]*\+ip-full//g' "$MK"
+            echo "trimmed +ip-full (download-only dep, 403-prone)"
+          else
+            echo "kept +ip-full"
+          fi
+
+          if [ "$TARGET_BUILDS_KERNEL_MODULES" = 'true' ]; then
+            grep -qE '\+kmod-veth' "$MK" || {
+              echo "TARGET_BUILDS_KERNEL_MODULES=true but $MK lost +kmod-veth" >&2; exit 1; }
+            echo "kept +kmod-veth +kmod-sched-core: this target can build them"
+          else
+            sed -i -E 's/[[:space:]]*\+(kmod-veth|kmod-sched-core)//g' "$MK"
+            echo "trimmed +kmod-veth +kmod-sched-core: no in-tree kernel here"
+          fi
+          echo "after:  $(grep -n 'DEPENDS' "$MK")"
+
+          if [ "$TRIM_IP_FULL" = 'true' ] && [ "$TARGET_BUILDS_KERNEL_MODULES" = 'false' ] &&
+             grep -qE '\+(kmod-veth|kmod-sched-core|ip-full)' "$MK"; then
+            echo "runtime deps were not trimmed properly in $MK" >&2
+            exit 1
+          fi
+          true
+
+      - name: Configure target
+        working-directory: sr1010/immortalwrt
+        run: |
+          cat >> .config <<EOF
+          CONFIG_TARGET_zte=y
+          CONFIG_TARGET_zte_zx279133=y
+          CONFIG_PACKAGE_zte-mesh=m
+          CONFIG_PACKAGE_zte-mesh-launcher=m
+          CONFIG_PACKAGE_luci-app-zte-mesh=m
+          CONFIG_PACKAGE_luci-i18n-zte-mesh-zh-cn=m
+          EOF
+          make defconfig
+
+          # The translations are a *virtual* package: luci.mk turns po/zh_Hans/
+          # into luci-i18n-zte-mesh-zh-cn, which owns no directory, so it can
+          # only be emitted by compiling its parent directory -- and only while
+          # it is selected in .config. defconfig quietly drops the selection
+          # when the symbol never reached Config.in, which is what happens when
+          # luci.mk could not see po/ (it builds its language list from
+          # ${CURDIR}/po/*). Name the case that is happening instead of letting
+          # the build die 20 minutes later on a target that does not exist.
+          if grep -qs 'luci-i18n-zte-mesh-zh-cn' .config-package.in tmp/.config-package.in; then
+            grep -q '^CONFIG_PACKAGE_luci-i18n-zte-mesh-zh-cn=' .config ||
+              printf 'CONFIG_PACKAGE_luci-i18n-zte-mesh-zh-cn=m\n' >> .config
+            grep -E '^CONFIG_PACKAGE_luci-i18n-zte-mesh-zh-cn=' .config
+          else
+            echo "luci.mk produced no luci-i18n-zte-mesh-zh-cn package:" >&2
+            echo "  po/ as the feed sees it: $(ls package/feeds/zte_mesh/luci-app-zte-mesh/po 2>&1 | tr '\n' ' ')" >&2
+            echo "  LUCI_LANG.zh_Hans in feeds/luci/luci.mk: $(grep -c 'LUCI_LANG\.zh_Hans' feeds/luci/luci.mk 2>/dev/null)" >&2
+            exit 1
+          fi
+
+          # Must come after defconfig: kconfig regenerates .config from Config.in
+          # and resets EXTERNAL_KERNEL_TREE to its default empty string, which
+          # makes target/linux/zte/Makefile abort with
+          # "The ZTE target requires CONFIG_EXTERNAL_KERNEL_TREE".
+          KERNEL_TREE="$(cd ../linux-mainline-zte-zxslc-sr1010/linux-6.18.38 && pwd)"
+          test -f "$KERNEL_TREE/arch/arm64/boot/dts/zte/zx279133-sr1010.dts" || {
+            echo "not a prepared ZX279133 kernel tree: $KERNEL_TREE" >&2
+            exit 1
+          }
+          sed -i '/^CONFIG_EXTERNAL_KERNEL_TREE=/d' .config
+          printf 'CONFIG_EXTERNAL_KERNEL_TREE="%s"\n' "$KERNEL_TREE" >> .config
+
+          # Belt and braces, in both directions. Without an in-tree kernel any
+          # re-selected kmod puts package/kernel/linux back in the graph and the
+          # build dies on modules.builtin, so stop here with a readable message
+          # instead of 20 minutes later. With an in-tree kernel the opposite must
+          # hold: the deps we deliberately kept have to survive defconfig, or the
+          # apk ships without the veth it needs at runtime.
+          if [ "$TARGET_BUILDS_KERNEL_MODULES" = 'true' ]; then
+            for kmod in kmod-veth kmod-sched-core; do
+              grep -qE "^CONFIG_PACKAGE_${kmod}=" .config || {
+                echo "kept +${kmod} in DEPENDS but defconfig dropped it" >&2; exit 1; }
+            done
+            grep -E '^CONFIG_PACKAGE_kmod-(veth|sched-core)=' .config
+          elif grep -qE '^CONFIG_PACKAGE_kmod-(veth|sched-core)=' .config; then
+            echo "kmod deps were re-selected by defconfig:" >&2
+            grep -E '^CONFIG_PACKAGE_kmod-' .config >&2
+            exit 1
+          fi
+
+          grep -n -E 'CONFIG_(TARGET_zte|EXTERNAL_KERNEL_TREE|PACKAGE_zte-mesh|PACKAGE_luci-app-zte-mesh)' .config
+
+      - name: Install host tools and target toolchain
+        working-directory: sr1010/immortalwrt
+        run: |
+          # `tools/install` stages host tools (meson/ninja for the apk packager);
+          # `toolchain/install` stages the aarch64_cortex-a53 gcc plus the libc /
+          # libgcc runtime packages the nonshared zte-mesh depends on.
+          # kernel-headers is part of that chain and now links the external
+          # kernel tree instead of downloading a tarball kernel.org never had.
+          #
+          # On a cache hit both are stamp-driven no-ops; they are still invoked
+          # so a partially restored cache is repaired rather than silently used.
+          time make -j"$(nproc)" V=s tools/install
+          time make -j"$(nproc)" V=s toolchain/install
+
+      - name: Save build cache
+        # actions/cache's own save step runs as a post step guarded by
+        # success(), so while the package build was failing the 38-minute
+        # toolchain was silently thrown away and paid for again on every run.
+        # Save it here instead: at this point it is known-good, and nothing
+        # fragile has run yet.
+        if: steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            sr1010/immortalwrt/dl
+            sr1010/immortalwrt/feeds
+            sr1010/immortalwrt/staging_dir
+            sr1010/immortalwrt/build_dir
+          key: owrt-${{ steps.keys.outputs.owrt }}-${{ steps.keys.outputs.kernel }}
+
+      - name: Build packages
+        working-directory: sr1010/immortalwrt
+        run: |
+          # Each target is built separately so a failure is attributable, and the
+          # full output goes to build.log (uploaded even on failure). The digest
+          # below is also pushed to the job summary, so the reason is visible on
+          # the run page without downloading anything.
+          LOG="$GITHUB_WORKSPACE/build.log"
+          : > "$LOG"
+
+          fail() {
+            {
+              echo "## FAILED: \`$1\`"
+              echo ""
+              echo "### error lines"
+              echo '```'
+              grep -nE 'ERROR:|error:|\*\*\* \[|Download failed|No such file or directory|cannot find|missing dependenc' \
+                "$LOG" | tail -30
+              echo '```'
+              echo "### context around the last make error"
+              echo '```'
+              # The toplevel only ever prints "Error 2"; the real reason is the
+              # ~15 lines above the failing recursion.
+              grep -n -B15 -A3 '\*\*\* .*Error [0-9]' "$LOG" | tail -60
+              echo '```'
+              echo "### last 40 lines"
+              echo '```'
+              tail -40 "$LOG"
+              echo '```'
+            } > failure.txt
+            cat failure.txt
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              cat failure.txt >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 1
+          }
+
+          build() {
+            echo "=== make $1 ===" | tee -a "$LOG"
+            make -j"$(nproc)" V=s "$1" >>"$LOG" 2>&1 || fail "$1"
+          }
+
+          # Warm dl/ up front, with retries. netfilter.org and kernel.org
+          # intermittently answer 403 to automated fetches, and one unlucky
+          # mirror sweep would otherwise abort the build long after the
+          # toolchain work. iproute2 is deliberately NOT built (see the
+          # "Trim runtime deps" step), so luci-base is the only download left.
+          prefetch() {
+            for i in 1 2 3; do
+              make -j"$(nproc)" "$1" >>"$LOG" 2>&1 && return 0
+              echo "=== prefetch $1: attempt $i failed, retrying ===" | tee -a "$LOG"
+              sleep 10
+            done
+            fail "$1"
+          }
+          prefetch package/feeds/luci/luci-base/download
+
+          # luci-base first: luci.mk needs the host po2lmo (and the luci libs)
+          # before it can build luci-app-zte-mesh and its zh-cn translations.
+          build package/feeds/luci/luci-base/compile
+          build package/feeds/zte_mesh/zte-mesh/compile
+
+          # The launcher unpacks ns-run.c / controller-net.c / enroller.c out of
+          # the runtime tarball in the sibling directory, so it has to be built
+          # from the same feed checkout; there is no second copy of the sources.
+          build package/feeds/zte_mesh/zte-mesh-launcher/compile
+
+          # luci-i18n-zte-mesh-zh-cn has no directory of its own to name here
+          # (luci.mk derives it from po/zh_Hans/), so asking for it as a path
+          # yields "No rule to make target". Compiling the parent directory
+          # emits every package of that directory .config has selected, so the
+          # translation rides along -- provided Configure target kept it
+          # selected, which it now guarantees or fails loudly about.
+          build package/feeds/zte_mesh/luci-app-zte-mesh/compile
+
+          find ./bin -name 'luci-i18n-zte-mesh-zh-cn-*.apk' | tee -a "$LOG"
+          test -n "$(find ./bin -name 'luci-i18n-zte-mesh-zh-cn-*.apk' | head -1)" || {
+            echo "the Chinese translation apk was not produced although it is selected" >&2
+            ls -R ./bin/packages 2>/dev/null | head -40 >&2
+            exit 1
+          }
+
+          # A green build with no artifact is the worst outcome: assert the
+          # packages are really there instead of trusting exit codes.
+          for stem in zte-mesh zte-mesh-launcher luci-app-zte-mesh luci-i18n-zte-mesh-zh-cn; do
+            test -n "$(find bin -name "$stem-*.apk" -print -quit)" || {
+              echo "build reported success but produced no $stem apk" >&2; exit 1; }
+          done
+          find bin -name '*.apk' | grep -E 'zte-mesh' || true
+
+      - name: Locate artifacts
+        id: collect
+        run: |
+          # zte-mesh is PKG_FLAGS:=nonshared but PKGARCH:=all (scripts plus the
+          # runtime tarball are data), so it lands under the feed packages dir with
+          # the LuCI packages. zte-mesh-launcher carries the compiled ns-run and
+          # mesh-search and is aarch64_cortex-a53, so it lands under the target
+          # packages dir. `zte-mesh*.apk` matches both.
+          mkdir -p dist
+          find sr1010/immortalwrt/bin -name 'zte-mesh*.apk' -exec cp -v {} dist/ \;
+          find sr1010/immortalwrt/bin -name 'luci-*zte-mesh*.apk' -exec cp -v {} dist/ \;
+          ls -la dist
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: zte-mesh-apk
+          path: dist/
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore

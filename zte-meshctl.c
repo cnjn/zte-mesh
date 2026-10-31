@@ -67,6 +67,20 @@ int main(int argc, char **argv)
         printf("ZTE_MESHCTL renew-acd band=%u status=%d\n", in[0], status);
         return status == 0 ? 0 : 3;
     }
+    if (argc == 2 && !strcmp(argv[1], "acd-election")) {
+        /* The probe the agent observation uses for cspd's cooperator step (g_TriggerSelectFlag -> CfIeee1905RoleElect).
+         * multiapd reaches that entry only through its acd task and the payload is not observable from the binary, so
+         * this is a zeroed four-byte probe: a non-zero status means the event does not exist on this build. */
+        unsigned char in[4] = {0};
+        (void)DBShmCliInit();
+        if (InitAppComm("zte-meshctl", 0)) {
+            printf("ZTE_MESHCTL fail=init-app-comm\n");
+            return 2;
+        }
+        status = ASEND(0x909b, in, sizeof(in), "multiapd.acd.acd");
+        printf("ZTE_MESHCTL acd-election event=0x909b status=%d\n", status);
+        return status == 0 ? 0 : 3;
+    }
     if ((argc == 3 && !strcmp(argv[1], "reboot-node")) ||
         (argc == 4 && !strcmp(argv[1], "light-node") && (!strcmp(argv[3], "0") || !strcmp(argv[3], "1")))) {
         /* What the factory web page does for one child router (CmMultiApSendMsg2TopoDev, libieee1905cmapi 0x6574):
@@ -176,7 +190,7 @@ int main(int argc, char **argv)
     }
     int notify = argc == 3 && !strcmp(argv[1], "notify") && (!strcmp(argv[2], "0") || !strcmp(argv[2], "1"));
     if (!notify && (argc != 2 || strcmp(argv[1], "renew"))) {
-        fprintf(stderr, "usage: zte-meshctl renew | notify <band 0|1> | renew-acd <band> | wlan-mgr <al-mac> <0|1> | notify-master <0x10205|0x10206|0x10208>... | reboot-node <al-mac> | light-node <al-mac> <0|1>\n");
+        fprintf(stderr, "usage: zte-meshctl renew | notify <band 0|1> | renew-acd <band> | acd-election | wlan-mgr <al-mac> <0|1> | notify-master <0x10205|0x10206|0x10208>... | reboot-node <al-mac> | light-node <al-mac> <0|1>\n");
         return 64;
     }
     (void)DBShmCliInit(); /* returns the mapping address, not a status */

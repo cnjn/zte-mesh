@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <arpa/inet.h>
 #include <linux/if_packet.h>
 #include <net/if.h>
@@ -14,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/shm.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -22,8 +24,12 @@
 #include "wlan-profiles.h"
 #include "mesh-bridge.h"
 #include "controller-packet.h"
+#include "controller-wsc-crypto.h"
 #include "controller-service.h"
+#include "agent-sync.h"
 #include "startup-views.inc"
+/* Where the agent role publishes the host-side Wi-Fi plan (agent-sync.c, applied by wlan-sync). */
+#define AGENT_WLAN_PLAN "/run/zte-mesh/wlan-plan"
 extern int ShmPoolLock(unsigned int);
 extern int ShmPoolUnlock(void);
 extern int mesh_policies_startup_rows(void);
@@ -292,10 +298,15 @@ int controller_write_cfg(const char *field, int value)
     return status || controller_read_cfg(field, &check) || check != value ? -1 : 0;
 }
 
-static int role_mode = -1; /* mesh.role: -1 = leave the database as built, 0 = master, 1 = auto */
+static int role_mode = CONTROLLER_ROLE_UNSET; /* mesh.role: leave the database as built, master, auto or slave */
 void controller_set_role(int role)
 {
     role_mode = role;
+}
+
+int controller_role(void)
+{
+    return role_mode;
 }
 
 /* Live write of P1905ComCfg.Enable, read back (0 = ok). The factory CmMultiApTopoSetP1905ComCfg writes the view and
@@ -455,9 +466,21 @@ static int startup_identity(const struct mb_profile profiles[2], const char *ver
     mesh_policies_apply_profile_view("P1905ComCfg", communication);
     mesh_policies_apply_profile_view("MultiAPCfg", cfg);
     /* mesh.role: the settled state of the factory device-role page. "Master" is SetRoleEnable 0, "adaptive" is
-     * SetRoleEnable 1 with the role the election ended on (Mode 2 for a router); Mode 0 only exists during an election. */
-    if (role_mode >= 0 && (dbSetValCommByRowNo(cfg, 0, "Mode", "2") ||
-                           dbSetValCommByRowNo(cfg, 0, "SetRoleEnable", role_mode ? "1" : "0")))
+     * SetRoleEnable 1 with the role the election ended on (Mode 2 for a router); Mode 0 only exists during an election.
+     * "Slave" is the agent side of the same switch (CM API Mode 1 = Slave, 0 = adaptive, 2 = Master): it also has to
+     * clear EnMasterOnly, which the fixture sets because a radio-less controller must skip slave_init. */
+    if (role_mode == CONTROLLER_ROLE_SLAVE) {
+        if (dbSetValCommByRowNo(cfg, 0, "Mode", "1") ||
+            dbSetValCommByRowNo(cfg, 0, "SetRoleEnable", "0") ||
+            dbSetValCommByRowNo(cfg, 0, "EnMasterOnly", "0") ||
+            /* Registry default "not attached": slave_init sets CurHop itself (CfMultiapSetCurHop). The fixture value 2
+             * is the stand-in for that call on the controller side and must not leak into the agent path. */
+            dbSetValCommByRowNo(cfg, 0, "CurHop", "-2"))
+            goto done;
+        printf("ZTE_CONTROLLER_STARTUP role=slave mode=1 set_role_enable=0 en_master_only=0 cur_hop=-2\n");
+    } else if (role_mode >= 0 &&
+               (dbSetValCommByRowNo(cfg, 0, "Mode", "2") ||
+                dbSetValCommByRowNo(cfg, 0, "SetRoleEnable", role_mode == CONTROLLER_ROLE_AUTO ? "1" : "0")))
         goto done;
     base_table = dbFindTbl("WLANBase");
     if (!base_table || dbSetValCommByRowNo(acd, 0, "ACDSyncEnable", "1")) goto done;
@@ -684,7 +707,7 @@ static int spawn_daemon(pid_t *child)
     if (!*child) {
         if (setenv("ZTE_MESH_START_COUNT", count, 1))
             _exit(82);
-        if (setenv("LD_PRELOAD", "/lib/libzte_controller_profile.so:/lib/libzte_controller_route.so:/lib/libzte_controller_trace.so:/lib/libzte_mesh_shim.so", 1))
+        if (setenv("LD_PRELOAD", "/lib/libzte_controller_profile.so:/lib/libzte_controller_route.so:/lib/libzte_controller_trace.so:/lib/libzte_mesh_shim.so:/lib/libzte_agent_mm.so", 1))
             _exit(82);
         execl("/lib/ld-linux.so.3", "ld-linux.so.3", "--library-path", "/lib",
               "/bin/multiapd", (char *)NULL);
@@ -739,8 +762,21 @@ int controller_boot(const struct mb_profile profiles[2], const char *version_mod
     extern int RAND_bytes(unsigned char *, int);
     struct shmid_ds info_shm;
     int status, id;
-    if (startup_identity(profiles, version_mode) || verify_route_adapter() || (lab && verify_profile_adapter()))
+    if (startup_identity(profiles, version_mode)) {
+        printf("ZTE_CONTROLLER_STARTUP fail=startup-identity errno=%d\n", errno);
+        fflush(NULL);
         return -1;
+    }
+    if (verify_route_adapter()) {
+        printf("ZTE_CONTROLLER_STARTUP fail=route-adapter errno=%d\n", errno);
+        fflush(NULL);
+        return -1;
+    }
+    if (lab && verify_profile_adapter()) {
+        printf("ZTE_CONTROLLER_STARTUP fail=profile-adapter errno=%d\n", errno);
+        fflush(NULL);
+        return -1;
+    }
     /* Validate real legacy OpenSSL RNG, never stub deterministic randomness. */
     status = RAND_bytes(randomness, sizeof(randomness));
     mb_wipe(randomness, sizeof(randomness));
@@ -858,5 +894,424 @@ int controller_startup(void)
            WIFSIGNALED(status) ? WTERMSIG(status) : 0);
     fflush(NULL);
     /* Observation is not an operational Controller success indication. */
+    return controller_shutdown_private(id);
+}
+
+/* WLANCfg / WLANPSK as the database holds them, for the agent observation: the SSID, the enable bit and (for the key row)
+ * the key LENGTH only. Nothing that could be a credential is printed. */
+static void dump_wlan_rows(const char *label)
+{
+    unsigned int row;
+    char line[512];
+    size_t used = 0;
+    if (ShmPoolLock(1000))
+        return;
+    for (row = 0; row < 8 && used < sizeof(line) - 96; row++) {
+        char ssid[64] = "", key[128] = "";
+        uint8_t enable = 0, access = 0;
+        if (dbGetValComm("WLANCfg", row, "ESSID", ssid, sizeof(ssid)))
+            ssid[0] = 0;
+        if (dbGetValComm("WLANCfg", row, "Enable", &enable, sizeof(enable)))
+            enable = 0;
+        if (dbGetValComm("WLANCfg", row, "MapAccessAttr", &access, sizeof(access)))
+            access = 0;
+        if (dbGetValComm("WLANPSK", row, "PreSharedKey", key, sizeof(key)))
+            key[0] = 0;
+        used += (size_t)snprintf(line + used, sizeof(line) - used, "[%u ssid=%s enable=%u access=%u key_len=%u]",
+                                 row, ssid, enable, access, (unsigned int)strlen(key));
+        mb_wipe(key, sizeof(key));
+    }
+    (void)ShmPoolUnlock();
+    printf("ZTE_AGENT_WLAN %s rows=%s\n", label, line);
+    fflush(NULL);
+}
+
+/* WLANPSK read back through the view API, which is how the daemon itself addresses the row (by instance id,
+ * not by row number - dbGetValComm() with a row index reports nothing for this table even after it is
+ * written). The key lands at offset 260 of the 328-byte row (wlan_psk.def: ViewName, WLANViewName,
+ * PreSharedKey, KeyPassphrase); only its length is printed, never the key, plus whether it equals the one the
+ * M2 carried - the length alone would not rule out a coincidence. */
+static void dump_psk_rows(const char *label, const char *expected_24g, const char *expected_5g)
+{
+    char line[384], key[32], buffer[328];
+    const char *expected[2] = { expected_24g, expected_5g };
+    size_t used = 0;
+    unsigned int radio;
+    line[0] = '\0';
+    for (radio = 0; radio < 2 && used < sizeof(line) - 96; radio++) {
+        uint32_t size = sizeof(buffer), magic = 0x01020304;
+        int status, matches = 0;
+        size_t key_length = 0;
+        char view[36] = "";
+        extern int WlanIndex2PSKInstId(unsigned int, unsigned int, char *);
+        extern int dbAPIGetView(const char *, const char *, void *);
+        if (WlanIndex2PSKInstId(radio, 0, key))
+            continue;
+        memset(buffer, 0, sizeof(buffer));
+        memcpy(buffer, &size, 4);
+        memcpy(buffer + 4, &magic, 4);
+        status = dbAPIGetView("WLANPSK", key, buffer);
+        if (!status) {
+            key_length = strnlen(buffer + 260, 64);
+            memcpy(view, buffer + 100, sizeof(view) - 1);
+            matches = expected[radio] && !strcmp(buffer + 260, expected[radio]);
+        }
+        used += (size_t)snprintf(line + used, sizeof(line) - used,
+                                 "[%s status=%d view=%s key_len=%u m2_match=%d]",
+                                 key, status, status ? "-" : view, (unsigned int)key_length, matches);
+        mb_wipe(buffer, sizeof(buffer));
+    }
+    printf("ZTE_AGENT_PSK %s rows=%s\n", label, line);
+    fflush(NULL);
+}
+
+/* MAC of a local interface (the daemon's AL MAC is br0's, it binds its 1905 socket to that device). */
+static int local_mac(const char *name, uint8_t out[6])
+{
+    struct ifreq interface;
+    int fd, result, saved;
+    memset(&interface, 0, sizeof(interface));
+    snprintf(interface.ifr_name, sizeof(interface.ifr_name), "%s", name);
+    fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    result = ioctl(fd, SIOCGIFHWADDR, &interface);
+    saved = errno;
+    close(fd);
+    errno = saved;
+    if (result || interface.ifr_hwaddr.sa_family != 1)
+        return -1;
+    memcpy(out, interface.ifr_hwaddr.sa_data, 6);
+    return 0;
+}
+
+/* Which band an M1 is about, read from the radio identifier the daemon carries in its 0x85 TLV. This lab has
+ * no radio hardware, so get_wlan_radio_info() answers from a hard-coded per-band table whose entries are
+ * ASCII: "MAP24G" for 2.4 GHz and "MAP5GL" for 5 GHz. Returns -1 when the identifier is neither. */
+static int radio_band(const uint8_t *radio, size_t bytes)
+{
+    if (!radio || bytes < 6)
+        return -1;
+    if (!memcmp(radio + 3, "24G", 3))
+        return 0;
+    if (!memcmp(radio + 3, "5GL", 3))
+        return 1;
+    return -1;
+}
+
+/* The interfaces this side can see, so "the daemon emitted nothing" and "we looked at the wrong interface" are
+ * told apart in the log. Names, indexes and MACs only. */
+static void dump_interfaces(void)
+{
+    struct if_nameindex *list = if_nameindex(), *entry;
+    char line[512];
+    size_t used = 0;
+    if (!list)
+        return;
+    line[0] = 0;
+    for (entry = list; entry->if_index; entry++) {
+        struct ifreq interface;
+        int fd;
+        memset(&interface, 0, sizeof(interface));
+        snprintf(interface.ifr_name, sizeof(interface.ifr_name), "%s", entry->if_name);
+        fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (fd >= 0 && !ioctl(fd, SIOCGIFHWADDR, &interface) && interface.ifr_hwaddr.sa_family == 1) {
+            const unsigned char *mac = (const unsigned char *)interface.ifr_hwaddr.sa_data;
+            used += (size_t)snprintf(line + used, sizeof(line) - used, "[%u %s %02x:%02x:%02x:%02x:%02x:%02x]",
+                                     entry->if_index, entry->if_name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        } else {
+            used += (size_t)snprintf(line + used, sizeof(line) - used, "[%u %s]", entry->if_index, entry->if_name);
+        }
+        if (fd >= 0)
+            close(fd);
+        if (used > sizeof(line) - 64)
+            break;
+    }
+    if_freenameindex(list);
+    printf("ZTE_AGENT_IF interfaces=%s\n", line);
+    fflush(NULL);
+}
+
+/* Lab observation of the agent side: the daemon boots as a Slave (Mode 1, SetRoleEnable 0, EnMasterOnly 0) and this side
+ * is the synthetic controller - it answers the daemon's AP-autoconfiguration Search and runs the public WSC M1/M2
+ * exchange, then reports what the M2 did to the WLANCfg/WLANPSK rows. Bounded; private netns only. */
+int controller_agent_startup(void)
+{
+    /* The identity profile startup_identity() writes. verify_profile_adapter() asserts exactly these values,
+     * so this one stays fixed across modes. */
+    static const struct mb_profile identity = { .request_id = 1, .security = MB_WPA2_PSK_AES, .enabled = 1,
+        .ssid_length = 19, .key_length = 20, .ssid = "zte-controller-test", .key = "public-test-only-key" };
+    /* What the M2 carries: deliberately different from the identity, so a change in the WLANCfg/WLANPSK rows
+     * can only have come from applying the controller's configuration (the AGENT_PROBE 6.5 criterion).
+     * One profile per band, because the daemon enrols each radio with its own M1 - a single answer profile
+     * cannot tell "the second M2 was applied to the right row" from "it was applied to the same row twice". */
+    static const struct mb_profile answer_24g = { .request_id = 2, .security = MB_WPA2_PSK_AES, .enabled = 1,
+        .ssid_length = 12, .key_length = 16, .ssid = "zte-agent-2g", .key = "m2-public-2g-key" };
+    static const struct mb_profile answer_5g = { .request_id = 3, .security = MB_WPA2_PSK_AES, .enabled = 1,
+        .ssid_length = 12, .key_length = 16, .ssid = "zte-agent-5g", .key = "m2-public-5g-key" };
+    siginfo_t info;
+    struct mb_profile profiles[2] = { identity, identity };
+    struct timespec start, now, pause_time = {0, 100000000};
+    struct controller_frame frame;
+    unsigned char daemon[6] = {0}, al_mac[6] = {0}, have_daemon = 0;
+    /* Supported Service TLV values to try as "Multi-AP Controller": the daemon declares 1 for itself as an
+     * Agent, so the lab cycles the three plausible encodings until it stops re-searching. */
+    static const unsigned int service_cycle[3] = { 0, 2, 1 };
+    unsigned int seen = 0, i, search = 0, discovery = 0, topo_sent = 0, m1_bytes = 0;
+    int status, id = -1, timed = 0, listener = -1, election_fired = 0, m1_seen = 0, debug_raised = 0;
+    /* One M2 per radio: the daemon sends an M1 for every band it wants configured, and answering only the
+     * first one is what left band 1 unconfigured in the earlier runs. */
+    uint8_t answered[4][6];
+    unsigned int answered_count = 0, band_applied[2] = { 0, 0 };
+    long last_m1 = -1;
+    /* Restart phase: the shared-memory engine belongs to this process, so a daemon restart is the only way
+     * this lab can ask whether the agent keeps the profile it was just given. 1 = running, 2 = failed. */
+    int reboot = 0;
+    long reboot_at = -1;
+    unsigned int reboot_m1 = 0;
+    long last_topo = -1, next_sync = 0;
+    int last_cmdu[8], last_mid[8];
+    pid_t child;
+    for (i = 0; i < 8; i++)
+        last_cmdu[i] = last_mid[i] = -1;
+    controller_set_role(CONTROLLER_ROLE_SLAVE);
+    /* Open the listener first: the daemon may send its Search as soon as its acds task runs. */
+    dump_interfaces();
+    if (local_mac("br0", al_mac))
+        memset(al_mac, 0, sizeof(al_mac));
+    listener = controller_cmdu_listener();
+    printf("ZTE_AGENT_WIRE listener=%d epoch=%ld\n", listener, (long)time(NULL));
+    fflush(NULL);
+    if (controller_boot(profiles, "2", 1, &child, &id) || clock_gettime(CLOCK_MONOTONIC, &start)) {
+        printf("ZTE_AGENT_WIRE boot=failed errno=%d\n", errno);
+        fflush(NULL);
+        if (listener >= 0)
+            close(listener);
+        return -1;
+    }
+    dump_wlan_rows("before");
+    dump_psk_rows("before", NULL, NULL);
+    for (;;) {
+        long elapsed;
+        int read;
+        memset(&info, 0, sizeof(info));
+        if (waitid(P_PID, child, &info, WEXITED | WNOHANG | WNOWAIT)) {
+            if (errno == EINTR)
+                continue;
+            if (listener >= 0)
+                close(listener);
+            return -1;
+        }
+        if (info.si_pid == child) {
+            printf("ZTE_AGENT_WIRE daemon_exited=1\n");
+            fflush(NULL);
+            break;
+        }
+        if (clock_gettime(CLOCK_MONOTONIC, &now)) {
+            (void)kill(child, SIGKILL);
+            continue;
+        }
+        elapsed = now.tv_sec - start.tv_sec;
+        while ((read = controller_read_frame(listener, &frame)) == 1) {
+            /* One line per new (CMDU, message id) pair: the observation is "which frames does a Slave emit". */
+            unsigned int slot = 0;
+            while (slot < 8 && last_cmdu[slot] >= 0 &&
+                   (last_cmdu[slot] != (int)frame.cmdu || last_mid[slot] != (int)frame.mid))
+                slot++;
+            if (slot < 8 && last_cmdu[slot] < 0) {
+                last_cmdu[slot] = (int)frame.cmdu;
+                last_mid[slot] = (int)frame.mid;
+                printf("ZTE_AGENT_WIRE rx cmdu=0x%04x mid=0x%04x bytes=%u wsc_msg_type=%u service=%u,%u epoch=%ld\n",
+                       frame.cmdu, frame.mid, frame.bytes, frame.wsc_message, frame.service_count,
+                       frame.service_first, (long)time(NULL));
+                fflush(NULL);
+                seen++;
+            }
+            if (!have_daemon) {
+                memcpy(daemon, frame.src, 6);
+                have_daemon = 1;
+            }
+            /* The synchroniser, observed from the same side as the rows: once an M2 has been answered the
+             * daemon writes WLANCfg/WLANPSK, and this turns those rows into the host-side plan. */
+            if (m1_seen && elapsed >= next_sync) {
+                next_sync = elapsed + 2;
+                status = agent_sync_poll(AGENT_WLAN_PLAN);
+                if (status > 0)
+                    printf("ZTE_AGENT_WIRE wlan_plan=1 path=%s epoch=%ld\n", AGENT_WLAN_PLAN, (long)time(NULL));
+                fflush(NULL);
+            }
+            if (frame.cmdu == 0x0007) {
+                /* AP Autoconfiguration Search: the enrolment request a controller answers on the band it names. */
+                unsigned int band = frame.band > 1 ? 0 : frame.band;
+                search++;
+                status = controller_autoconfig_response(frame.src, band, frame.mid);
+                printf("ZTE_AGENT_WIRE search_reply band=%u mid=0x%04x status=%d\n", band, frame.mid, status);
+                fflush(NULL);
+            } else if (frame.cmdu == 0x0000) {
+                /* Topology Discovery: the answer that makes the agent record us as its controller. */
+                unsigned int service = service_cycle[discovery % 3];
+                discovery++;
+                status = controller_topology_query(frame.src, 0x1200 + discovery, service);
+                topo_sent++;
+                last_topo = elapsed;
+                printf("ZTE_AGENT_WIRE topology_query mid=0x%04x discovery=%u service=%u status=%d\n",
+                       0x1200 + discovery, discovery, service, status);
+                fflush(NULL);
+            } else if (frame.cmdu == 0x0009 && frame.wsc_message == 4) {
+                /* WSC M1: the agent (enrollee) is asking for the configuration of one radio. The lab peer is
+                 * the registrar here, so it answers with an M2 carrying that band's profile. Every radio gets
+                 * its own answer - the daemon enrols 2.4G and 5G separately, and with only the first M1
+                 * answered the second band stayed at the identity profile. */
+                struct controller_wsc_check check;
+                static const char *const stage_name[] = { "none", "parse", "keys", "settings", "settings-leaf",
+                    "keywrap", "unused", "encrypt", "m2-head", "m2-body", "authenticator" };
+                int band = radio_band(frame.radio, frame.radio_bytes);
+                int duplicate = 0;
+                for (i = 0; i < answered_count; i++)
+                    if (!memcmp(answered[i], frame.radio, 6))
+                        duplicate = 1;
+                m1_seen++;
+                m1_bytes = frame.bytes;
+                last_m1 = elapsed;
+                printf("ZTE_AGENT_WIRE radio_id=%02x:%02x:%02x:%02x:%02x:%02x text=%.6s band=%d "
+                       "mid=0x%04x duplicate=%d\n",
+                       frame.radio[0], frame.radio[1], frame.radio[2], frame.radio[3], frame.radio[4],
+                       frame.radio[5], frame.radio_bytes >= 6 ? (const char *)frame.radio : "?", band, frame.mid,
+                       duplicate);
+                if (reboot) {
+                    /* After the restart only the question "does it re-enrol" is open, so the M1 is counted
+                     * and left unanswered: answering it would rewrite the rows with the same profile and
+                     * hide whether the earlier apply survived the restart. */
+                    reboot_m1++;
+                    printf("ZTE_AGENT_WIRE wsc_m1_after_reboot bytes=%u mid=0x%04x band=%d answered=0\n",
+                           frame.bytes, frame.mid, band);
+                    fflush(NULL);
+                    continue;
+                }
+                if (duplicate || answered_count >= sizeof(answered) / sizeof(answered[0])) {
+                    printf("ZTE_AGENT_WIRE wsc_m1_skipped bytes=%u reason=%s answered=%u\n", frame.bytes,
+                           duplicate ? "already-answered" : "table-full", answered_count);
+                    fflush(NULL);
+                    continue;
+                }
+                status = controller_wsc_answer_m1(&frame, band == 1 ? &answer_5g : &answer_24g, &check);
+                if (check.m1_tags[0])
+                    printf("ZTE_AGENT_WIRE m1_tags=%s\n", check.m1_tags);
+                if (check.m2_tags[0])
+                    printf("ZTE_AGENT_WIRE m2_tags=%s\n", check.m2_tags);
+                printf("ZTE_AGENT_WIRE wsc_m1 bytes=%u mid=0x%04x wsc=%u radio=%u m2_sent=%d stage=%u "
+                       "stage_name=%s keywrap=%u authenticator=%u profile=%u band=%d epoch=%ld\n",
+                       frame.bytes, frame.mid, (unsigned int)frame.wsc_bytes, (unsigned int)frame.radio_bytes,
+                       status, check.stage, stage_name[check.stage < 11 ? check.stage : 0], check.keywrap_verified,
+                       check.authenticator_verified, check.profile_matched, band, (long)time(NULL));
+                fflush(NULL);
+                if (!status) {
+                    memcpy(answered[answered_count], frame.radio, 6);
+                    answered_count++;
+                    if (band >= 0 && band <= 1)
+                        band_applied[band] = 1;
+                }
+            }
+        }
+        if (read < 0 && errno != EAGAIN)
+            break;
+        /* The daemon's own acd/topo decisions are only logged at debug level; raise it once the daemon is up so
+         * "the Slave did not start the M1 exchange" can be read from its side too. Factory channel, no sendcmd -
+         * and no shell: the lab root has no /bin/sh, so this is a direct exec. */
+        if (debug_raised < 2 && elapsed >= 3 + 6 * debug_raised) {
+            static const char *const tasks[2] = { "multiapd.acd.acd", "multiapd.base.base" };
+            pid_t helper = fork();
+            if (helper == 0) {
+                int quiet = open("/dev/null", O_WRONLY);
+                if (quiet >= 0) {
+                    (void)dup2(quiet, 1);
+                    (void)dup2(quiet, 2);
+                }
+                execl("/bin/zte-debugcmd", "zte-debugcmd", tasks[debug_raised], "-l", "8", (char *)NULL);
+                _exit(127);
+            }
+            status = -1;
+            if (helper > 0)
+                while (waitpid(helper, &status, 0) < 0 && errno == EINTR)
+                    ;
+            printf("ZTE_AGENT_DEBUG task=%s level=8 exit=%d\n", tasks[debug_raised],
+                   WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            fflush(NULL);
+            debug_raised++;
+        }
+        /* No Search in the first 18 s: the factory agent is nudged by cspd's cooperator (AGENT_PROBE section 5.3). */
+        if (!election_fired && !search && elapsed >= 18) {
+            election_fired = 1;
+            status = controller_election_trigger();
+            printf("ZTE_AGENT_WIRE election_trigger status=%d\n", status);
+            fflush(NULL);
+        }
+        /* The daemon may have sent its Discovery before the listener was up, and one query the daemon drops must
+         * not be the only one: repeat it every 8 s until the M1 shows up. Before the daemon has been heard from at
+         * all its AL MAC is still known - it is br0's. */
+        if ((reboot == 1 || !m1_seen) && topo_sent < 8 &&
+            (last_topo < 0 ? elapsed >= 4 : elapsed >= last_topo + 8)) {
+            unsigned int service = service_cycle[topo_sent % 3];
+            status = controller_topology_query(have_daemon ? daemon : al_mac, 0x1200 + (unsigned int)topo_sent,
+                                               service);
+            topo_sent++;
+            last_topo = elapsed;
+            printf("ZTE_AGENT_WIRE topology_query retry=%u at=%lds to=%s service=%u status=%d\n", topo_sent,
+                   elapsed, have_daemon ? "daemon-src" : "br0-mac", service, status);
+            fflush(NULL);
+        }
+        /* Leave 8 s after the last M1 for the M2 to be applied - or 20 s while a band is still unenrolled,
+         * because the daemon's second M1 can follow the first by a while. */
+        if (!reboot && answered_count && elapsed >= last_m1 + (band_applied[0] && band_applied[1] ? 8 : 20)) {
+            dump_wlan_rows("after");
+            dump_psk_rows("after", answer_24g.key, answer_5g.key);
+            printf("ZTE_AGENT_SYNC final=1 publish=%d plan=%s\r\n", agent_sync_poll(AGENT_WLAN_PLAN), AGENT_WLAN_PLAN);
+            /* Restart the daemon with the database intact. The factory multiapd_mgr does exactly this
+             * (SIGKILL, then start again; the engine lives in cspd), so it is the closest this lab gets to
+             * "the agent router rebooted": the rows and the daemon's own state are kept, the process is not. */
+            status = controller_respawn_daemon(&child);
+            printf("ZTE_AGENT_WIRE respawn status=%d epoch=%ld\n", status, (long)time(NULL));
+            fflush(NULL);
+            if (status) {
+                reboot = 2;
+                break;
+            }
+            reboot = 1;
+            reboot_at = elapsed;
+            /* Announce ourselves to the new instance: the acd task does not leave state 0 on its own.
+             * Observed before this was added - the restarted daemon built its M1 phrase and never put a
+             * single frame on the wire, which reads as "it kept its configuration" when it only meant
+             * "nobody told it a controller exists". */
+            last_topo = -1;
+            topo_sent = 0;
+            dump_wlan_rows("reboot-before");
+            dump_psk_rows("reboot-before", answer_24g.key, answer_5g.key);
+        } else if (reboot == 1 && elapsed >= reboot_at + 30) {
+            dump_wlan_rows("reboot-after");
+            dump_psk_rows("reboot-after", answer_24g.key, answer_5g.key);
+            (void)kill(child, SIGKILL);
+            break;
+        }
+        if (elapsed >= 100) {
+            timed = 1;
+            dump_wlan_rows("after");
+            dump_psk_rows("after", answer_24g.key, answer_5g.key);
+            printf("ZTE_AGENT_SYNC final=1 publish=%d plan=%s\r\n", agent_sync_poll(AGENT_WLAN_PLAN), AGENT_WLAN_PLAN);
+            (void)kill(child, SIGKILL);
+            break;
+        }
+        nanosleep(&pause_time, NULL);
+    }
+    if (listener >= 0)
+        close(listener);
+    while (waitpid(child, &status, 0) < 0)
+        if (errno != EINTR)
+            return -1;
+    printf("ZTE_AGENT_WIRE observed=1 frames=%u search_seen=%u discovery_seen=%u topology_sent=%u "
+           "election_triggered=%d m1_seen=%d answered=%u band_24g=%u band_5g=%u m1_bytes=%u reboot=%d "
+           "reboot_m1=%u timed=%d exit=%d\n",
+           seen, search, discovery, topo_sent, election_fired, m1_seen, answered_count, band_applied[0],
+           band_applied[1], m1_bytes, reboot, reboot_m1, timed, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    fflush(NULL);
     return controller_shutdown_private(id);
 }

@@ -111,6 +111,223 @@ int controller_wsc_m2_matches(const uint8_t *frame, size_t bytes, const uint8_t 
     }
     return 0;
 }
+/* WSC attribute scanner: one entry per tag, exactly like the verifier's, so a malformed M1 is refused
+ * rather than half-read. */
+static int find_attr(const uint8_t *s, size_t n, unsigned int tag, const uint8_t **data, size_t *length)
+{
+    size_t at = 0;
+    int found = 0;
+    *data = NULL;
+    *length = 0;
+    while (n - at >= 4) {
+        unsigned int type = u16(s + at);
+        size_t len = u16(s + at + 2);
+        at += 4;
+        if (len > n - at)
+            return -1;
+        if (type == tag) {
+            if (found++)
+                return -1;
+            *data = s + at;
+            *length = len;
+        }
+        at += len;
+    }
+    return at == n && found == 1 ? 0 : -1;
+}
+
+/* One line of tags for the diagnostics: "104a,1022,101a,…". */
+static void tag_list(const uint8_t *s, size_t n, char *out, size_t cap)
+{
+    size_t at = 0, used = 0;
+    out[0] = '\0';
+    while (n - at >= 4) {
+        unsigned int tag = u16(s + at);
+        size_t length = u16(s + at + 2);
+        int written;
+        if (length > n - at - 4 || used + 6 >= cap)
+            break;
+        written = snprintf(out + used, cap - used, used ? ",%04x" : "%04x", tag);
+        if (written < 1)
+            break;
+        used += (size_t)written;
+        at += 4 + length;
+    }
+}
+
+/* Registrar side of the exchange: turn the agent's WSC M1 into an M2 that carries the fixture profile and
+ * send it back in a CMDU 0x0009. This is the frame the factory controller produces and the one the daemon's
+ * _acdcRcvApAutoConfigWSCM2 is waiting for; the encrypted settings are built with the real derivation, so a
+ * daemon that applies them has been given genuine (public test) credentials, not a parser shortcut. */
+int controller_wsc_answer_m1(const struct controller_frame *frame, const struct mb_profile *wanted,
+                             struct controller_wsc_check *check)
+{
+    static const uint8_t peer[6] = {2, 0, 0, 0, 0x19, 0x0a};
+    static const uint8_t multi_ap_ext[6] = {0x00, 0x37, 0x2a, 6, 1, 0}; /* OUI + teardown subelement = 0 */
+    uint8_t secret[32], pub[192], registrar_nonce[16], registrar_uuid[16], keys[96];
+    uint8_t plain[512], encrypted[512], m2[1024], kwa[8], digest[8], digest_data[1600];
+    uint8_t packet[1600];
+    const uint8_t *uuid, *enrollee_mac, *enrollee_nonce, *enrollee_pub, *data;
+    size_t n_uuid, n_mac, n_nonce, n_pub, plain_used = 0, enc_bytes = 0, m2_used = 0;
+    size_t recovered = 0, packet_used = 22, digest_used = 0;
+    struct sockaddr_ll target = { .sll_family = AF_PACKET, .sll_protocol = htons(0x893a), .sll_halen = 6 };
+    const char *private = getenv("ZTE_MESH_DB_SANDBOX");
+    int fd = -1, result = -1, sent;
+    if (check)
+        memset(check, 0, sizeof(*check));
+    if (!frame || !wanted || frame->wsc_message != 4 || !frame->wsc_bytes ||
+        !private || strcmp(private, "1") || wanted->security != MB_WPA2_PSK_AES || wanted->enabled != 1 ||
+        wanted->ssid_length < 1 || wanted->ssid_length > 32 || wanted->key_length < 8 || wanted->key_length > 63)
+        return -1;
+    if (find_attr(frame->wsc, frame->wsc_bytes, 0x1047, &uuid, &n_uuid) || n_uuid != 16 ||
+        find_attr(frame->wsc, frame->wsc_bytes, 0x1020, &enrollee_mac, &n_mac) || n_mac != 6 ||
+        find_attr(frame->wsc, frame->wsc_bytes, 0x101a, &enrollee_nonce, &n_nonce) || n_nonce != 16 ||
+        find_attr(frame->wsc, frame->wsc_bytes, 0x1032, &enrollee_pub, &n_pub) || n_pub != 192 ||
+        find_attr(frame->wsc, frame->wsc_bytes, 0x1022, &data, &n_pub) || n_pub != 1 || *data != 4)
+        return -1;
+    if (check) {
+        check->stage = 1;
+        tag_list(frame->wsc, frame->wsc_bytes, check->m1_tags, sizeof(check->m1_tags));
+    }
+    if (RAND_bytes(secret, sizeof(secret)) != 1 || RAND_bytes(registrar_nonce, sizeof(registrar_nonce)) != 1 ||
+        RAND_bytes(registrar_uuid, sizeof(registrar_uuid)) != 1 ||
+        public_key(pub, secret) ||
+        controller_wsc_registrar_keys(secret, enrollee_pub, enrollee_nonce, enrollee_mac, registrar_nonce, keys))
+        goto done;
+    if (check)
+        check->stage = 2;
+    /* Encrypted settings, flat: acdcParseM2Msg walks the decrypted list attribute by attribute and dispatches
+     * on type against one table (0x1045, 0x1003, 0x100f, 0x1028, 0x1027, 0x1020, 0x101e, 0x1049). There is no
+     * Credential (0x100e) wrapper around those entries in the factory's own M2 - with one, the SSID and the
+     * key are never seen and the profile is applied empty ("mesh sync for M2: index[0], SSID[]"). */
+    if (check)
+        check->stage = 3;
+    if (attr(plain, sizeof(plain), &plain_used, 0x1045, wanted->ssid, wanted->ssid_length) ||
+        scalar(plain, sizeof(plain), &plain_used, 0x1003, 0x0020, 2) ||
+        scalar(plain, sizeof(plain), &plain_used, 0x100f, 0x0008, 2) ||
+        attr(plain, sizeof(plain), &plain_used, 0x1027, wanted->key, wanted->key_length) ||
+        attr(plain, sizeof(plain), &plain_used, 0x1049, multi_ap_ext, sizeof(multi_ap_ext)))
+        goto done;
+    if (check)
+        check->stage = 4;
+    /* Key Wrap Authenticator: HMAC over everything before it, so 0x101e closes the plaintext. */
+    if (controller_wsc_hmac8(keys, plain, plain_used, kwa) ||
+        attr(plain, sizeof(plain), &plain_used, 0x101e, kwa, sizeof(kwa)))
+        goto done;
+    if (check)
+        check->stage = 5;
+    if (controller_wsc_encrypt(keys + 32, plain, plain_used, encrypted, sizeof(encrypted), &enc_bytes))
+        goto done;
+    if (check) {
+        /* Read the settings back with the same keys: proves the AES path before anything is sent. */
+        uint8_t back[512];
+        check->stage = 7;
+        if (!controller_wsc_decrypt(keys + 32, encrypted, enc_bytes, back, sizeof(back), &recovered) &&
+            recovered >= plain_used && !memcmp(back, plain, plain_used))
+            check->keywrap_verified = 1;
+        mb_wipe(back, sizeof(back));
+    }
+    if (check)
+        check->stage = 8;
+    /* M2 attribute list, in the order the factory's own eap_wps_build_message_M2 writes it. The device
+     * attributes are echoed from the agent's M1: eap_wps_process_message_M2 walks that exact set and stops at
+     * the first slot it cannot read, which is how "get WPS_TYPE_UUID_R error" appeared - 0x1048 (UUID-R), not
+     * the 0x1047 (UUID-E) the M1 carries, is the tag it wants after the two nonces. */
+    if (scalar(m2, sizeof(m2), &m2_used, 0x104a, 0x10, 1) ||
+        scalar(m2, sizeof(m2), &m2_used, 0x1022, 5, 1) ||
+        attr(m2, sizeof(m2), &m2_used, 0x101a, enrollee_nonce, n_nonce) ||
+        attr(m2, sizeof(m2), &m2_used, 0x1039, registrar_nonce, sizeof(registrar_nonce)) ||
+        attr(m2, sizeof(m2), &m2_used, 0x1048, registrar_uuid, sizeof(registrar_uuid)) ||
+        attr(m2, sizeof(m2), &m2_used, 0x1032, pub, sizeof(pub)))
+        goto done;
+    {
+        static const unsigned int device_tags[] = {
+            0x1004, /* auth type flags */        0x1010, /* encryption type flags */
+            0x100d, /* connection type flags */  0x1008, /* configuration methods */
+            0x1021, /* manufacturer */           0x1023, /* model name */
+            0x1024, /* model number */           0x1042, /* serial number */
+            0x1054, /* primary device type */    0x1011, /* device name */
+            0x103c, /* RF bands */               0x1002, /* association state */
+            0x1009, /* configuration error */    0x1012, /* device password id */
+            0x102d  /* OS version */
+        };
+        size_t i;
+        for (i = 0; i < sizeof(device_tags) / sizeof(device_tags[0]); i++) {
+            const uint8_t *value;
+            size_t length;
+            if (find_attr(frame->wsc, frame->wsc_bytes, device_tags[i], &value, &length))
+                continue; /* not in this M1; nothing to echo */
+            if (attr(m2, sizeof(m2), &m2_used, device_tags[i], value, length))
+                goto done;
+        }
+    }
+    if (attr(m2, sizeof(m2), &m2_used, 0x1018, encrypted, enc_bytes))
+        goto done;
+    if (check) {
+        check->m2_tags[0] = '\0';
+        tag_list(m2, m2_used, check->m2_tags, sizeof(check->m2_tags));
+    }
+    if (check)
+        check->stage = 9;
+    /* Authenticator over the whole M1 attribute list followed by M2 up to (not including) itself. */
+    if (frame->wsc_bytes + m2_used > sizeof(digest_data))
+        goto done;
+    memcpy(digest_data, frame->wsc, frame->wsc_bytes);
+    memcpy(digest_data + frame->wsc_bytes, m2, m2_used);
+    digest_used = frame->wsc_bytes + m2_used;
+    if (controller_wsc_hmac8(keys, digest_data, digest_used, digest) ||
+        attr(m2, sizeof(m2), &m2_used, 0x1005, digest, sizeof(digest)))
+        goto done;
+    if (check) {
+        check->authenticator_verified = 1;
+        check->profile_matched = 1;
+        check->stage = 10;
+    }
+    /* CMDU 0x0009 back to the agent: the WSC TLV first, then the AP Radio Identifier TLV (0x82) naming the
+     * radio being configured - the same order the factory's own M2 uses (_acdsRcvApAutoConfigWSCM1 inserts
+     * the WSC TLV, then I5TlvApRadioIdentifierTypeAcdInsert). Its payload is the six-byte Radio Unique
+     * Identifier the agent put at the head of its AP Radio Basic Capabilities TLV: _acdcCheckAPRadioIdentifier
+     * memcmp()s it against the identifier its WLAN database reports for that band and drops the M2 on any
+     * mismatch ("Check APRadioIdentifier failed"). */
+    target.sll_ifindex = (int)if_nametoindex("lab-peer");
+    if (!target.sll_ifindex)
+        goto done;
+    memcpy(packet, frame->src, 6);
+    memcpy(packet + 6, peer, 6);
+    packet[12] = 0x89; packet[13] = 0x3a;
+    packet[16] = 0x00; packet[17] = 0x09;
+    packet[18] = (uint8_t)(frame->mid >> 8); packet[19] = (uint8_t)frame->mid;
+    packet[21] = 0x80;
+    packet[packet_used++] = 0x11;
+    packet[packet_used++] = (uint8_t)(m2_used >> 8);
+    packet[packet_used++] = (uint8_t)m2_used;
+    memcpy(packet + packet_used, m2, m2_used);
+    packet_used += m2_used;
+    if (frame->radio_bytes == 6) {
+        packet[packet_used++] = 0x82;
+        packet[packet_used++] = 0;
+        packet[packet_used++] = 6;
+        memcpy(packet + packet_used, frame->radio, 6);
+        packet_used += 6;
+    }
+    target.sll_halen = 6;
+    memcpy(target.sll_addr, frame->src, 6);
+    fd = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(0x893a));
+    if (fd < 0)
+        goto done;
+    sent = sendto(fd, packet, packet_used, 0, (struct sockaddr *)&target, sizeof(target));
+    result = sent == (ssize_t)packet_used ? 0 : -1;
+done:
+    if (fd >= 0)
+        close(fd);
+    mb_wipe(secret, sizeof(secret)); mb_wipe(pub, sizeof(pub)); mb_wipe(keys, sizeof(keys));
+    mb_wipe(plain, sizeof(plain)); mb_wipe(encrypted, sizeof(encrypted));
+    mb_wipe(m2, sizeof(m2)); mb_wipe(kwa, sizeof(kwa)); mb_wipe(digest, sizeof(digest));
+    mb_wipe(digest_data, sizeof(digest_data)); mb_wipe(packet, sizeof(packet));
+    mb_wipe(registrar_nonce, sizeof(registrar_nonce));
+    return result;
+}
+
 int controller_inject_wsc_m1(void)
 {
     static const uint8_t peer[6] = {2, 0, 0, 0, 0x19, 0x0a};

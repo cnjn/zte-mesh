@@ -3,6 +3,9 @@
 # that consumes request files and answers in state.json. Run: sh tests/test_rpcd.sh [PLUGIN]
 PLUGIN=${1:-$(dirname "$0")/../openwrt/zte-mesh/files/luci.zte-mesh}
 T=$(mktemp -d) || exit 1
+# Git Bash's mktemp hands back a Windows drive prefix (C:\...), which the delete helpers on that host
+# refuse; going through pwd gives the POSIX form there and changes nothing on Linux.
+T=$(cd "$T" && pwd)
 trap 'kill $SVC 2>/dev/null; rm -rf "$T"' EXIT
 export ZTE_MESH_RUNDIR=$T/run ZTE_MESH_ACTION_WAIT=3
 mkdir -p "$T/run/actions"
@@ -40,6 +43,27 @@ check list "$(sh -c 'set -- list; . "$ZTE_PLUGIN"' | tr -d ' ')" '{"status":{},"
 
 # fake service: answer status 0 for every request, remember the request text
 echo '{"actions":[]}' > "$T/run/state.json"
+
+# status names the role, so a child router shows up as one and a script does not have to read /etc/config
+status_out=$(call status '{}')
+case "$status_out" in
+*'"role":"master"'*) pass=$((pass + 1)) ;;
+*) echo "FAIL status-role: got '$status_out'"; fail=$((fail + 1)) ;;
+esac
+
+# status also reports what the child-side applier did last: it runs outside the sandbox, so the service cannot know.
+printf 'epoch=1761740000\nresult=ok\nchanged=1\nbands=2g 5g\nmessage=\n' > "$T/run/wlan-sync.status"
+status_out=$(call status '{}')
+case "$status_out" in
+*'"sync":{"epoch":1761740000,"result":"ok","bands":"2g5g"'*) pass=$((pass + 1)) ;;
+*) echo "FAIL status-sync: got '$status_out'"; fail=$((fail + 1)) ;;
+esac
+rm -f "$T/run/wlan-sync.status"
+status_out=$(call status '{}')
+case "$status_out" in
+*'"sync":null'*) pass=$((pass + 1)) ;;
+*) echo "FAIL status-sync-none: got '$status_out'"; fail=$((fail + 1)) ;;
+esac
 ( while :; do
 	for f in "$T"/run/actions/*.act; do
 		[ -e "$f" ] || continue

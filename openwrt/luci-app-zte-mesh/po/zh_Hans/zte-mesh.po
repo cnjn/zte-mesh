@@ -2,12 +2,17 @@ msgid ""
 msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Language: zh_Hans\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
 
 msgid "ZTE Mesh"
 msgstr "中兴组网"
 
-msgid "Manage ZTE child routers over the wired LAN. This router acts as the mesh controller; the child routers receive the Wi-Fi profile below."
-msgstr "通过有线局域网管理中兴子路由器。本路由器作为组网主控,子路由器会收到下方的 Wi-Fi 配置。"
+msgid "The main router: this router is the mesh controller and also broadcasts the Wi-Fi profile below, so it and its child routers put the same network on the air."
+msgstr "主路由：本机既是组网主控，也自己广播下面这套 Wi-Fi，于是它和子路由在空中是同一个网络。"
+
+msgid "A controller without Wi-Fi of its own: it manages the child routers and gives them the Wi-Fi profile below. This router's own radios are left alone."
+msgstr "本身不带无线的控制器：只管理子路由并把下面这套 Wi-Fi 下发给它们，本机无线保持原样不动。"
 
 msgid "The ZTE Mesh runtime is not installed on this router."
 msgstr "本路由器尚未安装中兴组网运行环境。"
@@ -46,7 +51,7 @@ msgid "Pending"
 msgstr "待处理"
 
 msgid "A setting changed that the controller reads only at start; restart the controller to apply it."
-msgstr "有只在启动时读取的设置已更改,请重启主控使其生效。"
+msgstr "有只在启动时读取的设置已更改，请重启主控使其生效。"
 
 msgid "Report"
 msgstr "状态报告"
@@ -132,29 +137,44 @@ msgstr "漫游与频段引导"
 msgid "Device role"
 msgstr "设备角色"
 
-msgid "Default (master)"
-msgstr "默认(主路由)"
+msgid "Controller only"
+msgstr "仅主控"
+
+msgid "Controller only: this router manages the child routers and gives them the Wi-Fi profile, but its own radios are left exactly as they are. That is the shape of most wired OpenWrt boxes at the head of a mesh, so it is the default. Main router: the same controller that also broadcasts the profile itself -- pick this when the box has Wi-Fi and should put the network on the air too. Child router: this router is a mesh agent, it hands nothing out and the controller gives it the Wi-Fi name, key and security. A child starts from the wireless network this router already broadcasts until the controller sends its own, so nothing has to be filled in here: the Wi-Fi, roaming and extra-network settings are hidden while the child role is selected. On the two roles that apply a profile here, a radio device that was switched off is switched on when the band is enabled, because a disabled radio puts nothing on the air; a radio switched off afterwards stays off until a different profile arrives. Changing the role restarts the service and reloads this page, and the child routers drop out of the topology for a short while."
+msgstr "仅主控：本机管理子路由、把 Wi-Fi 档案下发给它们，自己的射频原样不动。这是有线 OpenWrt 盒子做组网头端时最常见的形态，所以是默认值。主路由：同一个主控，但自己也广播这套档案——盒子带无线、并且应该把网络发到空中时选它。子路由：本机是 mesh 代理，不下发任何东西，由主控给出 Wi-Fi 名称、密码与加密方式。子路由启动时先用本机正在广播的无线网络，直到主控下发自己的配置，所以这里不需要填任何东西：选中子路由后，Wi-Fi、漫游与额外网络设置都会隐藏。在会把档案应用到本机的这两个角色上，某个频段启用时原先关着的射频设备会被打开——射频关着就等于什么都没发射；此后被手动关掉的射频会一直关着，直到来了不同的档案。改角色会重启服务并重新加载本页，子路由器会短暂掉出拓扑。"
 
 msgid "Main router"
 msgstr "主路由"
 
-msgid "Adaptive"
-msgstr "自适应"
+msgid "Child router"
+msgstr "子路由"
 
-msgid "The factory \"main router / adaptive\" switch. Only the controller role is supported. Changing from main router to adaptive restarts the mesh daemon twice and the child routers drop out of the topology for a short while; adding or removing this option restarts the service."
-msgstr "原厂的\"主路由 / 自适应\"开关。只支持主控角色。从主路由改为自适应会让组网守护进程重启两次,子路由器会短暂掉出拓扑;添加或删除此选项会重启服务。"
+msgid "Backhaul to the controller"
+msgstr "回控制器的方式"
+
+msgid "Off (main SSIDs only)"
+msgstr "关闭（只应用主 SSID)"
+
+msgid "Multi-AP (4-address)"
+msgstr "Multi-AP(4 地址）"
+
+msgid "How the child role reaches the controller over the radio. Off: only the main SSIDs are applied, as before. Multi-AP: the hidden backhaul network the controller sends becomes its own BSS marked as a Multi-AP backhaul, and the main SSIDs are marked as fronthaul, so the mesh control traffic crosses the radio as 4-address Ethernet. Requires a hostapd built with Multi-AP support (the full wpad, not wpad-basic); nothing is created until the controller has sent a backhaul network."
+msgstr "子路由通过无线回连控制器的方式。关闭：只应用主 SSID，与之前一致。Multi-AP：控制器下发的隐藏回程网络会成为独立的 BSS 并标记为 Multi-AP 回程，主 SSID 标记为前传，组网控制报文因此能以 4 地址以太网帧穿过无线。需要编译了 Multi-AP 支持的 hostapd（完整 wpad，不是 wpad-basic)；控制器没有下发回程网络之前不会创建任何东西。"
+
+msgid "This router is a mesh child: the controller manages it and gives it the Wi-Fi name, password and security."
+msgstr "本机是 mesh 子路由：由主控管理，Wi-Fi 名称、密码与加密方式都由主控下发。"
 
 msgid "Self-organizing network"
 msgstr "自组网"
 
 msgid "On (ZTE enhanced)"
-msgstr "开(中兴增强模式)"
+msgstr "开（中兴增强模式）"
 
 msgid "Off (ZTE compatible)"
-msgstr "关(中兴兼容模式)"
+msgstr "关（中兴兼容模式）"
 
 msgid "The factory MESH switch. On (ZTE enhanced): only ZTE child routers with the same market code are accepted. Off (ZTE compatible, default): any child router is accepted. Switching restarts the mesh daemon (the child routers drop out of the topology for up to a minute)."
-msgstr "原厂的 MESH 开关。开(中兴增强模式):只接受市场码相同的中兴子路由器。关(中兴兼容模式,默认):接受任何子路由器。切换会重启组网守护进程(子路由器最多一分钟内掉出拓扑)。"
+msgstr "原厂的 MESH 开关。开（中兴增强模式）：只接受市场码相同的中兴子路由器。关（中兴兼容模式，默认）：接受任何子路由器。切换会重启组网守护进程（子路由器最多一分钟内掉出拓扑）。"
 
 msgid "Wi-Fi 7 MLO"
 msgstr "Wi-Fi 7 MLO"
@@ -163,10 +183,13 @@ msgid "Same name and password on both bands"
 msgstr "双频使用相同的名称和密码"
 
 msgid "On: the 5 GHz band uses the 2.4 GHz name, password, security, hidden setting and MAC filter policy. Off: the 5 GHz name is the 2.4 GHz name plus the suffix below unless a 5 GHz name is given."
-msgstr "开:5 GHz 使用 2.4 GHz 的名称、密码、安全方式、隐藏设置和 MAC 过滤策略。关:除非单独填了 5 GHz 名称,否则 5 GHz 名称 = 2.4 GHz 名称 + 下方的后缀。"
+msgstr "开：5 GHz 使用 2.4 GHz 的名称、密码、安全方式、隐藏设置和 MAC 过滤策略。关：除非单独填了 5 GHz 名称，否则 5 GHz 名称 = 2.4 GHz 名称 + 下方的后缀。"
 
 msgid "Off switches the main network of this band off on the child routers."
 msgstr "关闭会让子路由器上这个频段的主网络关闭。"
+
+msgid "Off switches the main network of this band off here and on the child routers."
+msgstr "关闭后，本频段的主网络在本机和子路由上都会关掉。"
 
 msgid "2.4 GHz name + suffix"
 msgstr "2.4 GHz 名称 + 后缀"
@@ -184,19 +207,19 @@ msgid "%s security"
 msgstr "%s 加密方式"
 
 msgid "None (open network)"
-msgstr "无(开放网络)"
+msgstr "无（开放网络）"
 
 msgid "Child routers without WPA3 treat WPA2/WPA3 as WPA2 and ignore WPA3-only. \"None\" makes the main network open."
-msgstr "不支持 WPA3 的子路由器会把 WPA2/WPA3 当作 WPA2,并忽略仅 WPA3。\"无\"会让主网络变成开放网络。"
+msgstr "不支持 WPA3 的子路由器会把 WPA2/WPA3 当作 WPA2，并忽略仅 WPA3。\"无\"会让主网络变成开放网络。"
 
 msgid "%s beacon interval (ms)"
-msgstr "%s 信标间隔(毫秒)"
+msgstr "%s 信标间隔（毫秒）"
 
 msgid "%s channel"
 msgstr "%s 信道"
 
 msgid "%s transmit power (dBm, EIRP)"
-msgstr "%s 发射功率(dBm,EIRP)"
+msgstr "%s 发射功率（dBm,EIRP)"
 
 msgid "%s MAC filter policy"
 msgstr "%s MAC 过滤策略"
@@ -217,16 +240,16 @@ msgid "Band steering"
 msgstr "频段引导"
 
 msgid "Band steering threshold, 2.4 GHz (dBm)"
-msgstr "频段引导阈值,2.4 GHz(dBm)"
+msgstr "频段引导阈值，2.4 GHz(dBm)"
 
 msgid "Band steering threshold, 5 GHz (dBm)"
-msgstr "频段引导阈值,5 GHz(dBm)"
+msgstr "频段引导阈值，5 GHz(dBm)"
 
 msgid "Roaming threshold, 2.4 GHz (dBm)"
-msgstr "漫游阈值,2.4 GHz(dBm)"
+msgstr "漫游阈值，2.4 GHz(dBm)"
 
 msgid "Roaming threshold, 5 GHz (dBm)"
-msgstr "漫游阈值,5 GHz(dBm)"
+msgstr "漫游阈值，5 GHz(dBm)"
 
 msgid "Force roaming on weak signal"
 msgstr "弱信号强制切换"
@@ -235,7 +258,7 @@ msgid "Extra Wi-Fi networks"
 msgstr "额外的 Wi-Fi 网络"
 
 msgid "Guest, spare and hidden backhaul networks of the child routers. The slots of one band must be 1, 2, 3 in order without a gap: removing slot 1 while slot 2 exists is refused. Adding or removing a slot makes the child routers drop out of the topology for up to a minute; switching one on or off does not."
-msgstr "子路由器的访客、备用和隐藏回程网络。同一频段的槽位必须按 1、2、3 连续,不能有空档:槽位 2 还在时去掉槽位 1 会被拒绝。增加或去掉槽位会让子路由器最多一分钟内掉出拓扑;开关一个槽位不会。"
+msgstr "子路由器的访客、备用和隐藏回程网络。同一频段的槽位必须按 1、2、3 连续，不能有空档：槽位 2 还在时去掉槽位 1 会被拒绝。增加或去掉槽位会让子路由器最多一分钟内掉出拓扑；开关一个槽位不会。"
 
 msgid "Band"
 msgstr "频段"
@@ -244,13 +267,13 @@ msgid "Slot"
 msgstr "槽位"
 
 msgid "1 (guest)"
-msgstr "1(访客)"
+msgstr "1（访客）"
 
 msgid "2 (spare)"
-msgstr "2(备用)"
+msgstr "2（备用）"
 
 msgid "3 (hidden backhaul)"
-msgstr "3(隐藏回程)"
+msgstr "3（隐藏回程）"
 
 msgid "Enabled"
 msgstr "启用"
@@ -274,7 +297,7 @@ msgid "MAC filter list"
 msgstr "MAC 过滤列表"
 
 msgid "Up to 16 devices. A rule applies to the main network of the chosen band or to one of its extra networks; the policy above decides whether listed devices are blocked or the only ones allowed."
-msgstr "最多 16 台设备。一条规则作用于所选频段的主网络或其某个额外网络;上方的策略决定列表中的设备是被禁止还是唯一被允许。"
+msgstr "最多 16 台设备。一条规则作用于所选频段的主网络或其某个额外网络；上方的策略决定列表中的设备是被禁止还是唯一被允许。"
 
 msgid "MAC address"
 msgstr "MAC 地址"
@@ -307,16 +330,16 @@ msgid "The request was malformed."
 msgstr "请求格式不正确。"
 
 msgid "That router is not online or is not a ZTE router."
-msgstr "该路由器不在线,或不是中兴路由器。"
+msgstr "该路由器不在线，或不是中兴路由器。"
 
 msgid "The controller is restarting; try again in a moment."
-msgstr "主控正在重启,请稍后再试。"
+msgstr "主控正在重启，请稍后再试。"
 
 msgid "The controller is not running."
 msgstr "主控没有运行。"
 
 msgid "The controller could not send the request (%s)."
-msgstr "主控没能发出请求(%s)。"
+msgstr "主控没能发出请求（%s）。"
 
 msgid "Actions"
 msgstr "操作"
@@ -355,16 +378,16 @@ msgid "Wi-Fi 5 compatible network"
 msgstr "Wi-Fi 5 兼容网络"
 
 msgid "Announces the network as Wi-Fi 5 only to child routers that understand it; many models ignore it."
-msgstr "只对看得懂的子路由器声明该网络为 Wi-Fi 5;很多型号会忽略。"
+msgstr "只对看得懂的子路由器声明该网络为 Wi-Fi 5；很多型号会忽略。"
 
 msgid "Wi-Fi schedule"
 msgstr "Wi-Fi 定时关闭"
 
 msgid "Switch Wi-Fi off during these windows on every child router. \"All Wi-Fi\" turns off the main networks and the guest and spare networks (the hidden backhaul network stays on); \"Guest network\" turns off guest network 1 only. A window that ends before it starts runs past midnight. Times are in the router's time zone (the zone in effect when the settings were saved)."
-msgstr "在这些时间段内关闭每台子路由器的 Wi-Fi。\"全部 Wi-Fi\"关闭主网络以及访客、备用网络(隐藏的回程网络保持开启);\"访客网络\"只关闭访客网络 1。结束时间早于开始时间表示跨过午夜。时间按路由器的时区计(保存设置时生效的时区)。"
+msgstr "在这些时间段内关闭每台子路由器的 Wi-Fi。\"全部 Wi-Fi\"关闭主网络以及访客、备用网络（隐藏的回程网络保持开启）;\"访客网络\"只关闭访客网络 1。结束时间早于开始时间表示跨过午夜。时间按路由器的时区计（保存设置时生效的时区）。"
 
 msgid "Use the form HH:MM, for example 23:00"
-msgstr "请用 HH:MM 的格式,例如 23:00"
+msgstr "请用 HH:MM 的格式，例如 23:00"
 
 msgid "Off from"
 msgstr "关闭时间"
@@ -373,7 +396,7 @@ msgid "Back on at"
 msgstr "恢复时间"
 
 msgid "On the days that start on"
-msgstr "适用的星期(按开始当天算)"
+msgstr "适用的星期（按开始当天算）"
 
 msgid "Mon"
 msgstr "周一"
@@ -418,7 +441,7 @@ msgid "Router names"
 msgstr "路由器名称"
 
 msgid "Names for child routers, shown in the list above instead of the name the router reports. They are kept on this router only; the child routers keep their own names."
-msgstr "给子路由器起的名称,显示在上面的列表里,代替路由器自己报的名称。只保存在本路由器上,子路由器保留自己的名称。"
+msgstr "给子路由器起的名称，显示在上面的列表里，代替路由器自己报的名称。只保存在本路由器上，子路由器保留自己的名称。"
 
 msgid "Not saved: "
 msgstr "未保存："
@@ -441,8 +464,8 @@ msgstr "8 到 63 个字符。留空：与 2.4 GHz 密码相同。"
 msgid "8 to 63 characters"
 msgstr "8 到 63 个字符"
 
-msgid "8 to 63 characters, default 00000000. Required: the controller does not start without one."
-msgstr "8 到 63 个字符，默认 00000000。必填：不填主控不会启动。"
+msgid "8 to 63 characters, default Ztemesh2631!. Required: the controller does not start without one."
+msgstr "8 到 63 个字符，默认 Ztemesh2631!。必填：不填主控不会启动。"
 
 msgid "1 to 8 characters, appended to the 2.4 GHz name when no 5 GHz name is given (factory default -5G). The whole name must stay within 31 characters."
 msgstr "1 到 8 个字符，未填 5 GHz 名称时接在 2.4 GHz 名称后面（出厂默认 -5G）。拼出的名称不能超过 31 个字符。"
@@ -509,3 +532,21 @@ msgstr "填设备当前使用的地址：手机常对每个网络使用不同的
 
 msgid "Up to 20 characters: letters, digits and _ . -. Empty: acl1, acl2 and so on."
 msgstr "最多 20 个字符：字母、数字和 _ . -。留空则为 acl1、acl2 等。"
+
+msgid "Child router, managed by the controller"
+msgstr "子路由，由主控管理"
+
+msgid "Controller only: this router's own radios are not managed here"
+msgstr "仅主控：本机无线不在这里管理"
+
+msgid "Wi-Fi synchronisation"
+msgstr "Wi-Fi 同步"
+
+msgid "Applied"
+msgstr "已应用"
+
+msgid "Failed"
+msgstr "失败"
+
+msgid "%d s ago"
+msgstr "%d 秒前"

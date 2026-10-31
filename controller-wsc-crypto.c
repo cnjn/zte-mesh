@@ -4,6 +4,8 @@
  * left-aligned in a zeroed buffer (0x83dd0/0x83efc); retain that exact quirk.
  */
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "controller-wsc-crypto.h"
 typedef struct bignum_st BIGNUM;
@@ -33,6 +35,11 @@ extern void EVP_CIPHER_CTX_free(EVP_CIPHER_CTX *);
 extern int EVP_DecryptInit_ex(EVP_CIPHER_CTX *, const EVP_CIPHER *, void *, const unsigned char *, const unsigned char *);
 extern int EVP_DecryptUpdate(EVP_CIPHER_CTX *, unsigned char *, int *, const unsigned char *, int);
 extern int EVP_DecryptFinal_ex(EVP_CIPHER_CTX *, unsigned char *, int *);
+extern int EVP_EncryptInit_ex(EVP_CIPHER_CTX *, const EVP_CIPHER *, void *, const unsigned char *, const unsigned char *);
+extern int EVP_EncryptUpdate(EVP_CIPHER_CTX *, unsigned char *, int *, const unsigned char *, int);
+extern int EVP_EncryptFinal_ex(EVP_CIPHER_CTX *, unsigned char *, int *);
+extern int EVP_CIPHER_CTX_set_padding(EVP_CIPHER_CTX *, int);
+extern int RAND_bytes(unsigned char *, int);
 static const char prime[] =
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E08"
     "8A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD"
@@ -123,6 +130,80 @@ static int profile(const uint8_t *plain, size_t n, const struct mb_profile *want
         if (at != len) return -1;
     }
     return 0;
+}
+/* Registrar side. The key derivation is the enrollee's, with the roles in the seed swapped: the nonce and the
+ * MAC are the enrollee's, the second nonce is the registrar's, and the DH secret is ours against its public
+ * key. Same 96 bytes out: AuthKey, KeyWrapKey, EMSK. */
+int controller_wsc_registrar_keys(const uint8_t secret[32], const uint8_t enrollee_pub[192],
+                                  const uint8_t enrollee_nonce[16], const uint8_t enrollee_mac[6],
+                                  const uint8_t registrar_nonce[16], uint8_t keys[96])
+{
+    if (!secret || !enrollee_pub || !enrollee_nonce || !enrollee_mac || !registrar_nonce || !keys)
+        return -1;
+    return derive(secret, enrollee_pub, enrollee_nonce, enrollee_mac, registrar_nonce, keys);
+}
+/* First 8 bytes of HMAC-SHA256(AuthKey, data): the WPS "Authenticator" and "Key Wrap Authenticator". */
+int controller_wsc_hmac8(const uint8_t authkey[32], const uint8_t *data, size_t n, uint8_t out[8])
+{
+    uint8_t digest[32];
+    if (!authkey || !data || !out || !n || n > 2800)
+        return -1;
+    if (hash_mac(authkey, data, n, digest))
+        return -1;
+    memcpy(out, digest, 8);
+    mb_wipe(digest, sizeof(digest));
+    return 0;
+}
+/* WPS encrypted settings (attribute 0x1018) in the shape the factory produces. eap_wps_build_message_M2
+ * picks a random 16-byte IV, encrypts the attribute list with AES-128-CBC and pads it PKCS#7 style with
+ * 16 - (len % 16) bytes of that value, so an already aligned list still grows by a whole block; the IV goes
+ * in front of the ciphertext. eap_wps_process_message_M2 reads exactly that back: buf + 16 is the ciphertext,
+ * buf is the IV, and the last plaintext byte must be 1..16. */
+int controller_wsc_encrypt(const uint8_t key[32], const uint8_t *plain, size_t n, uint8_t *out, size_t cap,
+                           size_t *written)
+{
+    EVP_CIPHER_CTX *ctx = NULL;
+    size_t length;
+    int used = 0, final = 0, result = -1;
+    if (!key || !plain || !out || !written || !n)
+        return -1;
+    length = n + 16 - (n % 16); /* PKCS#7: always at least one padding byte */
+    if (cap < 16 + length || RAND_bytes(out, 16) != 1)
+        return -1;
+    ctx = EVP_CIPHER_CTX_new();
+    if (!ctx)
+        return -1;
+    /* Padding stays on: Init has to come first, it resets the context flags. */
+    if (!EVP_EncryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, key, out) ||
+        !EVP_EncryptUpdate(ctx, out + 16, &used, plain, (int)n) || used < 0 ||
+        !EVP_EncryptFinal_ex(ctx, out + 16 + used, &final) || final < 0 ||
+        (size_t)(used + final) != length)
+        goto done;
+    *written = 16 + length;
+    result = 0;
+done:
+    EVP_CIPHER_CTX_free(ctx);
+    return result;
+}
+/* The inverse, for the round-trip check before anything is put on the wire. */
+int controller_wsc_decrypt(const uint8_t key[32], const uint8_t *in, size_t n, uint8_t *out, size_t cap,
+                           size_t *written)
+{
+    EVP_CIPHER_CTX *ctx = NULL;
+    int used = 0, final = 0, result = -1;
+    if (!key || !in || !out || !written || n < 32 || (n - 16) % 16 || n - 16 > cap + 16)
+        return -1;
+    ctx = EVP_CIPHER_CTX_new();
+    if (!ctx || !EVP_DecryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, key, in) ||
+        !EVP_DecryptUpdate(ctx, out, &used, in + 16, (int)n - 16) || used < 0 ||
+        !EVP_DecryptFinal_ex(ctx, out + used, &final) || final < 0 ||
+        (size_t)(used + final) > cap)
+        goto done;
+    *written = (size_t)(used + final);
+    result = 0;
+done:
+    EVP_CIPHER_CTX_free(ctx);
+    return result;
 }
 int controller_wsc_verify_m2(const uint8_t *m1, size_t n1, const uint8_t *m2, size_t n2,
                            const uint8_t secret[32], const struct mb_profile *wanted,
