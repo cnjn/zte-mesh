@@ -1,0 +1,380 @@
+#!/bin/sh
+# Apply a Wi-Fi plan to the host's own Wi-Fi configuration.
+#
+#   wlan-sync [PLAN] [--once]
+#
+# The mesh service runs inside a private sandbox: it can write /run/zte-mesh, and nothing else. Two roles publish a
+# plan there, and this script does not care which:
+#
+#   child router   the profile the controller sent arrives as an M2, the vendor daemon writes it into its
+#                  configuration database, and the service turns those rows into PLAN (agent-sync.c).
+#   main router    this router is the controller, so there is no M2 to wait for: the service writes PLAN from the
+#                  profile it hands to the child routers (write_local_plan in zte-mesh.init).
+#
+# Either way this script is the other half: it maps the plan onto /etc/config/wireless and reloads the radios, which
+# is the step the factory image leaves to cspd and its driver layer. A controller-only router has no plan and no
+# instance of this script -- its own radios are not its business.
+#
+# Only the main BSS of each band is applied (slot 0). The extra SSID slots (1..3) are reported and skipped: the
+# factory daemon drives them through its own driver interface, and inventing hostapd sections for them here
+# would give the router a second, competing source of truth.
+#
+# The one exception is the backhaul BSS. With `zte_mesh.main.backhaul=multi_ap` the plan rows whose
+# MapAccessAttr carries bit 6 (value 64, the factory marks the hidden backhaul BSS that way) become their own
+# wifi-iface with multi_ap=2, and the main BSS of each band is marked multi_ap=1 (fronthaul). That is the
+# data path the 1905 control plane rides on: Multi-AP backhaul is a 4-address BSS, which is what a CMDU
+# needs to cross the radio as a plain Ethernet frame. 802.11s is deliberately not used here -- its data
+# frames carry a mesh header, so 1905.1 frames cannot traverse it.
+#
+# The default is `off`: the script then behaves exactly as before and touches no multi_ap option at all. A
+# backhaul row is only applied when the plan actually carries it; the SSID and key come from the controller's
+# M2, never from a name this script invents.
+#
+# Nothing is applied that the plan does not change: the script compares every value first and only commits and
+# reloads when at least one differs.
+#
+# One thing beyond the plan's own fields: a wifi-device that is switched off is switched on when the plan enables
+# the main BSS of its band (see enable_radio). A radio cannot broadcast while its device is disabled, and routers
+# arrive that way -- the factory image and the lab's ax3600 ship every wifi-device disabled -- so without it the
+# child holds the controller's SSID in /etc/config/wireless and puts nothing on the air. It only ever writes 0, so
+# a band the plan disables keeps its device and with it the backhaul BSS of that band.
+set -u
+
+PLAN=${1:-/run/zte-mesh/wlan-plan}
+[ "$PLAN" = "--once" ] && { PLAN=/run/zte-mesh/wlan-plan; ONCE=1; }
+[ "${2:-}" = "--once" ] && ONCE=1
+# Written next to the plan, so the sandboxed service and the page can see what happened outside the sandbox.
+STATUS=$(dirname "$PLAN")/wlan-sync.status
+
+log() { logger -t wlan-sync -p daemon.notice "$*" 2>/dev/null || echo "wlan-sync: $*" >&2; }
+
+# Every write goes through this: CHANGED says the configuration differs from the plan (commit and reload needed),
+# TOUCHED says the row being applied wrote something (the status file names the bands that way).
+TOUCHED=0
+changed() { CHANGED=1; TOUCHED=1; }
+
+command -v uci >/dev/null 2>&1 || { log "uci is not available; nothing to apply"; exit 1; }
+
+# backhaul_mode -> "multi_ap" or "off". Anything unexpected is off, so a typo cannot half-enable the backhaul.
+backhaul_mode() {
+	local value
+	value=$(uci -q get zte_mesh.main.backhaul 2>/dev/null)
+	case "$value" in multi_ap) echo multi_ap ;; *) echo off ;; esac
+}
+
+# encryption NAME -> the UCI encryption of a factory BeaconType
+encryption_of() {
+	case "$1" in
+	0) echo none ;;
+	3) echo psk2 ;;
+	6) echo psk-mixed ;;
+	10) echo sae ;;
+	12) echo sae-mixed ;;
+	*) return 1 ;;
+	esac
+}
+
+# uci_true VALUE -> 1 when the value is a true-ish UCI boolean, 0 otherwise. UCI accepts the word forms as well as
+# 1/0, and a config edited by hand (or written by another tool) may well say `true`.
+uci_true() {
+	case "$1" in 1|[Tt][Rr][Uu][Ee]|on|yes) echo 1 ;; *) echo 0 ;; esac
+}
+
+# radio_off SECTION -> 1 when that wifi-device is switched off. A missing `disabled` means the radio is on, which
+# is also what "no wifi-device at all" answers -- callers only ask about a device they already resolved.
+radio_off() {
+	uci_true "$(uci -q get "wireless.$1.disabled" 2>/dev/null)"
+}
+
+# enable_radio DEVICE BAND -> switch a switched-off wifi-device on, because the controller says its band should be
+# on the air. Only 0 is ever written: a band the plan disables keeps its device, since switching the device off
+# would take that band's backhaul BSS down with it, and that BSS is the control path. This is not a watchdog
+# either: it runs when the plan changes, so a radio switched off by hand afterwards stays off until the controller
+# publishes a different profile.
+#
+# It exists because a router can arrive with its radios off -- the factory image and the lab's ax3600 ship every
+# wifi-device disabled -- and then the child has the controller's SSID in /etc/config/wireless and nothing on the
+# air, which looks like "the plan is not applied" while it is applied perfectly.
+enable_radio() {
+	local device="$1" band="$2"
+	[ "$(radio_off "$device")" = 1 ] || return 0
+	uci -q set "wireless.$device.disabled=0"
+	changed
+	log "radio $device ($band) was switched off; switched on so the controller's network can go on the air"
+	return 0
+}
+
+# radio_section_of BAND -> the wifi-device that serves that band (2g / 5g)
+#
+# The band is a name, not a section, and a board may carry two devices on one band: the xiaomi,ax3600 in the lab
+# does, an unused PCIe 5 GHz card (radio0, ath10k) next to the SoC's 5 GHz radio (radio1, ath11k), and both say
+# band '5g'. Returning the first match wrote the controller's name into the spare device while the radio on the
+# air kept its old SSID, which on the child looks exactly like "the 5 GHz row is not applied at all".
+#
+# So, in order: an explicit pin wins (zte_mesh.main.wifi_2g / wifi_5g, the wifi-device section name); a band with
+# a single device needs no guess; with several, the only device that is not switched off (older images leave a
+# spare radio disabled). Two live candidates and no pin is ambiguous, and guessing there is worse than leaving
+# the band alone: the caller reports it, and the user pins it -- the name of the option is in the message.
+radio_section_of() {
+	local want="$1" pin section band hwmode candidates="" live=""
+	pin=$(uci -q get "zte_mesh.main.wifi_$want" 2>/dev/null)
+	for section in $(uci -q show wireless | sed -n "s/^wireless\.\([^.=]*\)=wifi-device$/\1/p"); do
+		band=$(uci -q get "wireless.$section.band" 2>/dev/null)
+		hwmode=$(uci -q get "wireless.$section.hwmode" 2>/dev/null)
+		case "$band:$hwmode" in
+		2g:*) [ "$want" = 2g ] || continue ;;
+		5g:*) [ "$want" = 5g ] || continue ;;
+		*:11g) [ "$want" = 2g ] || continue ;;
+		*:11a) [ "$want" = 5g ] || continue ;;
+		*) continue ;;
+		esac
+		candidates="$candidates $section"
+		[ "$(radio_off "$section")" = 1 ] || live="$live $section"
+	done
+	[ -n "$candidates" ] || return 1
+	if [ -n "$pin" ]; then
+		case " $candidates " in
+		*" $pin "*) echo "$pin"; return 0 ;;
+		esac
+		log "zte_mesh.main.wifi_$want names '$pin', which is not a $want device on this router (${candidates# }); ignored"
+	fi
+	set -- $candidates
+	[ $# -eq 1 ] && { echo "$1"; return 0; }
+	set -- $live
+	[ $# -eq 1 ] && { echo "$1"; return 0; }
+	log "several $want radios (${candidates# }) and no way to tell which one carries the mesh; set zte_mesh.main.wifi_$want to one of them, this band is left alone until then"
+	return 1
+}
+
+# ap_iface RADIO_SECTION -> the AP interface section on that radio (the one without a network of its own is
+# preferred, which is how OpenWrt names the main SSID). The backhaul BSS is never the main SSID, so both the
+# section it is given here and any section already marked multi_ap=2 are skipped.
+ap_iface_of() {
+	local radio="$1" section device mode multi found=""
+	for section in $(uci -q show wireless | sed -n "s/^wireless\.\([^.=]*\)=wifi-iface$/\1/p"); do
+		case "$section" in zte_backhaul_*) continue ;; esac
+		device=$(uci -q get "wireless.$section.device")
+		mode=$(uci -q get "wireless.$section.mode")
+		[ "$device" = "$radio" ] || continue
+		[ "$mode" = ap ] || continue
+		multi=$(uci -q get "wireless.$section.multi_ap")
+		[ "$multi" = 2 ] && continue
+		case "$section" in
+		default_*|*_default*) echo "$section"; return 0 ;;
+		esac
+		[ -n "$found" ] || found=$section
+	done
+	[ -n "$found" ] && { echo "$found"; return 0; }
+	return 1
+}
+
+# set_opt SECTION OPTION VALUE -> 1 when the value had to be written
+set_opt() {
+	local section="$1" option="$2" value="$3" current
+	current=$(uci -q get "wireless.$section.$option" 2>/dev/null)
+	[ "$current" = "$value" ] && return 1
+	uci -q set "wireless.$section.$option=$value"
+	changed
+	return 0
+}
+
+# apply_key SECTION ENCRYPTION KEY -> write the key where this image keeps it
+apply_key() {
+	local iface="$1" enc="$2" key="$3"
+	# The key has two spellings in /etc/config/wireless: `key` (the psk options) and `password` (sae).
+	# Write `key` always, and `password` only where the image already uses it, so nothing is invented.
+	if [ "$enc" = none ]; then
+		[ -n "$(uci -q get "wireless.$iface.key" 2>/dev/null)" ] &&
+			{ uci -q delete "wireless.$iface.key"; changed; }
+		[ -n "$(uci -q get "wireless.$iface.password" 2>/dev/null)" ] &&
+			{ uci -q delete "wireless.$iface.password"; changed; }
+		return 0
+	fi
+	set_opt "$iface" key "$key"
+	[ -n "$(uci -q get "wireless.$iface.password" 2>/dev/null)" ] && set_opt "$iface" password "$key"
+	return 0
+}
+
+# apply_backhaul BAND SSID KEY ENABLED HIDDEN BEACON -> create or update the multi_ap backhaul BSS of a band.
+# The name and the key are the controller's, taken from the plan row that carried MapAccessAttr bit 6.
+apply_backhaul() {
+	local band="$1" ssid="$2" key="$3" enabled="$4" hidden="$5" beacon="$6"
+	local device iface main main_network enc
+	device=$(radio_section_of "$band") || { log "no usable $band radio; backhaul left alone"; return 1; }
+	enc=$(encryption_of "${beacon:-3}") || { log "backhaul on $band: unknown security mode ${beacon:-?}; left alone"; return 1; }
+	[ "$enabled" = 1 ] && enable_radio "$device" "$band"
+	iface=zte_backhaul_$band
+	if [ "$(uci -q get "wireless.$iface" 2>/dev/null)" != wifi-iface ]; then
+		uci -q set "wireless.$iface=wifi-iface"
+		changed
+	fi
+	set_opt "$iface" device "$device"
+	set_opt "$iface" mode ap
+	# multi_ap 2 = backhaul BSS. hostapd turns that into the 4-address BSS the 1905 data path needs; it is
+	# also what tells a matching station which BSS it may associate with as a backhaul STA.
+	set_opt "$iface" multi_ap 2
+	set_opt "$iface" ssid "$ssid"
+	set_opt "$iface" encryption "$enc"
+	set_opt "$iface" disabled "$([ "$enabled" = 1 ] && echo 0 || echo 1)"
+	set_opt "$iface" hidden "${hidden:-1}"
+	# Same bridge as the main SSID of that radio, so the backhaul lands on br-lan like the fronthaul does.
+	main=$(ap_iface_of "$device")
+	if [ -n "$main" ]; then
+		main_network=$(uci -q get "wireless.$main.network" 2>/dev/null)
+		[ -n "$main_network" ] && set_opt "$iface" network "$main_network"
+	fi
+	apply_key "$iface" "$enc" "$key"
+	log "backhaul on $band ($device.$iface): name ${#ssid} characters, security $enc, enabled $enabled, multi_ap 2"
+	return 0
+}
+
+# clear_backhaul -> undo what multi_ap mode wrote, once the mode is no longer multi_ap
+clear_backhaul() {
+	local section band device iface
+	for section in $(uci -q show wireless | sed -n "s/^wireless\.\(zte_backhaul_[^.=]*\)=wifi-iface$/\1/p"); do
+		uci -q delete "wireless.$section"
+		changed
+		log "backhaul mode is off; removed $section"
+	done
+	# The fronthaul flag is ours as well, but only the value this script writes (1) is reverted: a 2 or a 3
+	# was put there by someone else, and deleting it would be this script overruling them.
+	for band in 2g 5g; do
+		device=$(radio_section_of "$band") || continue
+		iface=$(ap_iface_of "$device") || continue
+		[ "$(uci -q get "wireless.$iface.multi_ap" 2>/dev/null)" = 1 ] || continue
+		uci -q delete "wireless.$iface.multi_ap"
+		changed
+		log "backhaul mode is off; cleared multi_ap on $iface"
+	done
+}
+
+apply_plan() {
+	local plan="$1" rows=0 index radio slot ssid key enabled hidden beacon access
+	local iface device band enc is_backhaul
+	# Re-read on every pass: editing the UCI option takes effect on the next published plan, no restart.
+	BACKHAUL=$(backhaul_mode)
+	CHANGED=0
+	[ "$BACKHAUL" = multi_ap ] || clear_backhaul
+	rows=$(sed -n 's/^rows=//p' "$plan" | head -n 1)
+	case "$rows" in ''|*[!0-9]*) log "plan has no row count"; return 1 ;; esac
+	[ "$rows" -gt 0 ] || return 0
+	index=0
+	while [ "$index" -lt "$rows" ]; do
+		radio=$(sed -n "s/^$index\.radio=//p" "$plan" | head -n 1)
+		slot=$(sed -n "s/^$index\.slot=//p" "$plan" | head -n 1)
+		ssid=$(sed -n "s/^$index\.ssid=//p" "$plan" | head -n 1)
+		key=$(sed -n "s/^$index\.key=//p" "$plan" | head -n 1)
+		enabled=$(sed -n "s/^$index\.enabled=//p" "$plan" | head -n 1)
+		hidden=$(sed -n "s/^$index\.hidden=//p" "$plan" | head -n 1)
+		beacon=$(sed -n "s/^$index\.beacon_type=//p" "$plan" | head -n 1)
+		access=$(sed -n "s/^$index\.access=//p" "$plan" | head -n 1)
+		index=$((index + 1))
+		case "$radio" in 0|1) ;; *) continue ;; esac
+		TOUCHED=0
+		# MapAccessAttr: bit 5 (32) is the fronthaul BSS, bit 6 (64) the hidden backhaul BSS. Older service
+		# builds publish no access field at all, and then every row is treated as it was before this mode.
+		case "${access:-}" in ''|*[!0-9]*) access=0 ;; esac
+		is_backhaul=0
+		[ $((access & 64)) -eq 64 ] && is_backhaul=1
+		[ "$radio" = 0 ] && band=2g || band=5g
+		if [ "$is_backhaul" = 1 ]; then
+			if [ "$BACKHAUL" != multi_ap ]; then
+				log "radio $radio: plan carries a backhaul BSS but backhaul mode is off; not applied"
+				continue
+			fi
+			[ -n "$ssid" ] || { log "radio $radio: backhaul row has no name in the plan; left alone"; continue; }
+			apply_backhaul "$band" "$ssid" "$key" "${enabled:-0}" "$hidden" "${beacon:-3}"
+			mark_band "$band"
+			continue
+		fi
+		if [ "${slot:-0}" != 0 ]; then
+			log "slot $slot of radio $radio is not applied here (factory driver interface)"
+			continue
+		fi
+		[ -n "$ssid" ] || { log "radio $radio has no name in the plan; left alone"; continue; }
+		enc=$(encryption_of "${beacon:-3}") || { log "radio $radio: unknown security mode ${beacon:-?}; left alone"; continue; }
+		device=$(radio_section_of "$band") || { log "no usable $band radio; left alone"; continue; }
+		iface=$(ap_iface_of "$device") || { log "no AP interface on $device ($band); left alone"; continue; }
+		[ "$enabled" = 1 ] && enable_radio "$device" "$band"
+		set_opt "$iface" disabled "$([ "$enabled" = 1 ] && echo 0 || echo 1)"
+		set_opt "$iface" ssid "$ssid"
+		[ -n "$hidden" ] && set_opt "$iface" hidden "$hidden"
+		set_opt "$iface" encryption "$enc"
+		# The main BSS is the fronthaul half of a Multi-AP pair; without the flag a matching backhaul STA
+		# would not know this BSS carries the Multi-AP element.
+		[ "$BACKHAUL" = multi_ap ] && set_opt "$iface" multi_ap 1
+		apply_key "$iface" "$enc" "$key"
+		log "radio $radio ($band, $device.$iface): name set to ${#ssid} characters, security $enc, enabled $enabled"
+		mark_band "$band"
+	done
+	key=""
+	return 0
+}
+
+# Change detector for the plan. The first version asked stat(1) for mtime:size, and this `stat` is not in
+# every OpenWrt image (it is missing from the xiaomi,ax3600 one), so the stamp degraded to the constant
+# "missing" -- equal on every pass, which means the loop applied the plan once at start and then never
+# again. On a child that is configured by an M2 that is exactly backwards: the plan appears after the
+# enrolment and nobody applies it. Content is what the loop reacts to anyway, and the file is small.
+stamp() {
+	local value
+	[ -r "$1" ] || { echo missing; return 0; }
+	if command -v md5sum >/dev/null 2>&1; then
+		value=$(md5sum "$1" 2>/dev/null | awk '{print $1; exit}')
+	elif command -v stat >/dev/null 2>&1; then
+		value=$(stat -c '%Y:%s' "$1" 2>/dev/null)
+	else
+		value=$(ls -ln "$1" 2>/dev/null)
+	fi
+	echo "${value:-unreadable}"
+}
+
+# One line per run, next to the plan: when it last ran, what it did, and which bands it touched. Without it the only
+# trace of a failed apply is a log line the page cannot read. Fields are plain text on purpose (no quoting game).
+write_status() {
+	local result="$1" message="${2:-}" now
+	now=$(date +%s 2>/dev/null) || now=0
+	( umask 022
+	  printf 'epoch=%s\nresult=%s\nchanged=%s\nbands=%s\nmessage=%s\n' \
+		"$now" "$result" "${CHANGED:-0}" "${APPLIED# }" "$message" > "$STATUS.tmp" &&
+	  mv "$STATUS.tmp" "$STATUS" ) 2>/dev/null || log "cannot write $STATUS"
+}
+
+apply_and_reload() {
+	APPLIED=""
+	TOUCHED=0
+	apply_plan "$1" || { write_status error "the plan could not be applied"; return 1; }
+	if [ "$CHANGED" = 1 ]; then
+		uci commit wireless || { log "uci commit failed"; write_status error "uci commit failed"; return 1; }
+		# wifi reload re-reads every radio; a full restart is not needed and would drop the backhaul.
+		if command -v wifi >/dev/null 2>&1; then
+			wifi reload >/dev/null 2>&1 || { log "wifi reload failed"; write_status error "wifi reload failed"; return 1; }
+		fi
+		log "applied; wireless committed and reloaded"
+	else
+		log "plan applied nothing new"
+	fi
+	write_status ok
+	return 0
+}
+
+# Records a band only when this run actually wrote something in it.
+mark_band() {
+	[ "$TOUCHED" = 1 ] || return 0
+	case " $APPLIED " in *" $1 "*) ;; *) APPLIED="$APPLIED $1" ;; esac
+	TOUCHED=0
+	return 0
+}
+
+last=""
+while :; do
+	if [ -r "$PLAN" ]; then
+		current=$(stamp "$PLAN")
+		if [ "$current" != "$last" ]; then
+			apply_and_reload "$PLAN"
+			last=$current
+		fi
+	fi
+	[ "${ONCE:-0}" = 1 ] && exit 0
+	sleep 2
+done

@@ -31,7 +31,8 @@ def main():
     archive = args.archive or output / "zte-mesh-runtime.tar.gz"
     manifest = verify_existing(output)
     files = {"root/" + n: output / "runtime" / n for n in manifest["files"]}
-    for lib in ("libzte_mesh_shim", "libzte_controller_trace", "libzte_controller_route", "libzte_controller_profile"):
+    for lib in ("libzte_mesh_shim", "libzte_controller_trace", "libzte_controller_route", "libzte_controller_profile",
+                "libzte_agent_mm"):
         files[f"root/lib/{lib}.so"] = output / f"runtime/lib/{lib}.so"
     files["root/bin/db-engine-probe"] = output / "db-engine-probe"
     files["root/bin/zte-meshctl"] = output / "zte-meshctl"
