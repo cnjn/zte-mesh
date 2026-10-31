@@ -8,17 +8,27 @@
 #include <linux/if_packet.h>
 #include <arpa/inet.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 #define EXPORT __attribute__((visibility("default")))
 
-static unsigned int lines, packet_lines;
+static unsigned int lines, packet_lines, trace_all_lines;
 static int (*format_real)(char *, size_t, const char *, va_list);
+/* The firehose switch: a flag file in the one directory the sandbox leaves writable. */
+static int verbose_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+        cached = access("/run/zte-mesh/trace-all", F_OK) == 0;
+    return cached;
+}
 static void message(const char *fmt, ...)
 {
     char buffer[384];
@@ -30,6 +40,9 @@ static void message(const char *fmt, ...)
     int packet = strstr(fmt, " rx1905 ") || strstr(fmt, " tx1905 ") ||
                  strstr(fmt, " packet_bind ") || strstr(fmt, " native_dh_keygen ") ||
                  strstr(fmt, " packet_decision ") || strstr(fmt, " oss_dispatch ") || strstr(fmt, " wsc_status ") || strstr(fmt, " bss_config ");
+    /* The value lines ride the firehose budget: they appear exactly when the firehose does (the M2 arrives
+     * long after the ordinary budget is gone). */
+    int trace_all = !!strstr(fmt, "ZTE_TRACE_ALL") || !!strstr(fmt, "ZTE_TRACE_VALUE");
     if (!format_real) return;
     if (strstr(fmt, " device_event ")) {
         /* device on/off announcements: a small budget of their own so the DB chatter cannot hide them */
@@ -54,10 +67,10 @@ static void message(const char *fmt, ...)
         errno = saved;
         return;
     }
-    limit = packet ? 64 : 160;
-    count = __sync_fetch_and_add(packet ? &packet_lines : &lines, 1);
+    limit = trace_all ? 20000 : packet ? 64 : 160;
+    count = __sync_fetch_and_add(trace_all ? &trace_all_lines : packet ? &packet_lines : &lines, 1);
     if (count >= limit) {
-        if (count == limit) {
+        if (count == limit && !trace_all) {
             static const char ordinary[] = "ZTE_CONTROLLER_TRACE log_budget=ordinary exhausted=1 limit=160\n";
             static const char protocol[] = "ZTE_CONTROLLER_TRACE log_budget=packet exhausted=1 limit=64\n";
             (void)write(STDERR_FILENO, packet ? protocol : ordinary,
@@ -286,7 +299,17 @@ EXPORT int bind(int fd, const struct sockaddr *address, socklen_t length)
         message("ZTE_CONTROLLER_TRACE packet_bind ifindex=%d protocol=%u status=%d errno=%d\n",
                 ((const struct sockaddr_ll *)address)->sll_ifindex,
                 (unsigned int)ntohs(((const struct sockaddr_ll *)address)->sll_protocol), result, saved);
-    else
+    else if (address && address->sa_family == AF_UNIX && length > sizeof(sa_family_t)) {
+        /* The daemon's own OSS socket: its directory has to exist in the private root, so the path is the useful part of
+         * a failure here. A socket name carries no credential. */
+        char path[108];
+        size_t room = length - offsetof(struct sockaddr_un, sun_path);
+        if (room >= sizeof(path))
+            room = sizeof(path) - 1;
+        memcpy(path, ((const struct sockaddr_un *)address)->sun_path, room);
+        path[room] = 0;
+        message("ZTE_CONTROLLER_TRACE unix_bind path=%.90s status=%d errno=%d\n", path, result, saved);
+    } else
         message("ZTE_CONTROLLER_TRACE bind status=%d errno=%d\n", result, saved);
     errno = saved; return result;
 }
@@ -297,6 +320,10 @@ EXPORT int OssCreateSubProc(const char *name, void *callback, void *arg1, void *
     message("ZTE_CONTROLLER_TRACE return=OssCreateSubProc status=%d errno=%d\n", result, saved);
     errno = saved; return result;
 }
+/* The three WLAN setters that carry an M2 into the configuration database are not traced here: the
+ * runtime stand-in for the configuration manager (libzte_agent_mm.so) owns them, because the status it
+ * reports is what the daemon acts on and a second interposer would only hide it.
+ */
 EXPORT int OssSetThdInfo(void *name, unsigned int index, unsigned int priority, unsigned int options)
 {
     int (*real)(void *, unsigned int, unsigned int, unsigned int) = symbol("OssSetThdInfo");
@@ -319,6 +346,21 @@ EXPORT int vsnprintf(char *buffer, size_t size, const char *format, va_list ap)
         (!strcmp(info.dli_sname, "ProcUserLog") || !strcmp(info.dli_sname, "ProcOssLogType"))) {
         if (strstr(format, "M1") || strstr(format, "M2") || strstr(format, "WSC"))
             message("ZTE_CONTROLLER_TRACE wsc_status vendor_format=%.120s\n", format);
+        /* Opt-in firehose: while a frame shape is still being matched, the daemon's own objections are the
+         * only evidence, and they do not all mention M1/M2/WSC. Enabled by a flag file, not an environment
+         * variable, because the sandbox hands the daemon a single-variable environment. */
+        if (verbose_enabled()) {
+            static unsigned int verbose_lines;
+            if (__sync_fetch_and_add(&verbose_lines, 1) < 20000)
+                message("ZTE_TRACE_ALL vendor_format=%.150s\n", format);
+        }
+        /* Values rather than shapes, for the handful of lines the agent-mode criterion turns on: whether the
+         * M2 was applied (cfgChg), which BSS it went to, and what the WLAN setter returned. Only formats that
+         * carry no key material are expanded. */
+        if (size > 0 && (strstr(format, "acdcParseM2Msg cfgChg") || strstr(format, "The WSC-%d will cfg") ||
+                         strstr(format, "current state") || strstr(format, "M2 total Length") ||
+                         strstr(format, "WLAN_ASSERT_RET") || strstr(format, "mesh sync for M2")))
+            message("ZTE_TRACE_VALUE text=%.200s\n", buffer);
         if (strstr(format, "Bss") || strstr(format, "bss") || strstr(format, "WLANCFG") ||
             strstr(format, "PWKey") || strstr(format, "WEP") || strstr(format, "Wep") || strstr(format, "BeaconType"))
             message("ZTE_CONTROLLER_TRACE bss_config vendor_format=%.120s\n", format);

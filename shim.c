@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/shm.h>
 #include <unistd.h>
 
 #if !defined(__arm__) && !defined(ZTE_MESH_HOST_TEST)
@@ -18,6 +19,7 @@
 #define BINDING_FAILURE 79
 
 static int trace_mode;
+static int emulated_lab;
 static unsigned int records;
 static __thread int logging;
 
@@ -59,6 +61,8 @@ __attribute__((constructor)) static void shim_loaded(void)
 {
     const char *mode = getenv("ZTE_MESH_SHIM_MODE");
     const char *allow = getenv("ZTE_MESH_SHIM_ALLOW_TRACE");
+    const char *emulated = getenv("ZTE_MESH_EMULATED_LAB");
+    emulated_lab = emulated && !strcmp(emulated, "1");
     if (!mode || !strcmp(mode, "probe")) {
         log_record("ZTE_MESH_SHIM loaded mode=probe\n");
         return;
@@ -82,6 +86,81 @@ static void *next_symbol(const char *name)
     }
     errno = saved_errno;
     return function;
+}
+
+/* qemu-user cannot honour a fixed-address shmat(): the attach is emulated as an
+ * mmap() over the reservation that holds the guest address space, and that mmap
+ * fails with EINVAL unless SHM_REMAP lets it replace the placeholder mapping
+ * (measured on qemu 6.2 with a fixed-address shmat() probe: every fixed address fails,
+ * the same address with SHM_REMAP succeeds). The factory database engine attaches
+ * its segment at a fixed address and dereferences the result, so an emulated lab
+ * run needs the flag. A device run must keep the exact semantics the daemon
+ * expects, which is why this is gated on the lab marker and not unconditional.
+ */
+EXPORT void *shmat(int shmid, const void *shmaddr, int shmflg)
+{
+    void *(*real_attach)(int, const void *, int) = (void *(*)(int, const void *, int))next_symbol("shmat");
+    void *result = real_attach(shmid, shmaddr, shmflg);
+    if (result == (void *)-1 && shmaddr && emulated_lab && errno == EINVAL) {
+        result = real_attach(shmid, shmaddr, shmflg | SHM_REMAP);
+        if (result != (void *)-1)
+            log_record("ZTE_MESH_SHIM emulated=shmat-fixed-address-retry\n");
+    }
+    return result;
+}
+
+/* qemu-user performs the guest's execve() as a HOST execve() of the same path,
+ * which only lands back in the emulator when binfmt_misc is registered. A lab
+ * host without it (ImmortalWrt x86_64 has no CONFIG_BINFMT_MISC at all) gets
+ * ENOEXEC there, and the controller's daemon spawn dies on it (exit 82). Start
+ * the emulator directly instead, handing it the guest loader as its program.
+ * Opt-in through the two variables the launcher already sets, so a device run
+ * keeps exactly the exec chain the daemon expects.
+ */
+static int emulated_exec(const char *path, char *const argv[])
+{
+    int (*real_execv)(const char *, char *const *) =
+        (int (*)(const char *, char *const *))next_symbol("execv");
+    const char *emulator = emulated_lab ? getenv("ZTE_MESH_QEMU") : NULL;
+    if (emulator && *emulator && path && !strcmp(path, "/lib/ld-linux.so.3")) {
+        char *qemu_argv[32];
+        int i = 0, j;
+        qemu_argv[i++] = (char *)emulator;
+        qemu_argv[i++] = (char *)path;
+        for (j = 1; argv[j] && i < 31; ++j)
+            qemu_argv[i++] = argv[j];
+        qemu_argv[i] = NULL;
+        log_record("ZTE_MESH_SHIM emulated=exec-through-emulator\n");
+        return real_execv(emulator, qemu_argv);
+    }
+    return real_execv(path, argv);
+}
+
+EXPORT int execl(const char *path, const char *arg, ...)
+{
+    char *argv[32];
+    va_list args;
+    int n = 0;
+    argv[n++] = (char *)arg;
+    va_start(args, arg);
+    while (n < 31) {
+        argv[n] = va_arg(args, char *);
+        if (!argv[n])
+            break;
+        ++n;
+    }
+    va_end(args);
+    if (n >= 31) {
+        errno = E2BIG;
+        return -1;
+    }
+    argv[n] = NULL;
+    return emulated_exec(path, argv);
+}
+
+EXPORT int execv(const char *path, char *const argv[])
+{
+    return emulated_exec(path, argv);
 }
 
 EXPORT int DBShmCliInit(void)

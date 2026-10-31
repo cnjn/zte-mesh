@@ -30,6 +30,7 @@ extern void *GetPUB(unsigned int);
 extern void FreePUB(void *);
 extern int MapGetDB(void *);
 extern int controller_startup(void);
+extern int controller_agent_startup(void);
 extern int controller_service(void);
 extern void *g_ptTblHead, *g_ptViewHead, *g_pGetCount, *g_pTblHash, *g_pViewHash;
 extern void *g_pShmHandler;
@@ -206,7 +207,8 @@ int main(int argc, char **argv)
         return bridge_test(0);
     if (argc == 2 && !strcmp(argv[1], "--bridge-rollback-test"))
         return bridge_test(1);
-    startup = argc == 2 && (!strcmp(argv[1], "--controller-startup") || !strcmp(argv[1], "--controller-service"));
+    startup = argc == 2 && (!strcmp(argv[1], "--controller-startup") || !strcmp(argv[1], "--controller-service") ||
+                            !strcmp(argv[1], "--agent-startup"));
     service = startup && !strcmp(argv[1], "--controller-service");
     require(argc == 1 || startup, "arguments");
     errno = 0;
@@ -249,6 +251,14 @@ int main(int argc, char **argv)
     if (startup) {
         if (service)
             return controller_service() == 0 ? 0 : 1; /* private SysV objects die with the IPC namespace */
+        if (!strcmp(argv[1], "--agent-startup")) {
+            /* Slave-side observation: the daemon runs as an agent and this side plays the controller. */
+            require(controller_agent_startup() == 0, "agent-startup-observation");
+            id = shmget(DB_KEY, 0, 0);
+            require(id >= 0 && shmctl(id, IPC_RMID, NULL) == 0 && shmdt(DB_BASE) == 0,
+                    "startup-private-engine-cleanup");
+            return 0;
+        }
         require(controller_startup() == 0, "controller-startup-observation");
         id = shmget(DB_KEY, 0, 0);
         require(id >= 0 && shmctl(id, IPC_RMID, NULL) == 0 && shmdt(DB_BASE) == 0,

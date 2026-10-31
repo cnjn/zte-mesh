@@ -31,8 +31,21 @@ int controller_slot_present(unsigned int radio, unsigned int slot, int present, 
 /* MultiAPCfg scalar read / live write with read-back (0 = ok). */
 int controller_read_cfg(const char *field, int *value);
 int controller_write_cfg(const char *field, int value);
-/* mesh.role: -1 leave the database as built, 0 master (SetRoleEnable 0), 1 auto (SetRoleEnable 1); start-up value. */
+/* mesh.role as the MultiAPCfg triple the daemon reads once at start-up. MASTER: SetRoleEnable 0, Mode 2.
+ * AUTO: SetRoleEnable 1 with Mode 2 (the elected result the supervisor settles). SLAVE is the agent side:
+ * Mode 1, SetRoleEnable 0 and EnMasterOnly 0 - the last one is what lets multi_ap_slave_main run slave_init
+ * (multiap-cfg.c leaves EnMasterOnly 1, the radio-less-controller compensation). Start-up value only; the
+ * daemon reads all three once, so a live change needs a respawn. */
+#define CONTROLLER_ROLE_UNSET (-1)
+#define CONTROLLER_ROLE_MASTER 0
+#define CONTROLLER_ROLE_AUTO 1
+#define CONTROLLER_ROLE_SLAVE 2
 void controller_set_role(int role);
+int controller_role(void);
+/* Lab observation of the agent side: boot with SLAVE, wait for the daemon's own 1905 frames, answer an AP
+ * autoconfiguration Search, run the public WSC M1/M2 exchange against it, then report what the M2 did to the
+ * WLANCfg/WLANPSK rows. Bounded, private netns only, no credentials logged. */
+int controller_agent_startup(void);
 /* MultiAPCfg.P1905DevNum: 1905 devices in the daemon's topology, itself included (-1 = unreadable). */
 int controller_read_dev_num(void);
 /* Live write + read-back of P1905ComCfg.Enable (0 = ok); the caller respawns the daemon. */
@@ -53,4 +66,6 @@ int controller_shutdown_private(int shm_id);
 int controller_service(void);
 /* Trigger the factory WLAN-renew notification for both bands (helper process). */
 int controller_renew_agents(void);
+/* Ask the daemon's acd task to start the role election (helper process; the lab stand-in for cspd's cooperator). */
+int controller_election_trigger(void);
 #endif

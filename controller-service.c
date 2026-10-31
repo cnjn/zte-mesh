@@ -22,6 +22,7 @@
 
 #include "controller-service.h"
 #include "controller-packet.h"
+#include "agent-sync.h"
 #include "wlan-profiles.h"
 #include "mesh-policies.h"
 
@@ -29,6 +30,8 @@
 #define CONFIG_PATH SERVICE_DIR "/config"
 #define STATE_PATH SERVICE_DIR "/state.json"
 #define STATE_TEMP SERVICE_DIR "/.state.json.tmp"
+/* The plan the host-side wlan-sync applies to UCI (openwrt/zte-mesh/files/wlan-sync). */
+#define WLAN_PLAN_PATH SERVICE_DIR "/wlan-plan"
 #define MAX_NODES 32U
 #define MAX_CONFIG 8192U /* 16 ACL rules, 6 extra slots, 8 timer rules and the policy keys fit with room to spare */
 
@@ -64,7 +67,7 @@ struct service_config {
     int tx_power[2];                       /* -1 not set, else EIRP dBm 0..30 */
     int steer_set, steer_enabled;          /* optional master band steering switch */
     int steer_rssi_set, steer_rssi24, steer_rssi5; /* optional band-steering RSSI limits, dBm */
-    int role_set, role_auto;               /* optional mesh.role=master|auto: MultiAPCfg.SetRoleEnable (slave is not supported) */
+    int role_set, role;                     /* optional mesh.role=master|auto|slave: the MultiAPCfg role triple (CONTROLLER_ROLE_*) */
     int force_set, force_on;               /* optional roam.force: weak-signal forced roam (Domain EnLegacyStaRoam, Master EnBtmKickoff/EnRoamKick) */
     /* What the user configured (profiles[].enabled and bss_enabled above are the EFFECTIVE values: the schedule and the
      * guest access time can switch a configured-on network off). */
@@ -147,6 +150,11 @@ static int channel_allowed(unsigned int radio, int value)
     return 0;
 }
 
+/* Every rejection inside the parser funnels through done:. Recording the source line makes a rejected
+ * /run/zte-mesh/config name the rule that refused it, instead of only reporting "missing-or-invalid" -- which
+ * cannot be told apart from a key the running binary is too old to know. */
+#define reject(at) do { if (!reject_line) reject_line = (at); goto done; } while (0)
+
 /* Strict key=value parser: fixed keys only, no duplicates, no continuation. */
 static int parse_config(struct service_config *config, struct config_stamp *stamp)
 {
@@ -159,7 +167,7 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
     unsigned char acl_seen[WLAN_ACL_RULES];
     struct stat info;
     ssize_t bytes;
-    int fd, result = -1;
+    int fd, result = -1, reject_line = 0;
     memset(config, 0, sizeof(*config));
     config->mlo_enable = 1;
     snprintf(config->essid_suffix, sizeof(config->essid_suffix), "-5G");
@@ -177,27 +185,27 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
         return -1;
     if (fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_uid != 0 || (info.st_mode & 077) ||
         info.st_size < 1 || info.st_size > (off_t)MAX_CONFIG)
-        goto done;
+        reject(__LINE__);
     bytes = read(fd, buffer, MAX_CONFIG + 1);
     if (bytes != info.st_size)
-        goto done;
+        reject(__LINE__);
     buffer[bytes] = 0;
     for (line = buffer; *line; line = next) {
         char *newline = strchr(line, '\n'), *equals;
         unsigned int radio, bit;
         if (!newline)
-            goto done;
+            reject(__LINE__);
         *newline = 0;
         next = newline + 1;
         equals = strchr(line, '=');
         if (!equals)
-            goto done;
+            reject(__LINE__);
         *equals++ = 0;
         if (!strcmp(line, "version_mode")) {
             char *end;
             unsigned long value = strtoul(equals, &end, 10);
             if (seen & 1U || !*equals || *end || value > 255)
-                goto done;
+                reject(__LINE__);
             config->version_mode = (unsigned int)value;
             seen |= 1U;
             continue;
@@ -208,58 +216,61 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
             struct wlan_acl_rule *rule;
             unsigned int bit;
             if (dot == line + 4 || *dot != '.' || n < 1 || n > WLAN_ACL_RULES)
-                goto done;
+                reject(__LINE__);
             rule = &acl_slots[n - 1];
             if (!strcmp(dot + 1, "mac")) {
                 bit = 1U;
                 if (acl_seen[n - 1] & bit || normalize_mac(rule->mac, equals))
-                    goto done;
+                    reject(__LINE__);
             } else if (!strcmp(dot + 1, "name")) {
                 size_t i, bytes = strlen(equals);
                 bit = 2U;
                 if (acl_seen[n - 1] & bit || !bytes || bytes > 20)
-                    goto done;
+                    reject(__LINE__);
                 for (i = 0; i < bytes; i++)
                     if (!((equals[i] >= '0' && equals[i] <= '9') || (equals[i] >= 'a' && equals[i] <= 'z') ||
                           (equals[i] >= 'A' && equals[i] <= 'Z') || equals[i] == '_' || equals[i] == '-' || equals[i] == '.'))
-                        goto done;
+                        reject(__LINE__);
                 memcpy(rule->name, equals, bytes + 1);
             } else if (!strcmp(dot + 1, "radio")) {
                 bit = 4U;
                 if (acl_seen[n - 1] & bit ||
                     (strcmp(equals, "0") && strcmp(equals, "1") && strcmp(equals, "both")))
-                    goto done;
+                    reject(__LINE__);
                 rule->radio = !strcmp(equals, "both") ? 2 : equals[0] - '0';
             } else if (!strcmp(dot + 1, "bss")) {
                 bit = 8U;
                 if (acl_seen[n - 1] & bit || strlen(equals) != 1 || equals[0] < '0' || equals[0] > '3')
-                    goto done;
+                    reject(__LINE__);
                 rule->bss = equals[0] - '0';
             } else {
-                goto done;
+                reject(__LINE__);
             }
             acl_seen[n - 1] |= bit;
             continue;
         }
         if (!strcmp(line, "mesh.v2")) {
             if (v2_seen || (strcmp(equals, "0") && strcmp(equals, "1")))
-                goto done;
+                reject(__LINE__);
             config->v2_enable = equals[0] - '0';
             v2_seen = 1;
             continue;
         }
         if (!strcmp(line, "mesh.role")) {
-            /* "slave" (and the bridge-mode decision that picks it) needs the daemon to run as an agent: not supported */
-            if (role_seen || (strcmp(equals, "master") && strcmp(equals, "auto")))
-                goto done;
+            /* "slave" is the agent side: the daemon then runs multi_ap_slave_main instead of the controller, which is
+             * what the agent observation (controller_agent_startup) exercises. The router-facing UCI/UI does not offer
+             * it yet, see docs/research/AGENT_PROBE.md. */
+            if (role_seen || (strcmp(equals, "master") && strcmp(equals, "auto") && strcmp(equals, "slave")))
+                reject(__LINE__);
             config->role_set = 1;
-            config->role_auto = equals[0] == 'a';
+            config->role = !strcmp(equals, "auto") ? CONTROLLER_ROLE_AUTO
+                          : !strcmp(equals, "slave") ? CONTROLLER_ROLE_SLAVE : CONTROLLER_ROLE_MASTER;
             role_seen = 1;
             continue;
         }
         if (!strcmp(line, "roam.force")) {
             if (force_seen || (strcmp(equals, "0") && strcmp(equals, "1")))
-                goto done;
+                reject(__LINE__);
             config->force_on = equals[0] - '0';
             config->force_set = 1;
             force_seen = 1;
@@ -267,14 +278,14 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
         }
         if (!strcmp(line, "mlo.enable")) {
             if (mlo_seen || (strcmp(equals, "0") && strcmp(equals, "1")))
-                goto done;
+                reject(__LINE__);
             config->mlo_enable = equals[0] - '0';
             mlo_seen = 1;
             continue;
         }
         if (!strcmp(line, "wifi.dual_band_sync")) {
             if (dual_seen || (strcmp(equals, "0") && strcmp(equals, "1")))
-                goto done;
+                reject(__LINE__);
             config->dual_band_sync = equals[0] - '0';
             dual_seen = 1;
             continue;
@@ -282,7 +293,7 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
         if (!strcmp(line, "wifi.essid_suffix")) {
             size_t bytes = strlen(equals);
             if (suffix_seen || bytes < 1 || bytes > 8 || !printable(equals, bytes))
-                goto done;
+                reject(__LINE__);
             snprintf(config->essid_suffix, sizeof(config->essid_suffix), "%s", equals);
             suffix_seen = 1;
             continue;
@@ -292,7 +303,7 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
                 char *end;
                 long offset = strtol(equals, &end, 10);
                 if (offset_seen || !*equals || *end || offset < -720 || offset > 840)
-                    goto done;
+                    reject(__LINE__);
                 config->timer_offset = (int)offset;
                 offset_seen = 1;
             } else {
@@ -301,21 +312,21 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
                 struct timer_rule *rule;
                 unsigned int field;
                 if (dot == line + 6 || *dot != '.' || n < 1 || n > TIMER_RULES)
-                    goto done;
+                    reject(__LINE__);
                 rule = &timer_tmp[n - 1];
                 if (!strcmp(dot + 1, "start") || !strcmp(dot + 1, "end")) {
                     unsigned int hour, minute;
                     int is_start = !strcmp(dot + 1, "start");
                     if (strlen(equals) != 5 || equals[2] != ':' || equals[0] < '0' || equals[0] > '2' || equals[1] < '0' ||
                         equals[1] > '9' || equals[3] < '0' || equals[3] > '5' || equals[4] < '0' || equals[4] > '9')
-                        goto done;
+                        reject(__LINE__);
                     hour = (unsigned int)((equals[0] - '0') * 10 + (equals[1] - '0'));
                     minute = (unsigned int)((equals[3] - '0') * 10 + (equals[4] - '0'));
                     if (hour > 23)
-                        goto done;
+                        reject(__LINE__);
                     field = is_start ? 1U : 2U;
                     if (timer_seen[n - 1] & field)
-                        goto done;
+                        reject(__LINE__);
                     if (is_start)
                         rule->start = (uint16_t)(hour * 60 + minute);
                     else
@@ -324,23 +335,23 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
                     unsigned int d;
                     field = 4U;
                     if ((timer_seen[n - 1] & field) || strlen(equals) != 7)
-                        goto done;
+                        reject(__LINE__);
                     rule->days = 0;
                     for (d = 0; d < 7; d++) {
                         if (equals[d] != '0' && equals[d] != '1')
-                            goto done;
+                            reject(__LINE__);
                         if (equals[d] == '1')
                             rule->days |= (uint8_t)(1U << d);
                     }
                     if (!rule->days)
-                        goto done;
+                        reject(__LINE__);
                 } else if (!strcmp(dot + 1, "scope")) {
                     field = 8U;
                     if ((timer_seen[n - 1] & field) || (strcmp(equals, "all") && strcmp(equals, "guest")))
-                        goto done;
+                        reject(__LINE__);
                     rule->scope = !strcmp(equals, "guest");
                 } else {
-                    goto done;
+                    reject(__LINE__);
                 }
                 timer_seen[n - 1] |= (uint8_t)field;
             }
@@ -348,7 +359,7 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
         }
         if (!strcmp(line, "band_steer.enabled")) {
             if ((steer_seen & 1U) || (strcmp(equals, "0") && strcmp(equals, "1")))
-                goto done;
+                reject(__LINE__);
             config->steer_enabled = equals[0] - '0';
             config->steer_set = 1;
             steer_seen |= 1U;
@@ -359,7 +370,7 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
             long value = strtol(equals, &end, 10);
             int is24 = !strcmp(line, "band_steer.rssi24");
             if ((steer_seen & (is24 ? 2U : 4U)) || !*equals || *end || value < -110 || value > -30)
-                goto done;
+                reject(__LINE__);
             if (is24)
                 config->steer_rssi24 = (int)value;
             else
@@ -372,7 +383,7 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
             long value = strtol(equals, &end, 10);
             int is24 = !strcmp(line, "roam.rssi24");
             if ((roam_seen & (is24 ? 1U : 2U)) || !*equals || *end || value < -110 || value > -30)
-                goto done;
+                reject(__LINE__);
             if (is24)
                 config->roam_rssi24 = (int)value;
             else
@@ -381,11 +392,11 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
             continue;
         }
         if (strncmp(line, "radio", 5) || (line[5] != '0' && line[5] != '1') || line[6] != '.')
-            goto done;
+            reject(__LINE__);
         radio = (unsigned int)(line[5] - '0');
         if (!strcmp(line + 7, "acl_policy")) {
             if (config->acl_policy[radio][0] >= 0 || (config->acl_policy[radio][0] = parse_acl_policy(equals)) < 0)
-                goto done;
+                reject(__LINE__);
             continue;
         }
         if (!strcmp(line + 7, "channel") || !strcmp(line + 7, "tx_power")) {
@@ -395,7 +406,7 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
             int *slot = is_channel ? &config->channel[radio] : &config->tx_power[radio];
             if (*slot >= 0 || !*equals || *end || value < 0 ||
                 (is_channel ? !channel_allowed(radio, (int)value) : value > 30))
-                goto done;
+                reject(__LINE__);
             *slot = (int)value;
             continue;
         }
@@ -403,14 +414,14 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
             int is_hidden = !strcmp(line + 7, "hidden");
             uint8_t flag = is_hidden ? 1U : 2U;
             if (style_seen[radio] & flag)
-                goto done;
+                reject(__LINE__);
             if (is_hidden) {
                 if (strcmp(equals, "0") && strcmp(equals, "1"))
-                    goto done;
+                    reject(__LINE__);
                 config->main_hidden[radio] = (uint8_t)(equals[0] - '0');
             } else {
                 if (strcmp(equals, "0") && strcmp(equals, "3") && strcmp(equals, "6") && strcmp(equals, "10") && strcmp(equals, "12"))
-                    goto done;
+                    reject(__LINE__);
                 config->main_beacon[radio] = (uint8_t)strtoul(equals, NULL, 10);
             }
             style_seen[radio] |= flag;
@@ -420,7 +431,7 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
             char *end;
             unsigned long value = strtoul(equals, &end, 10);
             if (config->beacon_interval[radio] || !*equals || *end || value < 20 || value > 1000)
-                goto done;
+                reject(__LINE__);
             config->beacon_interval[radio] = (unsigned int)value;
             continue;
         }
@@ -429,17 +440,17 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
             if (seen & bit ||
                 set_text(config->profiles[radio].ssid, sizeof(config->profiles[radio].ssid),
                          &config->profiles[radio].ssid_length, equals, strlen(equals)))
-                goto done;
+                reject(__LINE__);
         } else if (!strcmp(line + 7, "key")) {
             bit = 4U << (radio * 3);
             if (seen & bit ||
                 set_text(config->profiles[radio].key, sizeof(config->profiles[radio].key),
                          &config->profiles[radio].key_length, equals, strlen(equals)))
-                goto done;
+                reject(__LINE__);
         } else if (!strcmp(line + 7, "enabled")) {
             bit = 8U << (radio * 3);
             if (seen & bit || (strcmp(equals, "0") && strcmp(equals, "1")))
-                goto done;
+                reject(__LINE__);
             config->profiles[radio].enabled = config->profile_enabled_cfg[radio] = (uint8_t)(equals[0] - '0');
         } else if (!strncmp(line + 7, "bss", 3) && line[10] >= '1' && line[10] <= '3' && line[11] == '.') {
             unsigned int slot = (unsigned int)(line[10] - '0'), what;
@@ -461,47 +472,47 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
             else if (!strcmp(line + 12, "force_wifi5"))
                 what = 128U;
             else
-                goto done;
+                reject(__LINE__);
             if (bss_seen[radio][slot] & what)
-                goto done;
+                reject(__LINE__);
             if (what == 1U) {
                 if (strcmp(equals, "0") && strcmp(equals, "1"))
-                    goto done;
+                    reject(__LINE__);
                 config->bss_enabled[radio][slot] = config->bss_enabled_cfg[radio][slot] = (uint8_t)(equals[0] - '0');
             } else if (what == 2U) {
                 uint8_t length;
                 if (set_text(config->bss_ssid[radio][slot], sizeof(config->bss_ssid[radio][slot]), &length, equals, bytes))
-                    goto done;
+                    reject(__LINE__);
             } else if (what == 8U) {
                 if (config->acl_policy[radio][slot] >= 0 || (config->acl_policy[radio][slot] = parse_acl_policy(equals)) < 0)
-                    goto done;
+                    reject(__LINE__);
             } else if (what == 16U) {
                 if (strcmp(equals, "0") && strcmp(equals, "1"))
-                    goto done;
+                    reject(__LINE__);
                 config->bss_hidden[radio][slot] = (uint8_t)(equals[0] - '0');
             } else if (what == 32U) {
                 if (strcmp(equals, "0") && strcmp(equals, "3") && strcmp(equals, "6") && strcmp(equals, "10") && strcmp(equals, "12"))
-                    goto done;
+                    reject(__LINE__);
                 config->bss_beacon[radio][slot] = (uint8_t)strtoul(equals, NULL, 10);
             } else if (what == 64U) {
                 char *end;
                 unsigned long minutes = strtoul(equals, &end, 10);
                 if (!*equals || *end || minutes < 1 || minutes > 10080)
-                    goto done;
+                    reject(__LINE__);
                 config->bss_access[radio][slot] = (unsigned int)minutes;
             } else if (what == 128U) {
                 if (strcmp(equals, "0") && strcmp(equals, "1"))
-                    goto done;
+                    reject(__LINE__);
                 config->bss_wifi5[radio][slot] = (int8_t)(equals[0] - '0');
             } else {
                 uint8_t length;
                 if (bytes < 8 || set_text(config->bss_key[radio][slot], sizeof(config->bss_key[radio][slot]), &length, equals, bytes))
-                    goto done;
+                    reject(__LINE__);
             }
             bss_seen[radio][slot] |= what;
             continue;
         } else {
-            goto done;
+            reject(__LINE__);
         }
         seen |= bit;
     }
@@ -509,9 +520,9 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
         /* radio1 name/key are not given separately: a contradictory value is rejected,
          * otherwise they mirror radio0 (the vendor "dual-band sync" meaning). */
         if (seen & ((2U | 4U) << 3))
-            goto done;
+            reject(__LINE__);
         if (seen != (1U | (14U << 0) | (8U << 3)))
-            goto done;
+            reject(__LINE__);
         memcpy(config->profiles[1].ssid, config->profiles[0].ssid, sizeof(config->profiles[1].ssid));
         memcpy(config->profiles[1].key, config->profiles[0].key, sizeof(config->profiles[1].key));
         config->profiles[1].ssid_length = config->profiles[0].ssid_length;
@@ -522,9 +533,9 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
          * password on its own (section 11.1); an omitted radio1.key is the 2.4G key, which is what the baseline has. */
         const unsigned int need = 1U | (14U << 0) | (8U << 3);
         if ((seen & need) != need)
-            goto done;
+            reject(__LINE__);
         if (!(seen & (2U << 3)) && mb_derive_name(&config->profiles[0], config->essid_suffix, &config->profiles[1]))
-            goto done;
+            reject(__LINE__);
         if (!(seen & (4U << 3))) {
             memcpy(config->profiles[1].key, config->profiles[0].key, sizeof(config->profiles[1].key));
             config->profiles[1].key_length = config->profiles[0].key_length;
@@ -537,12 +548,12 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
                 if (!bss_seen[radio][slot])
                     continue;
                 if ((bss_seen[radio][slot] & 7U) != 7U) /* enabled + ssid + key, never half a slot */
-                    goto done;
+                    reject(__LINE__);
                 /* The BSS entries of the M2 are positional: the agent applies them to its slots in order, so a gap
                  * (slot 3 without slot 2) would put slot 3's settings on the agent's slot 2 and switch its slot 3 off
                  * (replay run 44). The configured slots of a radio are therefore always 1..k. */
                 if (slot >= 2 && !config->bss_set[radio][slot - 1])
-                    goto done;
+                    reject(__LINE__);
                 config->bss_set[radio][slot] = 1;
                 if (!(bss_seen[radio][slot] & 16U))
                     config->bss_hidden[radio][slot] = slot == 3; /* slot 3 is the hidden backhaul BSS */
@@ -559,20 +570,20 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
             if (!acl_seen[i])
                 continue;
             if (!(acl_seen[i] & 1U)) /* a rule needs its MAC */
-                goto done;
+                reject(__LINE__);
             if (!(acl_seen[i] & 2U))
                 snprintf(rule->name, sizeof(rule->name), "acl%u", i + 1);
             if (!(acl_seen[i] & 4U))
                 rule->radio = 2;
             for (radio = 0; radio < 2; radio++)
                 if (rule->bss && (rule->radio == 2 || rule->radio == (int)radio) && !config->bss_set[radio][rule->bss])
-                    goto done; /* a slot without its own BSS has no interface to filter */
+                    reject(__LINE__); /* a slot without its own BSS has no interface to filter */
             config->acl[config->acl_count++] = *rule;
         }
         for (radio = 0; radio < 2; radio++)
             for (slot = 1; slot < 4; slot++)
                 if (config->acl_policy[radio][slot] >= 0 && !config->bss_set[radio][slot])
-                    goto done;
+                    reject(__LINE__);
     }
     {
         unsigned int i, n = 0;
@@ -580,23 +591,23 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
             if (!timer_seen[i])
                 continue;
             if ((timer_seen[i] & 3U) != 3U || timer_tmp[i].start == timer_tmp[i].end) /* start and end are both needed and differ */
-                goto done;
+                reject(__LINE__);
             if (!(timer_seen[i] & 4U))
                 timer_tmp[i].days = 0x7f;
             config->timer[n++] = timer_tmp[i];
         }
         config->timer_count = n;
         if (n && !offset_seen) /* the sandbox has no time zone: the host passes its offset */
-            goto done;
+            reject(__LINE__);
     }
     if (steer_seen & 6U) {
         if ((steer_seen & 6U) != 6U) /* both bands or neither */
-            goto done;
+            reject(__LINE__);
         config->steer_rssi_set = 1;
     }
     if (roam_seen) {
         if (roam_seen != 3U) /* both bands or neither */
-            goto done;
+            reject(__LINE__);
         config->roam_set = 1;
     }
     {
@@ -606,7 +617,7 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
             config->profiles[radio].security = MB_WPA2_PSK_AES;
             config->profiles[radio].radio = (uint8_t)radio;
             if (mb_validate(&config->profiles[radio]))
-                goto done;
+                reject(__LINE__);
         }
     }
     stamp->device = info.st_dev; stamp->inode = info.st_ino;
@@ -615,10 +626,14 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
 done:
     mb_wipe(buffer, sizeof(buffer));
     close(fd);
-    if (result)
+    if (result) {
+        fprintf(stderr, "ZTE_MESH_SERVICE config-reject line=%d\n", reject_line);
         mb_wipe(config, sizeof(*config));
+    }
     return result;
 }
+
+#undef reject
 
 static int same_stamp(const struct config_stamp *a, const struct config_stamp *b)
 {
@@ -1186,6 +1201,16 @@ int controller_renew_agents(void)
     return status;
 }
 
+/* cspd's cooperator (_MapCooperatorACDUpProc / _V4AddrProc) sets g_TriggerSelectFlag and then calls
+ * CfIeee1905RoleElect, which is how a factory agent starts its Search. multiapd only reaches that entry through its
+ * acd task, so the lab path pokes it with the same kind of probe event zte-meshctl already sends for the renew
+ * (0x909b, destination multiapd.acd.acd). The payload is not observable from the binary, so it is a zeroed four-byte
+ * probe and the status is reported as-is - a non-zero status simply means this trigger does not exist. */
+int controller_election_trigger(void)
+{
+    return run_helper("acd-election", NULL);
+}
+
 /* Which off windows are open at this wall-clock second. Bit 0 of the result: all Wi-Fi off; bit 1: guest slot 1 off. */
 static unsigned int sched_windows(const struct service_config *c, time_t wall)
 {
@@ -1282,6 +1307,11 @@ static void sched_tick(const struct service_config *c, struct service_state *s, 
         }
 }
 
+static const char *role_name(int role)
+{
+    return role == CONTROLLER_ROLE_SLAVE ? "slave" : role == CONTROLLER_ROLE_AUTO ? "auto" : "master";
+}
+
 static void apply_new_config(struct service_config *current, struct config_stamp *stamp, struct service_state *state)
 {
     struct service_config next;
@@ -1370,15 +1400,28 @@ static void apply_new_config(struct service_config *current, struct config_stamp
         /* the key appearing or disappearing has no value to go back to */
         state->restart_required = 1;
         printf("ZTE_MESH_SERVICE role_key_changed restart_required=1\n");
-    } else if (next.role_set && next.role_auto != current->role_auto) {
+    } else if (next.role_set && next.role != current->role) {
         /* The factory device-role page (FEATURE_MAP section 10): "adaptive" writes SetRoleEnable 1 and Mode 0 (the
          * election state; the Mode change makes cspd restart the daemon). The new daemon then lets cspd's cooperator
          * decide: router mode -> master, `_autoSetRole` writes Mode 2 and asks cspd for a second restart about 3 s
          * later. Neither cspd's cooperator nor that request exist here and the daemon does not finish the election by
          * itself (replay lab run: Mode stays 0), so the supervisor stands in for them: see role_settle_at. Back to
-         * "master" only clears SetRoleEnable, nothing restarts (10.1). */
+         * "master" only clears SetRoleEnable, nothing restarts (10.1).
+         *
+         * The agent side ("slave") is a different kind of change: multi_ap_slave_main reads EnMasterOnly/Mode once, so
+         * the whole triple is written and the daemon is replaced. No election stand-in is involved in either direction. */
         int status;
-        if (next.role_auto) {
+        if (next.role == CONTROLLER_ROLE_SLAVE || current->role == CONTROLLER_ROLE_SLAVE) {
+            status = next.role == CONTROLLER_ROLE_SLAVE
+                ? (controller_write_cfg("Mode", 1) || controller_write_cfg("SetRoleEnable", 0) ||
+                   controller_write_cfg("EnMasterOnly", 0) || controller_write_cfg("CurHop", -2))
+                : (controller_write_cfg("Mode", 2) ||
+                   controller_write_cfg("SetRoleEnable", next.role == CONTROLLER_ROLE_AUTO ? 1 : 0) ||
+                   controller_write_cfg("EnMasterOnly", 1) || controller_write_cfg("CurHop", 2));
+            state->role_settle_at = 0;
+            if (!status)
+                state->respawn_pending = 1;
+        } else if (next.role == CONTROLLER_ROLE_AUTO) {
             status = controller_write_cfg("SetRoleEnable", 1) || controller_write_cfg("Mode", 0);
             if (!status) {
                 struct timespec at;
@@ -1395,13 +1438,13 @@ static void apply_new_config(struct service_config *current, struct config_stamp
                 state->respawn_pending = 1;
             }
         }
-        printf("ZTE_MESH_SERVICE role_update role=%s status=%d epoch=%ld\n", next.role_auto ? "auto" : "master", status,
+        printf("ZTE_MESH_SERVICE role_update role=%s status=%d epoch=%ld\n", role_name(next.role), status,
                (long)time(NULL));
         if (status) {
             state->restart_required = 1;
             snprintf(state->config_error, sizeof(state->config_error), "mesh.role update failed, restart required");
         } else {
-            current->role_auto = next.role_auto;
+            current->role = next.role;
         }
     }
     if (next.mlo_enable != current->mlo_enable) {
@@ -1651,7 +1694,7 @@ int controller_service(void)
     controller_set_main_style(config.main_hidden, config.main_beacon);
     controller_set_acl(config.acl, config.acl_count, config.acl_policy);
     controller_set_v2(config.v2_enable);
-    controller_set_role(config.role_set ? config.role_auto : -1);
+    controller_set_role(config.role_set ? config.role : CONTROLLER_ROLE_UNSET);
     controller_set_wlan_setting(config.dual_band_sync, config.mlo_enable, config.essid_suffix);
     {
         struct mesh_startup_policy policy = { .essid = (const char *)config.profiles[0].ssid,
@@ -1691,8 +1734,13 @@ int controller_service(void)
             closedir(dir);
     }
     (void)mkdir(ACTION_DIR, 0700);
+    /* A daemon in the agent role is not a controller: the node actions, renews, policy pushes and radio/MLO pushes below
+     * all address *its* agents, which do not exist (docs/research/AGENT_PROBE.md). */
+    int slave = config.role_set && config.role == CONTROLLER_ROLE_SLAVE;
+    if (slave)
+        printf("ZTE_MESH_SERVICE role=slave controller_features=off epoch=%ld\n", (long)time(NULL));
     action_reconcile(0); /* a request from before this start is stale: a reboot must not be replayed */
-    int renew_sent = 0;
+    int renew_sent = 0, election_attempts = 0;
     struct radio_push radio_push[2] = {{0, 0, 0}, {0, 0, 0}};
     struct radio_agent radio_agent = {{0}, 0};
     struct mlo_push mlo_push[MLO_NODES];
@@ -1711,9 +1759,26 @@ int controller_service(void)
             /* Once the daemon's acd task is up, broadcast an AP-autoconfiguration
              * Renew so an agent that had onboarded against a previous controller
              * instance re-runs autoconfiguration against this one instead of
-             * staying put. Standard Multi-AP behaviour; harmless if no agent. */
+             * staying put. Standard Multi-AP behaviour; harmless if no agent.
+             * A daemon that runs as the agent has no agents of its own: skip it. */
             renew_sent = 1;
-            printf("ZTE_MESH_SERVICE startup_renew=%d epoch=%ld\n", controller_renew_agents(), (long)time(NULL));
+            if (slave)
+                printf("ZTE_MESH_SERVICE startup_renew=skipped role=slave epoch=%ld\n", (long)time(NULL));
+            else
+                printf("ZTE_MESH_SERVICE startup_renew=%d epoch=%ld\n", controller_renew_agents(), (long)time(NULL));
+            fflush(NULL);
+        }
+        /* The agent's Search is what starts EasyMesh: cspd's cooperator sets g_TriggerSelectFlag once the interface
+         * has an address and calls CfIeee1905RoleElect, and multiapd only reaches that entry through its acd task.
+         * There is no cspd here, so the same probe event zte-meshctl sends for the renew is poked at it directly
+         * (0x909b, multiapd.acd.acd, docs/research/AGENT_PROBE.md section 5.3). The payload is a four-byte zero
+         * probe: if the trigger does not exist the status is non-zero and nothing is lost. Retried a few times
+         * because the acd task is not necessarily up when the daemon reports itself started. */
+        if (slave && election_attempts < 3 && now.tv_sec - state.started >= 8 + election_attempts * 12) {
+            int status = controller_election_trigger();
+            election_attempts++;
+            printf("ZTE_MESH_SERVICE agent_election attempt=%d status=%d epoch=%ld\n", election_attempts, status,
+                   (long)time(NULL));
             fflush(NULL);
         }
         apply_new_config(&config, &stamp, &state);
@@ -1762,11 +1827,20 @@ int controller_service(void)
         if (now.tv_sec != last_state.tv_sec) {
             sched_tick(&config, &state, time(NULL), now.tv_sec);
             cfg_watch();
-            radio_reconcile(&config, &state, radio_push, &radio_agent, now.tv_sec);
-            mlo_reconcile(&config, mlo_push, now.tv_sec);
-            if (!state.respawn_pending)
-                action_reconcile(1);
-            policy_notify_reconcile(&state, now.tv_sec);
+            if (!slave) {
+                radio_reconcile(&config, &state, radio_push, &radio_agent, now.tv_sec);
+                mlo_reconcile(&config, mlo_push, now.tv_sec);
+                if (!state.respawn_pending)
+                    action_reconcile(1);
+                policy_notify_reconcile(&state, now.tv_sec);
+            } else {
+                /* A child's Wi-Fi profile comes from the M2 the controller sends, which the daemon writes into
+                 * WLANCfg/WLANPSK and announces with CmMultiAPWlanRenewNotify. Its subscribers in the factory
+                 * image are cspd and the driver layer, neither of which exists here, so the rows the notify is
+                 * about are polled and turned into the host-side plan (agent-sync.c, docs/research/AGENT_PROBE.md
+                 * section 11). This is idempotent: it writes only when the rows changed. */
+                (void)agent_sync_poll(WLAN_PLAN_PATH);
+            }
             last_state = now;
             state.sequence++;
             if (write_state(&state))
