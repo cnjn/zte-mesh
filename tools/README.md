@@ -9,6 +9,8 @@ passed as files that stay outside the repository. Unless noted, run them on the 
 |---|---|
 | `container-make.sh TARGET...` | Runs make targets in the offline builder container (`sr1010-mesh-shim-builder`): artifacts relative to `out/` (deleted inside the container first, see docs/DEVELOPMENT.md section 2) or `all`, `database`, `controller`, `test-host`. Keeps make's exit status. |
 | `runtime.sh install\|svctest` | Builds the matching launcher and packs `openwrt/zte-mesh/zte-mesh-runtime.tar.gz` (OpenWrt package, committed; root `/usr/lib/zte-mesh/root`) or `out/zte-mesh-svctest.tar.gz` (tmpfs lab runs, root `/tmp/zte-mesh-svc/root`). |
+| `bootstrap-out.py` | Rebuilds `out/runtime` + `out/manifest.json` from `openwrt/zte-mesh/zte-mesh-runtime.tar.gz` (hash-checked against its `SHA256SUMS` and `prepare.MULTIAPD_SHA256`), for a machine that has no factory JFFS2 (also used by `build-lab-tools.yml`). The manifest is marked `source=runtime-bundle`, so `prepare.py` still refuses it and packaging cannot silently use it. |
+| `po2lmo.py` | Compiles the LuCI `.po` into a `.lmo` without a build tree (same format as LuCI's `po2lmo.c`), for hand-installing the translation; `tests/test_i18n.py` uses it to check every msgid resolves. |
 
 ## capture/ (vendor study and real-child replay)
 
@@ -33,6 +35,12 @@ passed as files that stay outside the repository. Unless noted, run them on the 
 | `child-election-flag.sh` | Reads `g_TriggerSelectFlag` from `cspd` memory (role election trigger, FINDINGS section 3). |
 | `child-log-follow.sh` | Follows the child log for 160 s. |
 | `pcap1905.py` | Tiny IEEE 1905 pcap dumper. |
+
+## probe/ (static analysis of the vendor binaries, no run needed)
+
+| Script | What it does |
+|---|---|
+| `agent-surface.py` | Answers what a Slave role would actually need: where `slave_init` is gated, which way an M2 is applied (database setters or a `wlan_mgr` event), and whether the setter writes the database before notifying `cspd`. Reads `out/vendor/root/bin/multiapd` and `out/vendor/root/lib/libcmapi.so`; `--trace` prints every direct call, `--elf` takes another build. Results and open questions: docs/research/AGENT_PROBE.md. |
 
 ## drivers/
 
