@@ -12,6 +12,12 @@
 #include <string.h>
 #include <unistd.h>
 #define EXPORT __attribute__((visibility("default")))
+/* See controller-trace.c: -Werror=unused-result rejects `(void)write(...)` on GCC 11. */
+static void emit(const char *data, size_t len)
+{
+    ssize_t written = write(STDERR_FILENO, data, len);
+    (void)written;
+}
 #define GUARD 0xa5a5a5a5U
 #define CM_AP_BYTES 2496U
 #define CM_PSK_BYTES 324U
@@ -61,7 +67,7 @@ static void log_status(const char *api, int status)
     int n;
     if (atomic_fetch_add(&count, 1) >= 48) return;
     n = snprintf(text, sizeof(text), "ZTE_CM_PROFILE api=%s status=%d logical_profile=1 hardware_claimed=0\n", api, status);
-    if (n > 0 && (size_t)n < sizeof(text)) (void)write(2, text, (size_t)n);
+    if (n > 0 && (size_t)n < sizeof(text)) emit(text, (size_t)n);
 }
 /* ifidx is the BSS slot within the radio. Only slot 0 carries a logical
  * profile; acdGetWLANCFG nevertheless walks slots 0..3 and aborts the whole

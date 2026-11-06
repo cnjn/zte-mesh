@@ -213,7 +213,7 @@ def prepare_client_lib(rootfs: Path, output: Path, unsquashfs: str) -> Path:
 
 
 def main():
-    repo = Path(__file__).resolve().parent
+    repo = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
     # The factory image stays in the kernel project; SR1010_VENDOR_ROOTFS overrides the location.
     rootfs = os.environ.get("SR1010_VENDOR_ROOTFS", str(repo.parent / "zx279133/vendor-reference/2b5/rootfs.jffs2"))

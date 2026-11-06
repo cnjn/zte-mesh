@@ -19,7 +19,7 @@ from vendor_elf import ELF, audit
 
 
 def main():
-    repo = Path(__file__).resolve().parent
+    repo = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="root@192.168.5.1")
     parser.add_argument("--output", type=Path, default=repo / "out")
@@ -30,7 +30,7 @@ def main():
     manifest = verify_existing(output)
     subprocess.run([sys.executable, str(Path(__file__).with_name("startup-schema.py")),
                     "--cspd", str(output / "analysis/cspd"), "--libdb", str(output / "runtime/lib/libdb.so"),
-                    "--verify", str(Path(__file__).with_name("startup-views.inc"))], check=True)
+                    "--verify", str(repo / "src" / "startup-views.inc")], check=True)
     files = {"root/" + n: output / "runtime" / n for n in manifest["files"]}
     files.update({"root/bin/db-engine-probe": output / "db-engine-probe",
                   "root/lib/libzte_mesh_shim.so": output / "runtime/lib/libzte_mesh_shim.so",
@@ -49,7 +49,7 @@ def main():
     subprocess.run([sys.executable, str(Path(__file__).with_name("cm-profile-evidence.py")),
                     "--libcmapi", str(output / "runtime/lib/libcmapi.so"),
                     "--multiapd", str(output / "runtime/bin/multiapd"),
-                    "--verify", str(Path(__file__).with_name("cm-profile-layout.inc"))], check=True)
+                    "--verify", str(repo / "src" / "cm-profile-layout.inc")], check=True)
     archive = output / "device-controller-probe.tar.gz"
     sums = []
     with tarfile.open(archive, "w:gz") as tar:

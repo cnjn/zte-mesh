@@ -27,7 +27,7 @@ def verify(path):
                 raise ValueError("invalid public enum terminator")
         if found.count(wanted) != 1:
             raise ValueError("bridge public enum mismatch")
-    header = Path(__file__).with_name("mesh-bridge.h").read_text()
+    header = (Path(__file__).resolve().parents[2] / "src" / "mesh-bridge.h").read_text()
     expected = {"MB_VENDOR_BEACON_WPA2": 3, "MB_VENDOR_AUTH_PSK": 0, "MB_VENDOR_CIPHER_AES": 1}
     for name, value in expected.items():
         if not re.search(r"^#define " + name + r" " + str(value) + r"U$", header, re.M):

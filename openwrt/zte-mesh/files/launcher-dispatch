@@ -1,0 +1,72 @@
+#!/bin/sh
+# Pick the launcher binary that matches this CPU, then become it.
+#
+#   ns-run / mesh-search    -- one file installed under two names; the program is the name it was called by.
+#
+# Why this script exists: an ELF carries exactly one architecture, and package-pack.mk reads one PKGARCH
+# per Makefile ("Architecture: $(PKGARCH)"), so a package that ships machine code has to name one CPU -- unless
+# it names none and ships one build per CPU instead. That is what zte-mesh does: it is arch:all and ships
+# arch/<cpu>/{ns-run,mesh-search} next to this file, so one apk fits every machine and this script picks the
+# directory for the one running it. The price is that nothing rejects a wrong board at install time any more: the
+# old DEPENDS:=@(TARGET_zte||TARGET_qualcommax) gate used to fail `apk add` on a machine that could not run
+# the sandbox, and an arch:all package installs everywhere by definition. So the check lives here, where it
+# can name the machine it is standing on, and zte-mesh.init asks the same question before it starts an
+# instance (otherwise procd respawns a 127 every five seconds, which is the failure docs/LAB.md describes
+# for a missing emulator).
+#
+# Nothing is downloaded and nothing is guessed: when this CPU is not in the package, say which ones are.
+
+name=${0##*/}
+dir=${0%/*}
+
+# `uname -m` is the kernel's own name for the machine, and the three names below are the ones the package
+# is built for (openwrt/zte-mesh/Makefile). An unmapped CPU falls through as its own name, so the
+# "not carried" line reports what the kernel actually said instead of inventing a directory.
+machine=$(uname -m)
+case $machine in
+	aarch64 | arm64) arch=aarch64 ;;
+	armv7*) arch=armv7 ;;
+	x86_64) arch=x86_64 ;;
+	*) arch=$machine ;;
+esac
+
+bin=$dir/arch/$arch/$name
+
+# The reserved first argument zte-mesh.init asks with before it hands procd an instance: the same question
+# the exec below answers, without running anything. procd respawns a command that exits 127 for ever
+# (respawn 3600 5 0), so "this machine has no launcher here" belongs in the log before the service starts,
+# not in a respawn loop.
+if [ -x "$bin" ]; then
+	[ "$1" = --launcher-check ] && { printf '%s\n' "$bin"; exit 0; }
+	exec "$bin" "$@"
+fi
+
+# Two reasons the exec above did not happen, and the reader of the line has to tell them apart: this CPU was
+# never built for, or the build is on the disk and cannot be exec'd. Both answer 127, which is what makes the
+# difference worth a sentence.
+if [ -e "$bin" ]; then
+	printf 'zte-mesh %s: %s is not runnable on this machine (uname -m says %s)\n' "$name" "$bin" "$machine" >&2
+	[ "$1" = --launcher-check ] && exit 127
+	printf 'The file is there and cannot be run: check its mode (the package installs 755) and what this machine\n' >&2
+	printf 'needs to run it -- tools/lab/build-launcher.sh builds one for the CPU it is standing on.\n' >&2
+	exit 127
+fi
+
+# The --launcher-check answer is the same first line a person running the program would see: the read-back and
+# zte-mesh.init judge the message the machine actually produces, not a shorter one written for the check.
+carried=""
+for found in "$dir"/arch/*/; do
+	[ -d "$found" ] || continue
+	base=${found%/}
+	carried="$carried ${base##*/}"
+done
+[ -n "$carried" ] || carried=" none"
+
+printf 'zte-mesh %s: no build for this machine (uname -m says %s). The launcher on this box carries:%s\n' \
+	"$name" "$machine" "$carried" >&2
+[ "$1" = --launcher-check ] && exit 127
+
+printf 'An ELF runs only on the architecture it was compiled for, so nothing in this package runs on it: either\n' >&2
+printf 'build the launcher on the machine itself (tools/lab/build-launcher.sh does exactly that) or start the\n' >&2
+printf 'service on one of the architectures named above.\n' >&2
+exit 127

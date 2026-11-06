@@ -11,7 +11,7 @@ install)
 	sh "$REPO/tools/build/container-make.sh" ns-run
 	python3 "$REPO/openwrt/make-runtime.py" --output "$OUT" --ns-run "$OUT/ns-run" \
 		--archive "$REPO/openwrt/zte-mesh/zte-mesh-runtime.tar.gz" \
-		--extra "$REPO/ns-run.c" "$REPO/controller-net.c" "$REPO/enroller.c" ;;
+		--extra "$REPO/src/ns-run.c" "$REPO/src/controller-net.c" "$REPO/tools/lab/enroller.c" ;;
 svctest)
 	sh "$REPO/tools/build/container-make.sh" ns-run-svctest
 	python3 "$REPO/openwrt/make-runtime.py" --output "$OUT" --ns-run "$OUT/ns-run-svctest" \

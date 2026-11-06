@@ -11,7 +11,7 @@ import re
 import struct
 from pathlib import Path
 
-from schema import CSPD_SHA256, DB_SHA256, Image, _decode_constructor
+from schema import CSPD_SHA256, DB_SHA256, Image, TABLE_DEFS, _decode_constructor
 
 TYPES = {0: (12, 40), 1: (20, 48), 2: (36, 64), 3: (68, 96),
          5: (260, 288), 7: (1028, 1056), 12: (4, 32), 13: (4, 32),
@@ -116,7 +116,7 @@ def registry(name, path=None):
     if name not in SPECS:
         raise ValueError("unknown profile table")
     spec = SPECS[name]
-    path = path or Path(__file__).with_name(spec["file"])
+    path = path or TABLE_DEFS / spec["file"]
     fields, offset = [], 8
     for line in path.read_text().splitlines():
         if not line.startswith("PROFILE_FIELD"):

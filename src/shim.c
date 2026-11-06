@@ -91,7 +91,7 @@ static void *next_symbol(const char *name)
 /* qemu-user cannot honour a fixed-address shmat(): the attach is emulated as an
  * mmap() over the reservation that holds the guest address space, and that mmap
  * fails with EINVAL unless SHM_REMAP lets it replace the placeholder mapping
- * (measured on qemu 6.2 with a fixed-address shmat() probe: every fixed address fails,
+ * (measured on qemu 6.2 with tools/lab/shm-fixed.c: every fixed address fails,
  * the same address with SHM_REMAP succeeds). The factory database engine attaches
  * its segment at a fixed address and dereferences the result, so an emulated lab
  * run needs the flag. A device run must keep the exact semantics the daemon

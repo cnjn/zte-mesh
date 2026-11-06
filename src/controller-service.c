@@ -21,6 +21,8 @@
 #include <unistd.h>
 
 #include "controller-service.h"
+#include "controller-actions.h"
+#include "controller-peer.h"
 #include "controller-packet.h"
 #include "agent-sync.h"
 #include "wlan-profiles.h"
@@ -77,6 +79,11 @@ struct service_config {
     struct timer_rule timer[TIMER_RULES];
     unsigned int timer_count;
     int timer_offset;                      /* timer.utc_offset: minutes east of UTC (the sandbox has no time zone) */
+    /* Client actions (controller-actions.c): what to do to individual clients, in config order. `ban.minutes`
+     * turns every ban into a timed one; 0 means the rule stands until it is removed. */
+    struct action_intent intents[ACTION_MAX];
+    unsigned int intent_count;
+    unsigned int ban_minutes;
 };
 
 struct config_stamp { dev_t device; ino_t inode; off_t size; struct timespec modified; };
@@ -134,6 +141,18 @@ static int normalize_mac(char out[18], const char *text)
     return 0;
 }
 
+/* "aa:bb:cc:dd:ee:ff" (already normalized) to bytes. */
+static int text_to_mac(uint8_t mac[6], const char text[18])
+{
+    unsigned int i, value;
+    for (i = 0; i < 6; i++) {
+        if (sscanf(text + i * 3, "%2x", &value) != 1)
+            return -1;
+        mac[i] = (uint8_t)value;
+    }
+    return 0;
+}
+
 /* 0 = automatic channel; otherwise the legal 20 MHz channels of the band (no 2.4G ch14). */
 static int channel_allowed(unsigned int radio, int value)
 {
@@ -163,6 +182,7 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
     uint8_t bss_seen[2][4], style_seen[2] = {0, 0}, timer_seen[TIMER_RULES];
     struct timer_rule timer_tmp[TIMER_RULES];
     unsigned int roam_seen = 0, steer_seen = 0, dual_seen = 0, v2_seen = 0, mlo_seen = 0, force_seen = 0, role_seen = 0, suffix_seen = 0, offset_seen = 0;
+    unsigned int ban_minutes_seen = 0;
     struct wlan_acl_rule acl_slots[WLAN_ACL_RULES];
     unsigned char acl_seen[WLAN_ACL_RULES];
     struct stat info;
@@ -281,6 +301,27 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
                 reject(__LINE__);
             config->mlo_enable = equals[0] - '0';
             mlo_seen = 1;
+            continue;
+        }
+        if (!strcmp(line, "ban.mac") || !strcmp(line, "kick.mac")) {
+            struct action_intent *intent;
+            char text[18];
+            if (config->intent_count >= ACTION_MAX || normalize_mac(text, equals))
+                reject(__LINE__);
+            intent = &config->intents[config->intent_count++];
+            memset(intent, 0, sizeof(*intent));
+            intent->kind = line[0] == 'b' ? ACTION_KIND_BAN : ACTION_KIND_KICK;
+            if (text_to_mac(intent->mac, text))
+                reject(__LINE__);
+            continue;
+        }
+        if (!strcmp(line, "ban.minutes")) {
+            char *end;
+            unsigned long value = strtoul(equals, &end, 10);
+            if (ban_minutes_seen || !*equals || *end || value > 1440)
+                reject(__LINE__);
+            config->ban_minutes = (unsigned int)value;
+            ban_minutes_seen = 1;
             continue;
         }
         if (!strcmp(line, "wifi.dual_band_sync")) {
@@ -759,6 +800,12 @@ struct radio_agent { char mac[18]; time_t since; };
 #define MLO_NODES 8U
 struct mlo_push { char mac[18]; time_t since, next; int sent; unsigned int attempts; };
 
+/* One node this controller asks for its client counts, and when it asked last. */
+#define AP_METRIC_PEERS 8U
+#define AP_METRIC_SETTLE 15
+#define AP_METRIC_INTERVAL 10
+struct ap_metric_query { char mac[18]; time_t since, next; };
+
 static void al_mac(char out[18])
 {
     struct ifreq request;
@@ -778,7 +825,7 @@ static void al_mac(char out[18])
  * peers/<mac>.<kind>, -1 if missing or older than max_age seconds; *age gets the file's age in seconds. */
 static int read_peer(const char *mac, const char *kind, const char *key, time_t max_age, long *age)
 {
-    char path[96], text[32], wanted[16];
+    char path[96], text[96], wanted[16];
     struct stat info;
     ssize_t bytes;
     int fd, value = -1;
@@ -790,9 +837,20 @@ static int read_peer(const char *mac, const char *kind, const char *key, time_t 
     if (!fstat(fd, &info) && S_ISREG(info.st_mode) && info.st_size > 0 && info.st_size < (off_t)sizeof(text)) {
         bytes = read(fd, text, sizeof(text) - 1);
         if (bytes > 0) {
+            const char *at = text;
+            size_t want = strlen(wanted);
             text[bytes] = 0;
-            if (!strncmp(text, wanted, strlen(wanted)) && text[strlen(wanted)] >= '0' && text[strlen(wanted)] <= '9')
-                value = atoi(text + strlen(wanted));
+            /* A digest file holds one "key=value" per line, because one frame can say several things at once
+             * (stations, BSS count, hop count). The older one-key files match on their first line. */
+            while (at && *at) {
+                if (!strncmp(at, wanted, want) && at[want] >= '0' && at[want] <= '9') {
+                    value = atoi(at + want);
+                    break;
+                }
+                at = strchr(at, '\n');
+                if (at)
+                    at++;
+            }
         }
         if (age)
             *age = (long)(time(NULL) - info.st_mtime);
@@ -803,39 +861,124 @@ static int read_peer(const char *mac, const char *kind, const char *key, time_t 
     return value;
 }
 
+/* The whole text of a peer digest that is not a number - the software version, which the page shows as it was
+ * reported. "" when the node never reported one. */
+static void read_peer_text(const char *mac, const char *kind, char *out, size_t room)
+{
+    char path[96];
+    ssize_t bytes;
+    int fd;
+    out[0] = 0;
+    snprintf(path, sizeof(path), SERVICE_DIR "/peers/%s.%s", mac, kind);
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return;
+    bytes = read(fd, out, room - 1);
+    (void)close(fd);
+    if (bytes < 1) {
+        out[0] = 0;
+        return;
+    }
+    out[bytes] = 0;
+    while (bytes-- > 0)
+        if (out[bytes] == '\n' || out[bytes] == '\r')
+            out[bytes] = 0;
+}
+
+static struct action_table actions;
+
 static int write_state(const struct service_state *state)
 {
-    static char json[16384];
+    static char json[32768]; /* one node prints up to 2400 of it (see the loop below): the strings plus sixteen BSS rows */
     struct controller_node nodes[MAX_NODES];
     unsigned int count = controller_read_nodes(nodes, MAX_NODES), i;
     struct timespec now;
-    char mac[18], quoted[320];
+    char mac[18], quoted[320], self_model[64], self_name[64];
     size_t used = 0;
     int fd, written;
     clock_gettime(CLOCK_MONOTONIC, &now);
     al_mac(mac);
+    controller_self_identity(self_model, sizeof(self_model), self_name, sizeof(self_name));
     used += (size_t)snprintf(json + used, sizeof(json) - used,
         "{\"schema\":1,\"running\":%s,\"sequence\":%lu,\"uptime\":%ld,\"daemon_pid\":%d,\"daemon_restarts\":%u,"
-        "\"al_mac\":\"%s\",\"version_mode\":%u,\"config_applied\":%lu,\"restart_required\":%s,\"config_error\":",
+        "\"al_mac\":\"%s\",\"self\":{\"model\":",
         state->running ? "true" : "false", state->sequence, (long)(now.tv_sec - state->started), (int)state->daemon,
-        state->respawns, mac, state->version_mode, state->applied, state->restart_required ? "true" : "false");
+        state->respawns, mac);
+    json_string(quoted, sizeof(quoted), self_model);
+    used += (size_t)snprintf(json + used, sizeof(json) - used, "%s,\"name\":", quoted);
+    json_string(quoted, sizeof(quoted), self_name);
+    used += (size_t)snprintf(json + used, sizeof(json) - used,
+        "%s},\"version_mode\":%u,\"config_applied\":%lu,\"restart_required\":%s,\"config_error\":",
+        quoted, state->version_mode, state->applied, state->restart_required ? "true" : "false");
     json_string(quoted, sizeof(quoted), state->config_error);
     used += (size_t)snprintf(json + used, sizeof(json) - used, "%s,\"nodes\":[", quoted);
-    for (i = 0; i < count && used + 1200 < sizeof(json); i++) {
+    for (i = 0; i < count && used + 2400 < sizeof(json); i++) {
+        /* A node that reports no model or name is common enough (a non-ZTE child, or a row added before its identity
+         * TLV arrived). "router" is what the page shows instead of an empty cell. The row that carries our own
+         * address is this router, so it gets this router's system model and host name. */
+        const char *model = nodes[i].model, *name = nodes[i].name;
+        char reported[72]; /* one line from peers/<mac>.software: a version is at most 64 bytes */
+        const char *software = nodes[i].software;
+        if (!strcmp(nodes[i].mac, mac)) {
+            model = self_model;
+            name = self_name;
+        } else {
+            if (!model[0])
+                model = "router";
+            if (!name[0])
+                name = "router";
+        }
         used += (size_t)snprintf(json + used, sizeof(json) - used, "%s{\"key\":", i ? "," : "");
         json_string(quoted, sizeof(quoted), nodes[i].view);
         used += (size_t)snprintf(json + used, sizeof(json) - used, "%s,\"mac\":\"%s\",\"model\":", quoted, nodes[i].mac);
-        json_string(quoted, sizeof(quoted), nodes[i].model);
+        json_string(quoted, sizeof(quoted), model);
         used += (size_t)snprintf(json + used, sizeof(json) - used, "%s,\"name\":", quoted);
-        json_string(quoted, sizeof(quoted), nodes[i].name);
+        json_string(quoted, sizeof(quoted), name);
         used += (size_t)snprintf(json + used, sizeof(json) - used, "%s,\"software\":", quoted);
-        json_string(quoted, sizeof(quoted), nodes[i].software);
+        if (!software[0]) {
+            /* The database column is empty for a child: the factory master pulls the version out of the AP
+             * Capability Report into its own device table and never writes it into the peer rows, so the frame
+             * digest is the only source here. A row that does say something wins. */
+            read_peer_text(nodes[i].mac, "software", reported, sizeof(reported));
+            if (reported[0])
+                software = reported;
+        }
+        json_string(quoted, sizeof(quoted), software);
         {
-            long light_age = -1;
+            /* Everything below comes from the frames the daemon received from this node (controller-trace.c writes
+             * them, controller-1905.c decodes them). A value of -1 means the node has not reported it, which is not
+             * the same as zero: a node that reports no BSS is different from one this router never heard from. */
+            long light_age = -1, metrics_age = -1;
+            struct peer_bss_load counted = {0};
             int light = read_peer(nodes[i].mac, "light", "light", 0, &light_age);
-            int stations = read_peer(nodes[i].mac, "stations", "stations", 30, NULL);
-            used += (size_t)snprintf(json + used, sizeof(json) - used, "%s,\"zte\":%s,\"online\":%s,\"light\":%d,\"light_age\":%ld,\"stations\":%d}",
-                                     quoted, nodes[i].zte ? "true" : "false", nodes[i].active ? "true" : "false", light, light_age, stations);
+            int stations = read_peer(nodes[i].mac, "metrics", "stations", 30, &metrics_age);
+            int bss = read_peer(nodes[i].mac, "metrics", "bss", 30, NULL);
+            int hops = read_peer(nodes[i].mac, "metrics", "hops", 300, NULL);
+            unsigned int k;
+            if (stations < 0)
+                stations = read_peer(nodes[i].mac, "stations", "stations", 30, NULL); /* written by r10 and older */
+            /* The same frames leave one file per BSS. Where those exist they are the total: the digest above
+             * only ever holds the last frame that arrived, so a child that answers one frame per radio would
+             * otherwise alternate between the radios instead of showing both. The freshness shown with that sum
+             * is the oldest entry in it, not the digest's own mtime - a number assembled from two frames is as
+             * old as its stalest part. */
+            if (controller_peer_bss_load(nodes[i].mac, 30, &counted)) {
+                stations = (int)counted.stations;
+                metrics_age = counted.age;
+            }
+            used += (size_t)snprintf(json + used, sizeof(json) - used,
+                                     "%s,\"zte\":%s,\"online\":%s,\"light\":%d,\"light_age\":%ld,\"stations\":%d,"
+                                     "\"bss\":%d,\"hops\":%d,\"metrics_age\":%ld,\"bss_detail\":[",
+                                     quoted, nodes[i].zte ? "true" : "false", nodes[i].active ? "true" : "false", light, light_age,
+                                     stations, bss, hops, metrics_age);
+            /* One row per BSS that reported, so the page can tell a busy 5G from an idle radio with one guest. The
+             * BSSID is this node's own file name, and the count of a BSS with nobody on it is a zero - which is why
+             * an empty list means "the frames never split", not "no station anywhere". */
+            for (k = 0; k < counted.listed; k++)
+                used += (size_t)snprintf(json + used, sizeof(json) - used, "%s{\"bssid\":\"%s\",\"stations\":%u,\"age\":%ld}",
+                                         k ? "," : "", counted.detail[k].bssid, counted.detail[k].stations,
+                                         counted.detail[k].age);
+            used += (size_t)snprintf(json + used, sizeof(json) - used, "]}");
         }
     }
     used += (size_t)snprintf(json + used, sizeof(json) - used, "],\"actions\":[");
@@ -845,6 +988,15 @@ static int write_state(const struct service_state *state)
         used += (size_t)snprintf(json + used, sizeof(json) - used,
                                  "%s{\"id\":%s,\"action\":\"%s\",\"mac\":\"%s\",\"value\":%d,\"status\":%d,\"epoch\":%ld}",
                                  i ? "," : "", quoted, r->action, r->mac, r->value, r->status, r->epoch);
+    }
+    used += (size_t)snprintf(json + used, sizeof(json) - used, "],\"clients\":[");
+    {
+        char list[1024];
+        int bytes = actions_json(&actions, list, sizeof(list));
+        if (bytes > 0 && used + (size_t)bytes < sizeof(json)) {
+            memcpy(json + used, list, (size_t)bytes);
+            used += (size_t)bytes;
+        }
     }
     used += (size_t)snprintf(json + used, sizeof(json) - used, "],\"sched\":{\"rules\":%u,\"off_all\":%s,\"off_guest\":%s,\"access\":[",
                              state->sched_rules, state->sched_off_all ? "true" : "false", state->sched_off_guest ? "true" : "false");
@@ -868,6 +1020,66 @@ static int write_state(const struct service_state *state)
     if (close(fd) || written != (int)used || rename(STATE_TEMP, STATE_PATH))
         return -1;
     return 0;
+}
+
+/* Client actions, once a second: fold the configured intents into the state machine, then send whatever it says
+ * is due to every agent that is online right now. An agent that has just answered its first frame is the only
+ * one that can act on a request, and the machine below re-sends a ban every couple of minutes, so an agent that
+ * reboots does not stay un-banned for long.
+ *
+ * The request names the broadcast BSSID: without a per-client association table we do not know which BSS a
+ * client is on, and "all of them" is the only answer that covers a client roaming between the agent's BSSes. */
+static void client_actions_reconcile(const struct service_config *config, long now)
+{
+    static const uint8_t every_bss[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    struct controller_node nodes[MAX_NODES];
+    struct action_intent intents[ACTION_MAX];
+    struct action_due due[ACTION_MAX];
+    unsigned int count, i, k, n;
+
+    memcpy(intents, config->intents, sizeof(intents));
+    for (i = 0; i < config->intent_count; i++)
+        if (intents[i].kind == ACTION_KIND_BAN)
+            intents[i].minutes = config->ban_minutes;
+    if (actions_configure(&actions, now, intents, config->intent_count) < 0)
+        return; /* more rules than the table holds; the config parser already refuses that case */
+
+    n = actions_tick(&actions, now, due, ACTION_MAX);
+    if (!n)
+        return;
+    count = controller_read_nodes(nodes, MAX_NODES);
+    for (i = 0; i < n; i++) {
+        for (k = 0; k < count; k++) {
+            char text[18];
+            uint8_t agent[6];
+            if (!nodes[k].zte || !nodes[k].active)
+                continue;
+            snprintf(text, sizeof(text), "%s", nodes[k].mac);
+            if (text_to_mac(agent, text))
+                continue;
+            (void)controller_client_action(agent, every_bss, due[i].mac, due[i].kind, due[i].allow, 0);
+        }
+    }
+}
+
+/* A BTM report or a Steering Completed names the client; the trace library turns those into
+ * peers/<mac>.btm, so a kick learns whether it worked instead of waiting out its timer. */
+static void client_actions_observe(void)
+{
+    unsigned int i;
+    for (i = 0; i < actions.count; i++) {
+        char mac[18];
+        int ok;
+        if (actions.entry[i].kind != ACTION_KIND_KICK || actions.entry[i].state == ACTION_DONE ||
+            actions.entry[i].state == ACTION_FAILED)
+            continue;
+        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", actions.entry[i].mac[0],
+                 actions.entry[i].mac[1], actions.entry[i].mac[2], actions.entry[i].mac[3],
+                 actions.entry[i].mac[4], actions.entry[i].mac[5]);
+        ok = read_peer(mac, "btm", "ok", 120, NULL);
+        if (ok >= 0)
+            actions_observe(&actions, actions.entry[i].mac, ok);
+    }
 }
 
 /* Ask the daemon to push the WLAN profile to its agents, exactly as the factory
@@ -1063,6 +1275,67 @@ static void mlo_reconcile(const struct service_config *cfg, struct mlo_push push
         if (!status)
             p->sent = cfg->mlo_enable;
         return;
+    }
+}
+
+/* How many clients sit on a child's access points is not something this controller can see: it is measured on the
+ * child and only leaves that router in answer to an AP Metric Query (CMDU 0x800b). A factory master asks on its own
+ * schedule and the daemon here does not, so the service asks - one node per call, every AP_METRIC_INTERVAL seconds.
+ * That is well inside the 30 seconds the reader gives a per-BSS file, so a node that stays online is never shown as
+ * silent between two asks, and one send per call keeps the loop that writes state.json every second.
+ *
+ * The settle delay is the one the radio push uses: an agent drops what we send until it has learned this controller,
+ * so a query before that is a query with no answer. A node that leaves the topology stops being asked, and its files
+ * age out by themselves - which is what tells "this child reports nothing" from "this child is gone". */
+static void ap_metrics_reconcile(struct ap_metric_query peers[AP_METRIC_PEERS], time_t now)
+{
+    struct controller_node nodes[MAX_NODES];
+    unsigned int count, i, j, k, octets[6];
+    char self[18];
+    int online, asked = 0;
+    al_mac(self);
+    count = topology_ready() ? controller_read_nodes(nodes, MAX_NODES) : 0;
+    for (k = 0; k < AP_METRIC_PEERS; k++) {
+        if (!peers[k].mac[0])
+            continue;
+        for (i = 0, online = 0; i < count; i++)
+            if (nodes[i].active && !strcmp(nodes[i].mac, peers[k].mac)) {
+                online = 1;
+                break;
+            }
+        if (!online)
+            peers[k].mac[0] = 0;
+    }
+    for (i = 0; i < count && !asked; i++) {
+        uint8_t mac[6];
+        int status;
+        if (!nodes[i].active || !strcmp(nodes[i].mac, self))
+            continue;
+        if (sscanf(nodes[i].mac, "%x:%x:%x:%x:%x:%x", &octets[0], &octets[1], &octets[2],
+                   &octets[3], &octets[4], &octets[5]) != 6)
+            continue;
+        for (j = 0; j < 6; j++)
+            mac[j] = (uint8_t)octets[j];
+        for (k = 0; k < AP_METRIC_PEERS; k++)
+            if (peers[k].mac[0] && !strcmp(peers[k].mac, nodes[i].mac))
+                break;
+        if (k == AP_METRIC_PEERS) {
+            for (k = 0; k < AP_METRIC_PEERS; k++)
+                if (!peers[k].mac[0])
+                    break;
+            if (k == AP_METRIC_PEERS)
+                return; /* every slot holds a node still marked online; the next tick will ask one of those */
+            snprintf(peers[k].mac, sizeof(peers[k].mac), "%s", nodes[i].mac);
+            peers[k].since = now;
+            peers[k].next = 0;
+        }
+        if (now - peers[k].since < AP_METRIC_SETTLE || now < peers[k].next)
+            continue;
+        status = controller_ap_metrics_query(mac);
+        peers[k].next = now + AP_METRIC_INTERVAL;
+        printf("ZTE_MESH_SERVICE ap_metric_query mac=%s status=%d epoch=%ld\n", nodes[i].mac, status, (long)time(NULL));
+        fflush(NULL);
+        asked = 1;
     }
 }
 
@@ -1636,6 +1909,16 @@ static void apply_new_config(struct service_config *current, struct config_stamp
                     }
         }
     }
+    /* Client actions (ban / kick). The state machine diffs the new intents against its own table, so a rule that
+     * disappeared turns into the matching "allow" and a kick that already happened is not sent again; that is why
+     * this only copies the numbers. Nothing here needs a restart: the service re-reads this file every second. */
+    if (next.intent_count != current->intent_count || next.ban_minutes != current->ban_minutes ||
+        memcmp(next.intents, current->intents, sizeof(current->intents))) {
+        memcpy(current->intents, next.intents, sizeof(current->intents));
+        current->intent_count = next.intent_count;
+        current->ban_minutes = next.ban_minutes;
+        printf("ZTE_MESH_SERVICE client_actions rules=%u ban_minutes=%u\n", next.intent_count, next.ban_minutes);
+    }
     /* what the schedule and the access-time countdowns are computed from */
     memcpy(current->timer, next.timer, sizeof(current->timer));
     current->timer_count = next.timer_count;
@@ -1744,7 +2027,9 @@ int controller_service(void)
     struct radio_push radio_push[2] = {{0, 0, 0}, {0, 0, 0}};
     struct radio_agent radio_agent = {{0}, 0};
     struct mlo_push mlo_push[MLO_NODES];
+    struct ap_metric_query metric_query[AP_METRIC_PEERS];
     memset(mlo_push, 0, sizeof(mlo_push));
+    memset(metric_query, 0, sizeof(metric_query));
     for (;;) {
         memset(&info, 0, sizeof(info));
         if (waitid(P_PID, child, &info, WEXITED | WNOHANG | WNOWAIT)) {
@@ -1807,6 +2092,7 @@ int controller_service(void)
             state.notify_pending = 0;
             state.notify_attempts = 0;
             memset(mlo_push, 0, sizeof(mlo_push));
+            memset(metric_query, 0, sizeof(metric_query));
             memset(radio_push, 0, sizeof(radio_push));
             radio_agent.mac[0] = 0;
         }
@@ -1830,9 +2116,12 @@ int controller_service(void)
             if (!slave) {
                 radio_reconcile(&config, &state, radio_push, &radio_agent, now.tv_sec);
                 mlo_reconcile(&config, mlo_push, now.tv_sec);
+                ap_metrics_reconcile(metric_query, now.tv_sec);
                 if (!state.respawn_pending)
                     action_reconcile(1);
                 policy_notify_reconcile(&state, now.tv_sec);
+                client_actions_observe();
+                client_actions_reconcile(&config, now.tv_sec);
             } else {
                 /* A child's Wi-Fi profile comes from the M2 the controller sends, which the daemon writes into
                  * WLANCfg/WLANPSK and announces with CmMultiAPWlanRenewNotify. Its subscribers in the factory

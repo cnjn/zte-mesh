@@ -16,6 +16,15 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #define EXPORT __attribute__((visibility("default")))
+/* glibc marks write() __warn_unused_result and GCC refuses `(void)write(...)`
+ * under -Werror=unused-result (11.4 does). These are stderr-only diagnostics on
+ * a sandbox pipe that may already be closed; consume the result through a real
+ * assignment so the deliberate drop is explicit. */
+static void emit(const char *data, size_t len)
+{
+    ssize_t written = write(STDERR_FILENO, data, len);
+    (void)written;
+}
 
 /* Stock binds br0 but its socket-record classifier understands physical eth/
  * veth names, not br0. Map ONLY this private lab alias to the actual ingress
@@ -42,7 +51,7 @@ EXPORT int bind(int fd, const struct sockaddr *address, socklen_t bytes)
             mapped.sll_ifindex = (int)link;
             result = real(fd, (const struct sockaddr *)&mapped, sizeof(mapped)); saved = errno;
             n = snprintf(note, sizeof(note), "ZTE_CONTROLLER_WIRE actual_lab_bind=1 status=%d host_link=0\n", result);
-            if (n > 0 && (size_t)n < sizeof(note)) (void)write(2, note, (size_t)n);
+            if (n > 0 && (size_t)n < sizeof(note)) emit(note, (size_t)n);
             errno = saved; return result;
         }
     }
@@ -93,7 +102,7 @@ EXPORT int GetRouteIFInfo(const char *instance, void *output)
     /* Fixed metadata only, no actual MAC/identity/profile value. */
     {
         static const char note[] = "ZTE_CONTROLLER_ROUTE actual_private_if=1 route_bytes=532 l3_supported=0\n";
-        (void)write(STDERR_FILENO, note, sizeof(note) - 1);
+        emit(note, sizeof(note) - 1);
     }
     return 0;
 failed:

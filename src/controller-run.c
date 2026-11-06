@@ -98,6 +98,43 @@ static void cell_string(unsigned int row, const char *name, char *out, size_t si
     value[sizeof(value) - 1] = 0;
     snprintf(out, size, "%.*s", (int)size - 1, value);
 }
+/* First line of a file, without the newline and surrounding blanks. OpenWrt writes the board name to
+ * /tmp/sysinfo/model (the same string its overview page calls "Model"). */
+static void first_line(const char *path, char *out, size_t size)
+{
+    FILE *file = fopen(path, "r");
+    size_t used;
+    out[0] = 0;
+    if (!file)
+        return;
+    if (!fgets(out, (int)size, file))
+        out[0] = 0;
+    (void)fclose(file);
+    used = strlen(out);
+    while (used && (out[used - 1] == '\n' || out[used - 1] == '\r' || out[used - 1] == ' ' || out[used - 1] == '\t'))
+        out[--used] = 0;
+    while (out[0] == ' ' || out[0] == '\t')
+        memmove(out, out + 1, strlen(out));
+}
+/* This router's own model and name, for the page only. The identity a child router checks is a different thing:
+ * that one is the SR1010 shape in DevInfo and stays as it is (REAL_CHILD.md section 2), because a real ZTE child
+ * compares ModelName and rejects anything else. Nothing here is ever handed to the vendor code. */
+void controller_self_identity(char *model, size_t model_size, char *name, size_t name_size)
+{
+    if (model_size) {
+        first_line("/tmp/sysinfo/model", model, model_size);
+        if (!model[0])
+            snprintf(model, model_size, "%s", "router");
+    }
+    if (name_size) {
+        name[0] = 0;
+        if (gethostname(name, name_size))
+            name[0] = 0;
+        name[name_size - 1] = 0;
+        if (!name[0])
+            snprintf(name, name_size, "%s", "router");
+    }
+}
 /* Node inventory: rows the real daemon adds to P1905DeviceInfo. Read only;
  * serial numbers and product class are deliberately not exposed. */
 unsigned int controller_read_nodes(struct controller_node *nodes, unsigned int max)

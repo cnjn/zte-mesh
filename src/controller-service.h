@@ -8,6 +8,9 @@ struct controller_node {
     unsigned int zte, active;
 };
 unsigned int controller_read_nodes(struct controller_node *nodes, unsigned int max);
+/* This router's own model (OpenWrt's board name) and host name, each falling back to "router" when the system
+ * cannot answer. Display only: the identity sent to a ZTE child is the fixed SR1010 shape. */
+void controller_self_identity(char *model, size_t model_size, char *name, size_t name_size);
 /* Optional extra BSS slots (1..3 per radio) the controller answers SSID queries for.
  * set[r][k]!=0 exposes slot k of radio r; enabled[r][k] is the enable bit sent. */
 void controller_set_extra_bss(const uint8_t set[2][4], const uint8_t enabled[2][4],

@@ -20,7 +20,7 @@ ROOT = "/tmp/zte-mesh-svc"
 
 
 def main():
-    repo = Path(__file__).resolve().parent
+    repo = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--host", default="root@192.168.5.1")

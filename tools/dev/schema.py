@@ -20,9 +20,12 @@ TYPE_LENGTHS = {2: (36, 64), 3: (68, 96), 5: (260, 288), 7: (1028, 1056),
                 12: (4, 32), 13: (4, 32), 14: (4, 32), 15: (1, 32)}
 PATTERN = re.compile(r'^MAP_FIELD\(([A-Z0-9_]+), "([^"]+)", (\d+), ([01]), "([^"]*)"\)$')
 
+# 表描述文件（.def）与 C 源同在 src/
+TABLE_DEFS = Path(__file__).resolve().parents[2] / "src"
+
 
 def registry(path=None):
-    path = path or Path(__file__).with_name("multiap_cfg.def")
+    path = path or TABLE_DEFS / "multiap_cfg.def"
     fields, offset = [], 8
     for line in path.read_text().splitlines():
         if not line.startswith("MAP_FIELD"):
@@ -238,7 +241,7 @@ def policy_registry(table_name, path=None):
     if table_name not in POLICY_TABLES:
         raise ValueError("unknown policy table")
     spec = POLICY_TABLES[table_name]
-    path = path or Path(__file__).with_name(spec["file"])
+    path = path or TABLE_DEFS / spec["file"]
     fields, offset = [], 8
     for line in path.read_text().splitlines():
         if not line.startswith("MESH_FIELD"):

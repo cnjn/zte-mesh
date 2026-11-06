@@ -210,18 +210,85 @@ static unsigned int search_frame(uint8_t *frame, const uint8_t controller[6], un
     frame[at++] = 0x80; frame[at++] = 0; frame[at++] = 2; frame[at++] = 1; frame[at++] = 1; /* supported: agent */
     frame[at++] = 0x81; frame[at++] = 0; frame[at++] = 2; frame[at++] = 1; frame[at++] = 0; /* searched: controller */
     frame[at++] = 0xb3; frame[at++] = 0; frame[at++] = 1; frame[at++] = 1;               /* Multi-AP profile 1 */
+    /* End of Message. Every frame the factory daemon sent on the wire in the lab capture
+     * of 2026-11-01 (0x0000/0x0001/0x0008/0x000a) ends with 00 00 00, and without it the
+     * Wireshark 3.6 ieee1905 dissector runs off the end of the TLV list and marks the whole
+     * frame malformed (docs/research/WIRESHARK_1905.md). The daemon itself is lenient -
+     * it answered the search either way - so this is for the dissector and for anything
+     * else that walks the list strictly. */
+    frame[at++] = 0; frame[at++] = 0; frame[at++] = 0;
     return at;
+}
+
+/* AP Metric Query (CMDU 0x800b), AP Metric Query TLV 0x93 = {BSSID number, BSSID[n]}, the way the
+ * factory master's I5TlvApMetricsQueryInsert writes it. An agent that recognises a BSSID answers
+ * 0x800c with one AP Metrics TLV (0x94) for it; one it does not gets an Error Code response instead
+ * (ApMetricsQueryReceive -> slave_find_bss). Used by --metric: it is the only way to make a child
+ * report station counts on demand, and what the answer looks like decides where a stand-in has to sit. */
+static unsigned int metric_frame(uint8_t *frame, const uint8_t agent[6], const uint8_t controller[6],
+                                 unsigned int mid, const uint8_t *bssids, unsigned int count)
+{
+    unsigned int at = 0, length = 1 + 6 * count;
+    memcpy(frame + at, agent, 6);         at += 6;
+    memcpy(frame + at, controller, 6);    at += 6;
+    frame[at++] = (uint8_t)(ETHERTYPE_1905 >> 8);
+    frame[at++] = (uint8_t)(ETHERTYPE_1905 & 0xff);
+    frame[at++] = 0;                          /* revision */
+    frame[at++] = 0;                          /* reserved */
+    frame[at++] = 0x80; frame[at++] = 0x0b;   /* CMDU 0x800b */
+    frame[at++] = (uint8_t)(mid >> 8); frame[at++] = (uint8_t)(mid & 0xff);
+    frame[at++] = 0;                          /* fragment id */
+    frame[at++] = 0x80;                       /* last fragment */
+    frame[at++] = 0x93; frame[at++] = (uint8_t)(length >> 8); frame[at++] = (uint8_t)length;
+    frame[at++] = (uint8_t)count;
+    memcpy(frame + at, bssids, 6 * count);    at += 6 * count;
+    frame[at++] = 0; frame[at++] = 0; frame[at++] = 0; /* End of Message */
+    if (at < 60)
+        at = 60;                              /* the raw socket does not pad an Ethernet frame */
+    return at;
+}
+
+/* AP Metrics TLV 0x94 = BSSID(6), channel utility(1), station count u16, presence bitmap(1), then the
+ * optional estimated-service blocks (I5TlvApMetricsTypeInsert, cross-checked against the 3.6 dissector). */
+static void report_metrics(const uint8_t *frame, unsigned int bytes)
+{
+    unsigned int at = FRAME_BYTES;
+    char from[18];
+    snprintf(from, sizeof(from), "%02x:%02x:%02x:%02x:%02x:%02x", frame[6], frame[7], frame[8], frame[9],
+             frame[10], frame[11]);
+    while (at + 3 <= bytes) {
+        unsigned int type = frame[at];
+        unsigned int length = ((unsigned int)frame[at + 1] << 8) | frame[at + 2];
+        const uint8_t *value;
+        if (!type)
+            break;
+        if (at + 3 + length > bytes)
+            break;
+        value = frame + at + 3;
+        if (type == 0x94 && length >= 9)
+            printf("enroller metric from=%s bssid=%02x:%02x:%02x:%02x:%02x:%02x util=%u stations=%u "
+                   "present=0x%02x length=%u\n", from, value[0], value[1], value[2], value[3], value[4], value[5],
+                   value[6], (unsigned int)((value[7] << 8) | value[8]), value[9], length);
+        else if (type == 0x0a || type == 0x0b) /* Error Code / vendor container, reported as bytes only */
+            printf("enroller metric from=%s tlv=0x%02x length=%u value=%02x%02x%02x\n", from, type, length,
+                   length ? value[0] : 0, length > 1 ? value[1] : 0, length > 2 ? value[2] : 0);
+        at += 3 + length;
+    }
+    fflush(NULL);
 }
 
 int main(int argc, char **argv)
 {
     uint8_t controller[6] = { 0 }, iface_mac[6] = { 0 }, buffer[1600];
+    uint8_t target[6] = { 0 }, bssids[16][6];
     unsigned int seconds = 60, band = 0, mid = 0x3000, replies = 0, heard = 0;
+    unsigned int metric_count = 0, metric_next = 0;
     int fd, index = 0, was_promiscuous = 0, quiet = 0, want_search = 0, status;
     const char *name;
     struct timespec start, now;
     if (argc < 2) {
-        fprintf(stderr, "usage: enroller <iface> [seconds] [--al-mac aa:bb:cc:dd:ee:ff] [--band N] [--search] [--quiet]\n");
+        fprintf(stderr, "usage: enroller <iface> [seconds] [--al-mac aa:bb:cc:dd:ee:ff] [--band N] [--search] "
+                        "[--metric bssid[,bssid...]] [--metric-to aa:bb:cc:dd:ee:ff] [--quiet]\n");
         return 64;
     }
     name = argv[1];
@@ -230,6 +297,21 @@ int main(int argc, char **argv)
             if (parse_mac(argv[++i], controller)) {
                 fprintf(stderr, "enroller: bad --al-mac\n");
                 return 64;
+            }
+        } else if (!strcmp(argv[i], "--metric-to") && i + 1 < argc) {
+            if (parse_mac(argv[++i], target)) {
+                fprintf(stderr, "enroller: bad --metric-to\n");
+                return 64;
+            }
+        } else if (!strcmp(argv[i], "--metric") && i + 1 < argc) {
+            char *list = argv[++i], *item = strtok(list, ",");
+            while (item && metric_count < 16) {
+                if (parse_mac(item, bssids[metric_count])) {
+                    fprintf(stderr, "enroller: bad --metric bssid\n");
+                    return 64;
+                }
+                metric_count++;
+                item = strtok(NULL, ",");
             }
         } else if (!strcmp(argv[i], "--band") && i + 1 < argc) {
             band = (unsigned int)atoi(argv[++i]);
@@ -288,10 +370,26 @@ int main(int argc, char **argv)
     }
 
     clock_gettime(CLOCK_MONOTONIC, &start);
+    if (metric_count && (metric_count < 1 || !(target[0] | target[1] | target[2] | target[3] | target[4] | target[5]))) {
+        fprintf(stderr, "enroller: --metric needs --metric-to\n");
+        close(fd);
+        promiscuous(name, was_promiscuous, NULL);
+        return 64;
+    }
     for (;;) {
         struct pollfd watch = { .fd = fd, .events = POLLIN };
         long elapsed;
         ssize_t bytes;
+        if (metric_count && clock_gettime(CLOCK_MONOTONIC, &now) == 0 &&
+            (long)(now.tv_sec - start.tv_sec) >= (long)metric_next) {
+            uint8_t query[128];
+            unsigned int used = metric_frame(query, target, controller, mid++, &bssids[0][0], metric_count);
+            status = send_frame(fd, index, query, used, target);
+            metric_next = (unsigned int)((now.tv_sec - start.tv_sec) + 5);
+            printf("enroller metric tx mid=0x%04x bssids=%u bytes=%u status=%d\n", mid - 1, metric_count, used,
+                   status);
+            fflush(NULL);
+        }
         if (poll(&watch, 1, 500) > 0 && (watch.revents & POLLIN)) {
             bytes = recv(fd, buffer, sizeof(buffer), 0);
             if (bytes > FRAME_BYTES + 4 && buffer[12] == 0x89 && buffer[13] == 0x3a) {
@@ -304,6 +402,8 @@ int main(int argc, char **argv)
                     list_tlvs(buffer, (unsigned int)bytes);
                     fflush(NULL);
                 }
+                if (cmdu == 0x800c)
+                    report_metrics(buffer, (unsigned int)bytes);
                 if (cmdu == 0x0007) {
                     /* The agent is asking to be enrolled. Answer as its controller: the agent's M1 then goes to
                      * this frame's source address, which is why --al-mac exists. */

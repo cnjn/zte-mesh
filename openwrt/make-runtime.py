@@ -11,7 +11,7 @@ import sys
 import tarfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "dev"))
 from prepare import verify_existing  # noqa: E402
 from vendor_elf import ELF, audit  # noqa: E402
 

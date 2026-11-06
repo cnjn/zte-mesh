@@ -13,6 +13,7 @@ NSRUN=${ZTE_MESH_NSRUN:-/usr/libexec/zte-mesh/ns-run}
 ATTACH=${ZTE_MESH_ATTACH:-/usr/libexec/zte-mesh/attach}
 WLAN_SYNC=${ZTE_MESH_WLAN_SYNC:-/usr/libexec/zte-mesh/wlan-sync}
 MESH_SEARCH=${ZTE_MESH_MESH_SEARCH:-/usr/libexec/zte-mesh/mesh-search}
+STA_COLLECT=${ZTE_MESH_STA_COLLECT:-/usr/libexec/zte-mesh/sta-collect}
 RUNDIR=${ZTE_MESH_RUNDIR:-/run/zte-mesh}
 
 log() { logger -t zte-mesh -p daemon.warn "$*"; }
@@ -23,8 +24,8 @@ service_triggers() {
 
 # The controller's VersionMode bit mask, fixed at the SR1010 factory value 128: ZTE vendor TLVs on (bit1 clear),
 # bit7 adds the Wi-Fi 7 MLD TLVs (0xdd, 0xe0) and nothing else (replay runs 15/16). A child applies an M2 in the
-# controller's mode. The factory UI has no setting for it; its one mesh switch is the self-organizing network
-# (mesh_v2). The old UCI option 'mode' is ignored.
+# controller's mode. The factory UI has no setting for it; its one mesh switch is MESH compatibility
+# (mesh_compatible, which the service file writes inverted as mesh.v2). The old UCI options 'mode' and 'mesh_v2' are ignored.
 VERSION_MODE=128
 
 # ---- UCI input checks -------------------------------------------------------------------------
@@ -99,6 +100,9 @@ band_name() { [ "$1" = 0 ] && echo 24g || echo 5g; }
 
 # Optional per-band options of the main section. $1 = radio (0/1), $2 = 1 when the bands are synchronised: the 5 GHz
 # radio then takes the hidden flag, security and MAC filter policy of the 2.4 GHz band, as it takes its name and key.
+# $3 / $4 are what this router is already broadcasting on this band (a child's seed, see borrow_profile): the
+# declared hidden flag and security of a band the applier is about to compare against the air are not used at all --
+# reading them here would put a name nobody chose in front of the network that is already up.
 # Returns non-zero (after logging) on a bad value.
 emit_band_options() {
 	local radio="$1" b s v code
@@ -108,17 +112,27 @@ emit_band_options() {
 	# Read back by write_config for the local Wi-Fi plan (write_local_plan): the plan has to spell out the hidden flag
 	# and the security of each band, and this is the one place that knows how the two bands relate to each other.
 	BAND_HIDDEN="" BAND_BEACON=""
-	config_get v main "wifi_${s}_hidden" ""
-	if [ -n "$v" ]; then
-		v=$(bool01 "$v") || { bad "wifi_${s}_hidden must be 0 or 1"; return 1; }
-		BAND_HIDDEN=$v
-		emit "radio$radio.hidden" "$v"
+	if [ -n "${3:-}" ]; then
+		BAND_HIDDEN=$3
+		emit "radio$radio.hidden" "$3"
+	else
+		config_get v main "wifi_${s}_hidden" ""
+		if [ -n "$v" ]; then
+			v=$(bool01 "$v") || { bad "wifi_${s}_hidden must be 0 or 1"; return 1; }
+			BAND_HIDDEN=$v
+			emit "radio$radio.hidden" "$v"
+		fi
 	fi
-	config_get v main "wifi_${s}_security" ""
-	if [ -n "$v" ]; then
-		code=$(security_code "$v") || { bad "wifi_${s}_security must be none, psk2, psk-mixed, sae or sae-mixed"; return 1; }
-		BAND_BEACON=$code
-		emit "radio$radio.beacon_type" "$code"
+	if [ -n "${4:-}" ]; then
+		BAND_BEACON=$4
+		emit "radio$radio.beacon_type" "$4"
+	else
+		config_get v main "wifi_${s}_security" ""
+		if [ -n "$v" ]; then
+			code=$(security_code "$v") || { bad "wifi_${s}_security must be none, psk2, psk-mixed, sae or sae-mixed"; return 1; }
+			BAND_BEACON=$code
+			emit "radio$radio.beacon_type" "$code"
+		fi
 	fi
 	config_get v main "wifi_${b}_beacon_interval" ""
 	if [ -n "$v" ]; then
@@ -145,7 +159,7 @@ emit_band_options() {
 # config_foreach callback for 'config zte_mesh_bss': one extra SSID slot of a band
 BSS_SEEN=""
 bss_section() {
-	local sec="$1" band slot en ssid key hid sec_name acl radio code
+	local sec="$1" band slot en ssid key hid hide_val sec_name acl radio code
 	config_get band "$sec" band ""
 	case "$band" in 24g) radio=0 ;; 5g) radio=1 ;; *) bad "zte_mesh_bss '$sec': band must be 24g or 5g"; BSS_FAIL=1; return 1 ;; esac
 	config_get slot "$sec" slot ""
@@ -165,6 +179,7 @@ bss_section() {
 	config_get hid "$sec" hidden ""
 	if [ -n "$hid" ]; then
 		hid=$(bool01 "$hid") || { bad "zte_mesh_bss '$sec': hidden must be 0 or 1"; BSS_FAIL=1; return 1; }
+		hide_val=$hid
 		emit "radio$radio.bss$slot.hidden" "$hid"
 	fi
 	config_get sec_name "$sec" security ""
@@ -188,6 +203,23 @@ bss_section() {
 		hid=$(bool01 "$hid") || { bad "zte_mesh_bss '$sec': force_wifi5 must be 0 or 1"; BSS_FAIL=1; return 1; }
 		emit "radio$radio.bss$slot.force_wifi5" "$hid"
 	fi
+	# The plan rows of this slot, for a controller that also broadcasts. Written last: a section
+	# that failed a check above never reaches the plan. Slot 3 is the factory's hidden backhaul BSS and carries
+	# MapAccessAttr bit 6 like it does on a child; wlan-sync applies it through the backhaul mode, not as a slot.
+	if [ -n "$PLAN_EXTRA" ]; then
+		{
+			printf '%s.radio=%s\n' "$PLAN_EXTRA_ROWS" "$radio"
+			printf '%s.slot=%s\n' "$PLAN_EXTRA_ROWS" "$slot"
+			printf '%s.ssid=%s\n' "$PLAN_EXTRA_ROWS" "$ssid"
+			printf '%s.key=%s\n' "$PLAN_EXTRA_ROWS" "$key"
+			printf '%s.enabled=%s\n' "$PLAN_EXTRA_ROWS" "$en"
+			printf '%s.access=%s\n' "$PLAN_EXTRA_ROWS" "$([ "$slot" = 3 ] && echo 64 || echo 32)"
+			if [ -n "$hide_val" ]; then printf '%s.hidden=%s\n' "$PLAN_EXTRA_ROWS" "$hide_val"; fi
+			if [ -n "$code" ]; then printf '%s.beacon_type=%s\n' "$PLAN_EXTRA_ROWS" "$code"; fi
+		} >> "$PLAN_EXTRA" || { bad "zte_mesh_bss '$sec': cannot write the local plan"; BSS_FAIL=1; return 1; }
+		PLAN_EXTRA_ROWS=$((PLAN_EXTRA_ROWS + 1))
+	fi
+	return 0
 }
 
 # config_foreach callback for 'config zte_mesh_acl': one MAC filter rule (at most 16, numbered in file order)
@@ -226,6 +258,33 @@ acl_section() {
 		fi
 		emit "acl.$n.bss" "$bss"
 	fi
+}
+
+# config_foreach callback for 'config zte_mesh_client': one client action (at most 8, the size of the service's table).
+# A ban is a standing rule (the service repeats it every two minutes, so a child that rebooted does not forget it);
+# a kick is one nudge, retried a few times, and gives up. The whole section is live: the service re-reads this file
+# every second and its state machine keeps what it already did, so adding or removing a rule needs no restart.
+CLIENT_COUNT=0
+CLIENT_MACS=""
+client_section() {
+	local sec="$1" mac action n
+	CLIENT_COUNT=$((CLIENT_COUNT + 1))
+	n=$CLIENT_COUNT
+	[ "$n" -le 8 ] || { bad "more than 8 zte_mesh_client rules"; CLIENT_FAIL=1; return 1; }
+	config_get mac "$sec" mac ""
+	mac_ok "$mac" || { bad "zte_mesh_client '$sec': mac must be a unicast aa:bb:cc:dd:ee:ff address"; CLIENT_FAIL=1; return 1; }
+	mac=$(printf '%s' "$mac" | tr 'A-F' 'a-f')
+	# The service keeps one row per MAC, so two rules for the same device would silently fight over it.
+	case " $CLIENT_MACS " in
+	*" $mac "*) bad "zte_mesh_client '$sec': $mac is listed twice"; CLIENT_FAIL=1; return 1 ;;
+	esac
+	CLIENT_MACS="$CLIENT_MACS $mac"
+	config_get action "$sec" action ban
+	case "$action" in
+	ban) emit "ban.mac" "$mac" ;;
+	kick) emit "kick.mac" "$mac" ;;
+	*) bad "zte_mesh_client '$sec': action must be ban or kick"; CLIENT_FAIL=1; return 1 ;;
+	esac
 }
 
 # tz_offset_minutes: the router's UTC offset in minutes east (the sandbox has no time zone; the service needs it for the schedule)
@@ -274,63 +333,183 @@ timer_section() {
 	emit "timer.$n.scope" "$scope"
 }
 
-# borrow_profile -> 0 when this router has a wireless network to borrow a name and key from
+# ---- what this router is already broadcasting -------------------------------------------------------
 #
-# A child does not need a Wi-Fi profile of its own: the controller sends one in the M2 and wlan-sync writes it into
-# /etc/config/wireless. Until that happens the child keeps broadcasting whatever it already broadcasts, so the profile
-# it starts with is that network and not something the user has to make up. Sets BORROWED_SSID / BORROWED_KEY.
-BORROWED_SSID=""
-BORROWED_KEY=""
-borrow_profile() {
-	local section ssid key
-	BORROWED_SSID="" BORROWED_KEY=""
-	command -v uci >/dev/null 2>&1 || return 1
-	for section in $(uci -q show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.=]*\)=wifi-iface$/\1/p"); do
-		ssid=$(uci -q get "wireless.$section.ssid" 2>/dev/null)
-		key=$(uci -q get "wireless.$section.key" 2>/dev/null)
-		[ -n "$ssid" ] && [ -n "$key" ] || continue
-		BORROWED_SSID=$ssid BORROWED_KEY=$key
-		return 0
-	done
+# A child does not own its air: the controller sends the profile in the M2 and wlan-sync writes it into
+# /etc/config/wireless. So the profile a child starts from has to be the network it is broadcasting right now --
+# anything else is a difference, and a difference is a commit plus `wifi reload`, which drops every client.
+#
+# switched_off SECTION -> 0 when that wifi-device or wifi-iface is switched off. A missing `disabled` means on,
+# which is also what netifd writes today; the truth table is wlan-sync's `uci_true`, kept identical on purpose.
+switched_off() {
+	case "$(uci -q get "wireless.$1.disabled" 2>/dev/null)" in
+	1|[Tt][Rr][Uu][Ee]|on|yes) return 0 ;;
+	esac
 	return 1
 }
 
-# ---- the three device roles -------------------------------------------------------------------
+# live_ap_iface BAND -> the wifi-iface broadcasting on that band, non-zero when there is no way to tell
 #
-#   master  controller only. Hands the profile to the child routers and leaves this router's own radios alone,
-#           which is the shape most OpenWrt boxes have when they are used as the head of a mesh -- a wired
-#           router, a VM, a box whose Wi-Fi is somebody else's problem. This is the default.
-#   main    controller that also broadcasts: master plus the child's half. The profile is handed out AND applied
-#           to this router's own radios, so the controller and its children put the same network on the air.
-#   slave   child only: nothing is handed out, the controller's M2 decides what goes on the air here.
+# This is the same decision wlan-sync makes when it picks the section to write (its `radio_section_of` +
+# `ap_iface_of`), and it has to be the same one: seeding from one section while the applier compares and writes
+# another is the two-flip restart again, just with the names swapped. Both sides are pinned by the ax3600-shaped
+# cases in tests/test_init.sh and the child-plan cases in tests/test_wlan_sync.sh.
 #
-# "auto" is the old name of the main router role (the factory page calls the pair "main router / adaptive"). It is
-# still accepted on input and means exactly the same thing, so a configuration written before this change keeps
-# working. The daemon is told "auto" for both, which is the factory's adaptive triple that settles at master.
-role_applies_here() {
-	case "${1:-}" in main|auto) return 0 ;; esac
+# In order: an explicit pin wins (`zte_mesh.main.wifi_2g` / `wifi_5g`) when it names a device of that band; a band
+# with one device needs no guess; with several, the only one that is not switched off. A switched-off device stays a
+# candidate because the applier counts it too, and a band that cannot be resolved is simply not borrowed.
+live_ap_iface() {
+	local want="$1" pin band hwmode section device mode candidates="" live="" found=""
+	command -v uci >/dev/null 2>&1 || return 1
+	config_get pin main "wifi_$want" ""
+	for section in $(uci -q show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.=]*\)=wifi-device$/\1/p"); do
+		band=$(uci -q get "wireless.$section.band" 2>/dev/null)
+		hwmode=$(uci -q get "wireless.$section.hwmode" 2>/dev/null)
+		case "$band:$hwmode" in
+		2g:*|*:11g) [ "$want" = 2g ] || continue ;;
+		5g:*|*:11a) [ "$want" = 5g ] || continue ;;
+		*) continue ;;
+		esac
+		candidates="$candidates $section"
+		switched_off "$section" || live="$live $section"
+	done
+	[ -n "$candidates" ] || return 1
+	device=""
+	if [ -n "$pin" ]; then
+		case " $candidates " in *" $pin "*) device=$pin ;; esac
+	fi
+	if [ -z "$device" ]; then
+		set -- $candidates
+		[ $# -eq 1 ] && device=$1
+	fi
+	if [ -z "$device" ]; then
+		set -- $live
+		[ $# -eq 1 ] && device=$1
+	fi
+	[ -n "$device" ] || return 1
+	# A device that is switched off broadcasts nothing, whatever its interfaces say, so there is no network here to
+	# borrow. Declining is also what keeps the seed honest: the applier would switch that radio on the moment the plan
+	# claims the band is up, and a `wifi reload` takes every other band down with it.
+	switched_off "$device" && return 1
+	for section in $(uci -q show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.=]*\)=wifi-iface$/\1/p"); do
+		case "$section" in zte_backhaul_*) continue ;; esac
+		[ "$(uci -q get "wireless.$section.device" 2>/dev/null)" = "$device" ] || continue
+		mode=$(uci -q get "wireless.$section.mode" 2>/dev/null)
+		[ -z "$mode" ] || [ "$mode" = ap ] || continue
+		[ "$(uci -q get "wireless.$section.multi_ap" 2>/dev/null)" = 2 ] && continue
+		case "$section" in
+		default_*|*_default*) echo "$section"; return 0 ;;
+		esac
+		[ -n "$found" ] || found=$section
+	done
+	[ -n "$found" ] && { echo "$found"; return 0; }
 	return 1
+}
+
+# borrow_profile BAND -> 0 with BORROWED_* filled from the network broadcasting on that band
+#
+# Everything wlan-sync compares for the main BSS comes back from here, because one missing field is still a
+# difference: name, key, the security the service file spells as BeaconType, the hidden flag (only when the
+# interface carries one -- seeding a flag the air does not have makes the applier write it) and whether the band
+# is on. A band whose interface cannot be read cleanly is not borrowed: the declared profile stays in front of it,
+# which is what a router with no wireless at all needs.
+BORROWED_SSID=""
+BORROWED_KEY=""
+BORROWED_BEACON=""
+BORROWED_HIDDEN=""
+BORROWED_ENABLED=""
+borrow_profile() {
+	local iface ssid key enc hidden
+	BORROWED_SSID="" BORROWED_KEY="" BORROWED_BEACON="" BORROWED_HIDDEN="" BORROWED_ENABLED=""
+	iface=$(live_ap_iface "$1") || return 1
+	ssid=$(uci -q get "wireless.$iface.ssid" 2>/dev/null)
+	key=$(uci -q get "wireless.$iface.key" 2>/dev/null)
+	# the key has two spellings in /etc/config/wireless -- `key` beside the psk options, `password` beside sae --
+	# and wlan-sync writes both, so read whichever the image uses
+	[ -n "$key" ] || key=$(uci -q get "wireless.$iface.password" 2>/dev/null)
+	enc=$(uci -q get "wireless.$iface.encryption" 2>/dev/null)
+	BORROWED_BEACON=$(security_code "${enc:-none}") || return 1
+	[ "${#ssid}" -ge 1 ] && [ "${#ssid}" -le 31 ] && plain "$ssid" || return 1
+	[ "${#key}" -ge 8 ] && [ "${#key}" -le 63 ] && plain "$key" || return 1
+	BORROWED_SSID=$ssid BORROWED_KEY=$key
+	hidden=$(uci -q get "wireless.$iface.hidden" 2>/dev/null)
+	[ -n "$hidden" ] && hidden=$(bool01 "$hidden") || hidden=""
+	BORROWED_HIDDEN=$hidden
+	switched_off "$iface" && BORROWED_ENABLED=0 || BORROWED_ENABLED=1
+	return 0
+}
+
+# ---- the two things a role is made of -------------------------------------------------------------------
+#
+# The daemon only ever hears one of two words, so the service file and the ZTE children see a clean line:
+#
+#   mesh_role = master  this router runs the controller: it answers Search, hands the Wi-Fi profile out and
+#                       decides about the children. This is the default.
+#   mesh_role = slave   this router is a mesh child: it hands nothing out and takes its profile from the controller.
+#
+# Where that left an ambiguity the old three-role page could not express, so the second decision is its own option
+# rather than a third name for the first one:
+#
+#   apply_local = 1     a controller also puts the profile it hands out on this router's own radios -- the box that
+#                       is the head of the mesh and broadcasts the network at the same time.
+#   apply_local = 0     a controller leaves its own radios alone: a wired router, a VM, a box whose Wi-Fi is
+#                       somebody else's problem.
+#
+# "main" and "auto" are the old names of the broadcasting controller (the factory page calls the pair "main router /
+# adaptive"). Both are still accepted on input and mean master with apply_local=1, so a configuration written before
+# this split keeps working. What changed is what the daemon is told: master, never "auto". "auto" is the factory's
+# adaptive triple -- SetRoleEnable=1 plus Mode 0, an election that settles at master once other nodes answer. With no
+# cspd in the sandbox there is nobody to answer, so the controller spent three seconds pretending to be undecided
+# before our own code forced Mode 2 on it; a real ZTE child watching that flap could win the election and invert the
+# topology. A definite master writes SetRoleEnable=0 and Mode 2 from the first frame.
+role_is_master() {
+	case "${1:-master}" in slave) return 1 ;; esac
+	return 0
+}
+
+# apply_local_value ROLE VALUE -> 0 or 1, with the old spellings folded in.
+# A child ignores the flag whatever it says: its radios are configured by the controller's M2, which is not ours.
+apply_local_value() {
+	local v=${2:-}
+	if [ -z "$v" ]; then
+		case "$1" in main|auto) v=1 ;; *) v=0 ;; esac
+	fi
+	bool01 "$v"
+}
+
+# apply_here ROLE APPLY_LOCAL -> this router is a controller AND publishes the profile to its own radios.
+apply_here() {
+	role_is_master "$1" && [ "${2:-0}" = 1 ]
+}
+
+# sync_runs ROLE APPLY_LOCAL -> a wlan-sync instance runs here, because some plan reaches this router's radios: either
+# the controller's (a child) or the one written above (a broadcasting master). The controller-only role is the one
+# shape with no applier, and so the one shape where `backhaul` cannot do anything.
+sync_runs() {
+	! role_is_master "$1" || apply_here "$1" "$2"
 }
 
 # write_local_plan SSID KEY ENABLED HIDDEN BEACON SSID KEY ENABLED HIDDEN BEACON -> the plan wlan-sync applies to
-# THIS router (main router role).
+# THIS router (master with apply_local=1).
 #
 # A child gets this through the M2 the controller sends: the daemon writes the profile into WLANCfg/WLANPSK and
-# agent-sync.c publishes those rows as the plan. The main router has no M2 to wait for -- it is the one that sends
-# it -- so the plan is written here, from the values write_config has just validated. One producer per role: the
-# service publishes the plan on a child, this function publishes it on the main router, and neither ever writes the
-# other's file.
+# agent-sync.c publishes those rows as the plan. A broadcasting controller has no M2 to wait for -- it is the one
+# that sends it -- so the plan is written here, from the values write_config has just validated. One producer per
+# role: the service publishes the plan on a child, this function publishes it on a broadcasting controller, and
+# neither ever writes the other's file.
 #
 # Same format as agent-sync.c (read by openwrt/zte-mesh/files/wlan-sync): rows=<n>, then <row>.<option>=<value>, one
-# option per line, the value being everything after the first '='. Only the main BSS of each band (slot 0) is
-# written and every row is marked fronthaul (MapAccessAttr bit 5 = 32): a main router broadcasts the network it
-# hands out. The hidden backhaul BSS of the factory profile is not part of it.
+# option per line, the value being everything after the first '='. The main BSS of each band (slot 0) is always
+# written and every main row is marked fronthaul (MapAccessAttr bit 5 = 32): a broadcasting controller puts the
+# network it hands out on the air itself. With extra_slots=1 the configured extra slots of 'config zte_mesh_bss' are
+# appended as their own rows,
+# which bss_section put in $PLAN_EXTRA while the configuration was validated -- the same rows a child gets from its
+# M2, so wlan-sync applies them the same way on either role. Slot 3 is the factory's hidden backhaul BSS and is
+# marked as such (bit 6 = 64); with backhaul=off it is reported and skipped, exactly like on a child.
 write_local_plan() {
-	local tmp="$RUNDIR/.wlan-plan.$$" radio=0
-	( umask 077; : > "$tmp" ) || return 1
+	local tmp="$RUNDIR/.wlan-plan.$$" body="$RUNDIR/.wlan-plan.body.$$" radio=0 rows=0
+	( umask 077; : > "$body" ) || return 1
 	{
-		printf '# zte-mesh local Wi-Fi plan (main router). Generated by the service; applied by wlan-sync.\n'
-		printf 'rows=2\n'
 		while [ "$radio" -le 1 ]; do
 			printf '%s.radio=%s\n' "$radio" "$radio"
 			printf '%s.slot=0\n' "$radio"
@@ -343,16 +522,33 @@ write_local_plan() {
 			radio=$((radio + 1))
 			shift 5
 		done
-	} >> "$tmp" || { rm -f "$tmp"; return 1; }
+		# The slot rows were numbered from 0 by bss_section, which does not know how many main rows precede them:
+		# renumber them to follow those. Only the index in front of the first dot is touched, so a name or a key
+		# that contains dots survives untouched.
+		if [ -n "$PLAN_EXTRA" ] && [ -s "$PLAN_EXTRA" ]; then
+			awk -v base="$radio" '{ idx = $0; sub(/\..*/, "", idx); rest = $0; sub(/^[0-9]+\./, "", rest);
+				printf "%d.%s\n", idx + base, rest }' "$PLAN_EXTRA"
+		fi
+	} >> "$body" || { rm -f "$body"; return 1; }
+	rows=$(grep -c '^[0-9][0-9]*\.radio=' "$body" 2>/dev/null) || rows=0
+	{
+		printf '# zte-mesh local Wi-Fi plan (this router broadcasts). Generated by the service; applied by wlan-sync.\n'
+		printf 'rows=%s\n' "$rows"
+		cat "$body"
+	} > "$tmp" || { rm -f "$body" "$tmp"; return 1; }
+	rm -f "$body"
 	mv "$tmp" "$RUNDIR/wlan-plan" || { rm -f "$tmp"; return 1; }
 	return 0
 }
 
 # Writes $RUNDIR/config atomically (0600). Returns non-zero when incomplete or invalid.
 write_config() {
-	local e0 s0 k0 e1 s1 k1 sync suffix v radio key a b role h0 b0 h1 b1 s1_air k1_air
+	local e0 s0 k0 e1 s1 k1 sync suffix v radio key a b role apply_local backhaul pin2g pin5g h0 b0 h1 b1 s1_air k1_air
+	local sh0 sb0 sh1 sb1 seed2g="" seed5g="" sync_forced="" declared0="" bands=""
 	config_load zte_mesh
 	config_get role main mesh_role ""
+	config_get apply_local main apply_local ""
+	apply_local=$(apply_local_value "$role" "$apply_local") || { bad "apply_local must be 0 or 1"; return 1; }
 	config_get e0 main wifi_24g_enabled 1
 	config_get s0 main wifi_24g_ssid ""
 	config_get k0 main wifi_24g_key ""
@@ -365,14 +561,41 @@ write_config() {
 	e0=$(bool01 "$e0") && e1=$(bool01 "$e1") || { bad "wifi_24g_enabled / wifi_5g_enabled must be 0 or 1"; return 1; }
 	sync=$(bool01 "$sync") || { bad "wifi_dual_band_sync must be 0 or 1"; return 1; }
 
-	# A child takes its profile from the controller (M2 -> WLANCfg/WLANPSK -> wlan-sync). Requiring the user to type a
-	# name and key that are about to be overwritten is what made "child router" a form to fill in instead of one option,
-	# so a child with nothing configured borrows the network this router already broadcasts.
-	if [ "$role" = slave ] && { [ -z "$s0" ] || [ -z "$k0" ]; }; then
-		if borrow_profile; then
-			[ -n "$s0" ] || s0=$BORROWED_SSID
-			[ -n "$k0" ] || k0=$BORROWED_KEY
-			log "child role: no Wi-Fi profile configured, starting from the network this router broadcasts until the controller sends one"
+	# A child takes its profile from the controller (M2 -> WLANCfg/WLANPSK -> wlan-sync), so the name and key typed on
+	# this page describe a network this router is not going to keep. What they still decide is what goes on the air
+	# until that M2 lands, because they are the seed the daemon starts from -- and a seed that differs from the
+	# network already broadcasting is a write, a commit and a `wifi reload`. Every restart of a child therefore
+	# renamed the network twice: once to this seed and once again when the controller's profile arrived. The seed is
+	# read back from the air instead, band by band, so the applier finds nothing to change and the clients stay up.
+	if [ "$role" = slave ]; then
+		declared0=$s0
+		if borrow_profile 2g; then
+			s0=$BORROWED_SSID k0=$BORROWED_KEY e0=$BORROWED_ENABLED
+			sh0=$BORROWED_HIDDEN sb0=$BORROWED_BEACON
+			seed2g=1 bands="$bands 2g"
+		fi
+		if borrow_profile 5g; then
+			e1=$BORROWED_ENABLED sh1=$BORROWED_HIDDEN sb1=$BORROWED_BEACON
+			seed5g=1 bands="$bands 5g"
+			# The two bands are only "synchronised" if the air says so in every field the applier compares. Otherwise
+			# the 5 GHz pair has to be spelled out, and said so to the daemon: leaving wifi_dual_band_sync at 1 would
+			# derive the 2.4 GHz name and security onto a radio broadcasting a different network.
+			if [ "$seed2g" = 1 ] && [ "$BORROWED_SSID" = "$s0" ] && [ "$BORROWED_KEY" = "$k0" ] &&
+				[ "$BORROWED_HIDDEN" = "$sh0" ] && [ "$BORROWED_BEACON" = "$sb0" ]; then
+				sync=1
+			else
+				sync=0 s1=$BORROWED_SSID k1=$BORROWED_KEY
+			fi
+			sync_forced=1
+		elif [ "$seed2g" = 1 ] && [ "$sync" = 1 ]; then
+			# only the 2.4 GHz band could be read: the synchronised 5 GHz row takes that seed too, because with
+			# wifi_dual_band_sync on it is the 2.4 GHz profile the daemon derives for it
+			sh1=$sh0 sb1=$sb0
+		fi
+		if [ -n "$seed2g$seed5g" ]; then
+			log "child role: starting from the network this router broadcasts (${bands# }) until the controller sends one"
+			[ -z "$declared0" ] || [ "$declared0" = "$s0" ] ||
+				log "child role: wifi_24g_ssid is not the seed on this router: the network it is broadcasting takes its place, and the controller's profile replaces both"
 		fi
 	fi
 
@@ -407,19 +630,20 @@ write_config() {
 	CFG_TMP="$RUNDIR/.config.$$"
 	( umask 077; : > "$CFG_TMP" ) || return 1
 	BSS_SEEN="" BSS_FAIL="" ACL_COUNT=0 ACL_FAIL="" TIMER_COUNT=0 TIMER_FAIL=""
+	CLIENT_COUNT=0 CLIENT_MACS="" CLIENT_FAIL=""
 
 	emit version_mode "$VERSION_MODE"
 	emit radio0.enabled "$e0"
 	emit radio0.ssid "$s0"
 	emit radio0.key "$k0"
-	emit_band_options 0 || { rm -f "$CFG_TMP"; return 1; }
+	emit_band_options 0 "" "$sh0" "$sb0" || { rm -f "$CFG_TMP"; return 1; }
 	h0=$BAND_HIDDEN b0=$BAND_BEACON
 	emit radio1.enabled "$e1"
 	if [ "$sync" = 0 ]; then
 		[ -n "$s1" ] && emit radio1.ssid "$s1"
 		[ -n "$k1" ] && emit radio1.key "$k1"
 	fi
-	emit_band_options 1 "$sync" || { rm -f "$CFG_TMP"; return 1; }
+	emit_band_options 1 "$sync" "$sh1" "$sb1" || { rm -f "$CFG_TMP"; return 1; }
 	h1=$BAND_HIDDEN b1=$BAND_BEACON
 
 	# The 5 GHz pair as it ends up on the air. The daemon derives it from wifi.dual_band_sync / wifi.essid_suffix
@@ -433,21 +657,26 @@ write_config() {
 
 	# Network-level and policy options: written only when set, so an untouched router keeps the fixed defaults.
 	config_get v main wifi_dual_band_sync ""
-	[ -n "$v" ] && emit wifi.dual_band_sync "$sync"
+	# `sync_forced`: a child whose seed came from its own radios has to say which bands are synchronised even when the
+	# page never set it. The daemon derives the 5 GHz name and security from this line, and a missing one is a guess
+	# about the factory default -- the guess that would rename the band the air disagrees with.
+	if [ -n "$v" ] || [ -n "$sync_forced" ]; then emit wifi.dual_band_sync "$sync"; fi
 	[ -n "$suffix" ] && emit wifi.essid_suffix "$suffix"
-	config_get v main mesh_v2 ""
+	config_get v main mesh_compatible ""
 	if [ -n "$v" ]; then
-		v=$(bool01 "$v") || { bad "mesh_v2 must be 0 or 1"; rm -f "$CFG_TMP"; return 1; }
-		emit mesh.v2 "$v"
+		v=$(bool01 "$v") || { bad "mesh_compatible must be 0 or 1"; rm -f "$CFG_TMP"; return 1; }
+		# The page switch is the factory one (MESH 兼容): on = accept any child router. What the daemon reads is
+		# the opposite question (P1905ComCfg.Enable = strict ZTE admission), so the value flips here and nowhere else.
+		emit mesh.v2 $((1 - v))
 	fi
 	if [ -n "$role" ]; then
 		case "$role" in
-		# The daemon only knows the factory triple: master, auto (the adaptive state) and slave. A main router is
-		# emitted as "auto", which is exactly what that role was before it was renamed, so the daemon side is
-		# unchanged; what is new is that the host side now applies the profile to this router as well.
-		main|auto) emit mesh.role auto ;;
-		master|slave) emit mesh.role "$role" ;;
-		*) bad "mesh_role must be master, main or slave"; rm -f "$CFG_TMP"; return 1 ;;
+		# The daemon is told one of two words. `main`/`auto` were the broadcasting controller and are master now;
+		# the local half of what they meant is this function's other decision (apply_local), which the host acts on
+		# and the daemon never hears about. See the role block above for why "auto" is gone from the service file.
+		master|main|auto) emit mesh.role master ;;
+		slave) emit mesh.role slave ;;
+		*) bad "mesh_role must be master or slave"; rm -f "$CFG_TMP"; return 1 ;;
 		esac
 	fi
 	config_get v main mlo_enable ""
@@ -480,8 +709,34 @@ write_config() {
 
 	# Extra SSID slots (guest, spare, hidden backhaul) and MAC filter rules. Slots of a band must be 1..k without a gap:
 	# the child matches the BSS entries of the M2 message by position.
+	config_get v main extra_slots ""
+	[ -n "$v" ] && { v=$(bool01 "$v") || { bad "extra_slots must be 0 or 1"; rm -f "$CFG_TMP"; return 1; }; }
+	EXTRA_SLOTS=${v:-0}
+	# The backhaul mode has two spellings and wlan-sync reads the option itself, so a third one (`multi-ap`, with the
+	# hyphen the vendor's own docs use) is read as off: the page shows a switch that is set and nothing happens on the
+	# radio. Refusing it here is the only place that can still say why.
+	config_get backhaul main backhaul off
+	[ -n "$backhaul" ] || backhaul=off
+	case "$backhaul" in
+	off|multi_ap) ;;
+	*) bad "backhaul must be off or multi_ap"; rm -f "$CFG_TMP"; return 1 ;;
+	esac
+	# Which radio device carries each band, when the router has more than one of the kind. wlan-sync picks a
+	# candidate and says so in the log when it cannot tell, and that answer is not in the plan either.
+	config_get pin2g main wifi_2g ""
+	config_get pin5g main wifi_5g ""
+	# On a controller that broadcasts, the extra slots are this router's own radios, so they also have to reach the
+	# local plan: bss_section appends their rows to $PLAN_EXTRA and write_local_plan folds them in. On a child the
+	# plan comes from the M2, and wlan-sync reads this same UCI option itself -- nothing is written here.
+	PLAN_EXTRA="" PLAN_EXTRA_ROWS=0
+	if [ "$EXTRA_SLOTS" = 1 ]; then
+		if apply_here "$role" "$apply_local"; then
+			PLAN_EXTRA="$RUNDIR/.bss-plan.$$"
+			( umask 077; : > "$PLAN_EXTRA" ) || { PLAN_EXTRA=""; bad "cannot write $PLAN_EXTRA"; rm -f "$CFG_TMP"; return 1; }
+		fi
+	fi
 	config_foreach bss_section zte_mesh_bss
-	[ -z "$BSS_FAIL" ] || { rm -f "$CFG_TMP"; return 1; }
+	[ -z "$BSS_FAIL" ] || { rm -f "$CFG_TMP" "$PLAN_EXTRA"; return 1; }
 	for radio in 0 1; do
 		case " $BSS_SEEN " in
 		*" $radio.3 "*) case " $BSS_SEEN " in *" $radio.2 "*) ;; *) bad "$(band_name $radio) slot 3 needs slot 2 (slots must be 1..k)"; rm -f "$CFG_TMP"; return 1 ;; esac ;;
@@ -491,51 +746,119 @@ write_config() {
 		esac
 	done
 	config_foreach acl_section zte_mesh_acl
-	[ -z "$ACL_FAIL" ] || { rm -f "$CFG_TMP"; return 1; }
+	[ -z "$ACL_FAIL" ] || { rm -f "$CFG_TMP" "$PLAN_EXTRA"; return 1; }
 	config_foreach timer_section zte_mesh_timer
-	[ -z "$TIMER_FAIL" ] || { rm -f "$CFG_TMP"; return 1; }
+	[ -z "$TIMER_FAIL" ] || { rm -f "$CFG_TMP" "$PLAN_EXTRA"; return 1; }
 	[ "$TIMER_COUNT" = 0 ] || emit timer.utc_offset "$(tz_offset_minutes)"
+
+	# One lifetime for every ban: the format has no room for a per-rule time, and the user edits one number.
+	config_get v main ban_minutes ""
+	if [ -n "$v" ]; then
+		is_int "$v" 0 1440 || { bad "ban_minutes must be 0..1440 minutes (0 = until removed)"; rm -f "$CFG_TMP" "$PLAN_EXTRA"; return 1; }
+		emit ban.minutes "$(printf '%d' "$v")"
+	fi
+	config_foreach client_section zte_mesh_client
+	[ -z "$CLIENT_FAIL" ] || { rm -f "$CFG_TMP" "$PLAN_EXTRA"; return 1; }
 
 	mv "$CFG_TMP" "$RUNDIR/config" || { rm -f "$CFG_TMP"; return 1; }
 	echo "$VERSION_MODE" > "$RUNDIR/version_mode.host"
 
-	# The plan wlan-sync applies lives next to the service configuration, and only one role publishes it. On a main
-	# router that is this function: the profile just validated is also what this router broadcasts. On a child it is
-	# the service (agent-sync.c, from the rows the M2 wrote) -- writing it here as well would fight it, so a child's
-	# plan is left exactly as it is. A controller-only router removes it: its own radios are not ours to configure.
-	case "$role" in
-	main|auto) write_local_plan "$s0" "$k0" "$e0" "$h0" "$b0" "$s1_air" "$k1_air" "$e1" "$h1" "$b1" ||
-		log "could not write $RUNDIR/wlan-plan; this router's own radios keep their configuration" ;;
-	slave) ;;
-	*) rm -f "$RUNDIR/wlan-plan" ;;
-	esac
+	# The plan wlan-sync applies lives next to the service configuration, and only one role publishes it. On a
+	# controller that broadcasts that is this function: the profile just validated is also what this router
+	# broadcasts. On a child it is the service (agent-sync.c, from the rows the M2 wrote) -- writing it here as well
+	# would fight it, so a child's plan is left exactly as it is. A controller-only router removes it: its own radios
+	# are not ours to configure.
+	if apply_here "$role" "$apply_local"; then
+		write_local_plan "$s0" "$k0" "$e0" "$h0" "$b0" "$s1_air" "$k1_air" "$e1" "$h1" "$b1" ||
+			log "could not write $RUNDIR/wlan-plan; this router's own radios keep their configuration"
+	elif role_is_master "$role"; then
+		rm -f "$RUNDIR/wlan-plan"
+	fi
+	[ -n "$PLAN_EXTRA" ] && rm -f "$PLAN_EXTRA"
 
-	# Which optional policy keys exist (names only): a key that appears or disappears needs a restart, a changed value does not
+	# What needs a restart is which instances exist, not what they were told last time. Key names cover the optional
+	# policy sections, but neither role decision changes a key: master->slave starts and stops search, and
+	# apply_local does the same to wlan-sync. Both are hashed as values so the instance set is rebuilt for them.
+	# The applier's own inputs go in as values, for the opposite reason of the two above: they change neither which
+	# instances exist nor the plan, only what wlan-sync writes *from* the plan it is given -- and that watcher reacts
+	# to plan content alone. `backhaul` (which end, if any), `extra_slots` (which slot rows reach the radios; on a child
+	# the plan carries them whatever this switch says) and the two radio pins are exactly that set. Without them a save
+	# sits inert until some later restart: switching the extra SSIDs off on a child leaves it broadcasting the guest
+	# network it was told to drop. Only the two roles that run an applier can act on any of them, so only theirs carry
+	# these tokens; on a controller-only box it would restart the service for values that change nothing there.
 	{ grep -E '^(mesh\.role|wifi\.dual_band_sync|band_steer\.|roam\.|mlo\.enable)' "$RUNDIR/config" | cut -d= -f1 | sort
-	  echo "$VERSION_MODE"; } | tr '\n' ' ' > "$RUNDIR/restart.sig"
+	  echo "$VERSION_MODE"
+	  role_is_master "$role" && echo role=master || echo role=slave
+	  apply_here "$role" "$apply_local" && echo local=on || echo local=off
+	  if sync_runs "$role" "$apply_local"; then
+	  	echo "backhaul=$backhaul extra_slots=$EXTRA_SLOTS pin2g=$pin2g pin5g=$pin5g"
+	  fi; } | tr '\n' ' ' > "$RUNDIR/restart.sig"
+}
+
+# The three refusals that belong before procd ever gets an instance, split out of start_service() so the host
+# test can run them without /sys or procd. Each one is its own line because each is repaired differently --
+# see the comments on the three branches below (tests/test_init.sh reads the log line each branch writes).
+launcher_ready() {
+	local launcher launcher_status
+	# One package carries both halves now -- the runtime tarball and, under arch/<cpu>/, one launcher build
+	# per CPU -- so either of these missing is a box somebody edited by hand, not a half-installed one. The
+	# two lines stay apart because the two repairs are not the same: the first says the data is gone, the
+	# second names the file.
+	[ -d "$ROOT" ] || { log "runtime is not installed (package zte-mesh)"; return 1; }
+	# Asked before "$NSRUN" is ever executed, because ash answers a missing file with 127 -- the same number
+	# the entry script uses for "this CPU is not in the package". Read back on owrt after uninstalling the
+	# launcher package that used to ship separately took both entry names away: the log said the machine had
+	# no build for x86_64, while the truth was a package missing half its files. Nothing about the CPU is
+	# wrong there; reinstall is.
+	[ -x "$NSRUN" ] || { log "$NSRUN is missing from package zte-mesh"; return 1; }
+	# ... and an arch:all package installs everywhere, so nothing at install time refuses a machine whose
+	# CPU the package does not carry. That refusal used to be `DEPENDS:=@(TARGET_zte||TARGET_qualcommax)`;
+	# it is asked here instead, of the entry script the package installs, before any instance exists. The
+	# alternative is procd respawning a 127 every five seconds and a log that never says "architecture".
+	# Only 127 is that answer, so only 127 gets that sentence: the entry script exits 127 when this CPU has
+	# no build in arch/, while any other non-zero is a different problem wearing the same exit. An ELF left
+	# under this name by hand takes --launcher-check as two unknown arguments, prints usage and exits 64 --
+	# and calling that "no build for this machine" sends the reader off to look for an architecture when the
+	# file they should be looking at is the one standing there.
+	launcher_status=0
+	launcher=$("$NSRUN" --launcher-check 2>&1) || launcher_status=$?
+	if [ "$launcher_status" = 127 ]; then
+		log "zte-mesh has no launcher build for $(uname -m): $launcher"
+		return 1
+	fi
+	[ "$launcher_status" = 0 ] || {
+		log "$NSRUN --launcher-check exited $launcher_status: $launcher"
+		return 1
+	}
+	return 0
 }
 
 start_service() {
-	local enabled bridge role
+	local enabled bridge role apply_local backhaul
 	config_load zte_mesh
 	config_get_bool enabled main enabled 0
 	[ "$enabled" = 1 ] || return 0
 	config_get bridge main bridge br-lan
 	[ -d "/sys/class/net/$bridge/bridge" ] || { log "bridge $bridge does not exist"; return 1; }
-	# Two packages, two things that can be missing, and the log should say which: the runtime
-	# tarball comes from zte-mesh (arch:all), the launcher from zte-mesh-launcher (arch-tagged
-	# to the board). A box that installed only the first one has $ROOT but no $NSRUN.
-	[ -d "$ROOT" ] || { log "runtime is not installed (package zte-mesh)"; return 1; }
-	[ -x "$NSRUN" ] || { log "$NSRUN is missing: install zte-mesh-launcher for this board's architecture"; return 1; }
+	launcher_ready || return 1
 	write_config || return 1
 	config_get role main mesh_role ""
+	config_get apply_local main apply_local ""
+	apply_local=$(apply_local_value "$role" "$apply_local")
+	config_get backhaul main backhaul off
 
-	# The one combination worth a line in the log: a router that has radios, is left in the controller-only role, and
-	# therefore hands the profile out without putting it on the air itself. That is easy to mistake for "the plan was
-	# not applied", so say it once at start rather than leaving it to be discovered.
-	if [ "$role" != slave ] && ! role_applies_here "$role" &&
+	# The two combinations worth a line in the log, because both look like "the plan was not applied" from the
+	# outside. First: a router that has radios and is left in the controller-only role, so it hands the profile out
+	# without putting it on the air itself.
+	if role_is_master "$role" && ! apply_here "$role" "$apply_local" &&
 		uci -q show wireless 2>/dev/null | grep -q '=wifi-device$'; then
-		log "controller-only role: the Wi-Fi profile goes to the child routers only, this router's own radios are left alone; mesh_role=main applies it here as well"
+		log "controller-only role: the Wi-Fi profile goes to the child routers only, this router's own radios are left alone; apply_local=1 applies it here as well"
+	fi
+	# Second: `backhaul` builds a radio link on *this* router -- a client to the controller's backhaul BSS when this
+	# is a child, that BSS itself when this is a broadcasting master. A controller-only router runs no applier at
+	# all, so the option sits there doing nothing, usually because the box changed role and left it on.
+	if [ "$backhaul" = multi_ap ] && role_is_master "$role" && ! apply_here "$role" "$apply_local"; then
+		log "zte_mesh.main.backhaul=multi_ap has nothing to do while apply_local is off: this router applies no Wi-Fi profile locally, so it builds neither a backhaul client nor a backhaul BSS. Set apply_local=1 to broadcast here, or mesh_role=slave to join the controller's backhaul"
 	fi
 
 	# Two boxes must never present the same AL MAC. The vendor takes its AL MAC from br0, and a 1905 stack
@@ -544,13 +867,33 @@ start_service() {
 	# and the topology stays at a single entry. The last byte is taken from this router's LAN MAC (unique on
 	# the segment by definition) unless zte_mesh.main.al_last overrides it; the rest is fixed because the
 	# address must stay locally administered for the vendor's route adapter to accept it.
-	al_last=$(cat "/sys/class/net/$bridge/address" 2>/dev/null)
-	al_last=${al_last##*:}
+	#
+	# Only the last byte is open: the first five are the shape a ZTE controller presents, and no endpoint
+	# accepts anything else. The override is the way out of two boxes with the same LAN MAC (an image cloned
+	# onto both, or a MAC clone) where no derivation can help.
+	al_lan=$(cat "/sys/class/net/$bridge/address" 2>/dev/null)
+	al_last=${al_lan##*:}
 	config_get al_last_override main al_last ""
-	[ -n "$al_last_override" ] && al_last=$al_last_override
+	if [ -n "$al_last_override" ]; then
+		al_typed=$al_last_override
+		case "$al_typed" in
+		[0-9a-fA-F][0-9a-fA-F]) al_last=$(echo "$al_typed" | tr 'A-F' 'a-f') ;;
+		*)
+			# Falling back silently would leave the box on one byte while the page shows the one the
+			# user typed: a difference nobody can see is the worst kind to diagnose later.
+			log "zte_mesh.main.al_last=$al_typed is not two hex digits (as in 02:00:00:00:19:e3 -> e3); keeping $al_last, from the LAN MAC of $bridge"
+			;;
+		esac
+	fi
 	case "$al_last" in
 	[0-9a-fA-F][0-9a-fA-F]) ;;
-	*) al_last=06 ;;
+	*)
+		# No usable LAN MAC either: every box in this state ends up on the built-in address, which is
+		# the collision this derivation exists to avoid. Say it once instead of leaving it to a
+		# topology that never fills in.
+		al_last=06
+		log "cannot read the LAN MAC of $bridge: the AL MAC falls back to 02:00:00:00:19:06, which any other box in this state would share"
+		;;
 	esac
 
 	# A previous sandbox's wire can only be left behind by a crash.
@@ -560,9 +903,10 @@ start_service() {
 	# The daemon is a 32-bit ARM binary and the host is usually not. A kernel with CONFIG_COMPAT runs it
 	# natively, so the emulator is only used when the kernel says it cannot: x86-64 never can, and arm64
 	# only when CONFIG_COMPAT is off (the firmware build that turns it on is .github/workflows/
-	# build-firmware.yml). The emulator is opt-in by presence, overridable through zte_mesh.main.emulator
-	# ("none" forces the native path). Nothing is installed or loaded here; when neither works the service
-	# keeps failing the way it always did, with "execv errno=8" in the log.
+	# build-firmware.yml). The emulator is opt-in by presence, overridable through zte_mesh.main.emulator:
+	# "none" forces the native path, a path inside the private root is used where it sits, and a path
+	# outside it is copied in first (see below). No package ships an emulator and nothing is downloaded
+	# here; when neither works the service keeps failing the way it always did, with "execv errno=8".
 	emulator=""
 	config_get emulator main emulator ""
 	if [ "$emulator" = none ]; then
@@ -602,10 +946,39 @@ start_service() {
 			# No package ships one (OpenWrt does not build qemu-user, and it would have to match
 			# this board anyway), so this is a lab-only affordance. Say exactly what is missing
 			# instead of letting the sandbox fail later with a bare "execv errno=8". Leaving it
-			# out of the package is deliberate; docs/DEVELOPMENT.md section 11.2 explains why and lists the
+			# out of the package is deliberate; docs/LAB.md section 4.2 explains why and lists the
 			# three ways out of it.
 			[ -z "$emulator" ] && log "this kernel cannot run the 32-bit ARM daemon and no qemu-arm-static was found in $ROOT: put one there (it must be built for $(uname -m), and it must sit inside the private root because it is exec'd after the chroot), or install a firmware built with CONFIG_COMPAT=y, or set zte_mesh.main.emulator=none to force the native path"
 		fi
+	else
+		# An explicit value names the emulator either inside the private root -- relative, or absolute under
+		# $ROOT -- and it is used where it sits, or on this machine outside it. The second form is the one
+		# worth taking: a box that already has a qemu-arm-static somewhere should not have to be told to
+		# move it, and ns-run execs the emulator *after* the chroot, so a path the sandbox cannot see is not
+		# a path it can run. Copy it in, say so once, and hand on the root-relative path either way. The
+		# hash comparison is what keeps a restart from rewriting a 11 MB file every time the service starts.
+		case $emulator in
+		"$ROOT"/*) emulator=${emulator#"$ROOT"} ;;
+		/*)
+			host_bin=$emulator
+			rel=/usr/bin/${host_bin##*/}
+			dest=$ROOT$rel
+			[ -r "$host_bin" ] || { log "zte_mesh.main.emulator=$host_bin is not readable: not starting"; return 1; }
+			src_hash=$(sha256sum "$host_bin" 2>/dev/null)
+			dst_hash=$(sha256sum "$dest" 2>/dev/null)
+			src_hash=${src_hash%% *}
+			dst_hash=${dst_hash%% *}
+			if [ -n "$src_hash" ] && [ "$src_hash" = "$dst_hash" ]; then
+				emulator=$rel
+			elif { mkdir -p "${dest%/*}" 2>/dev/null && cp -f "$host_bin" "$dest" && chmod 755 "$dest"; }; then
+				emulator=$rel
+				log "copied $host_bin into the private root as $dest: the sandbox execs the emulator after the chroot"
+			else
+				log "cannot copy $host_bin into $dest, and the sandbox only execs an emulator it can see inside the private root: not starting"
+				return 1
+			fi
+			;;
+		esac
 	fi
 	emulated=""
 	[ -n "$emulator" ] && emulated="ZTE_MESH_EMULATED_LAB=1 ZTE_MESH_QEMU=$emulator"
@@ -628,14 +1001,14 @@ start_service() {
 	procd_close_instance
 
 	# Two roles have a plan to apply here. On a child the profile comes from the controller's M2 and the service
-	# publishes what the daemon applied to $RUNDIR/wlan-plan (agent-sync.c). On a main router this router is the
-	# controller, so write_config publishes the same file from its own profile before the service starts. wlan-sync is
-	# the half that runs outside the sandbox and puts those values into /etc/config/wireless; it does not care which
-	# of the two produced the plan. A controller-only router has no instance at all.
-	if { [ "$role" = slave ] || role_applies_here "$role"; } && [ -x "$WLAN_SYNC" ]; then
+	# publishes what the daemon applied to $RUNDIR/wlan-plan (agent-sync.c). On a controller that broadcasts this
+	# router is the controller, so write_config publishes the same file from its own profile before the service
+	# starts. wlan-sync is the half that runs outside the sandbox and puts those values into /etc/config/wireless; it
+	# does not care which of the two produced the plan. A controller-only router has no instance at all.
+	if [ -x "$WLAN_SYNC" ] && sync_runs "$role" "$apply_local"; then
 		procd_open_instance wlan-sync
 		procd_set_param command "$WLAN_SYNC" "$RUNDIR/wlan-plan"
-		procd_set_param respawn
+		procd_set_param respawn 3600 5 0
 		procd_set_param stderr 1
 		procd_close_instance
 	fi
@@ -659,10 +1032,31 @@ start_service() {
 # the worst case to five minutes. It is not chatty: the frame is one ethernet frame every five
 # minutes, and a child that is already enrolled answers it with the same M1 it would have sent
 # anyway, which wlan-sync then reports as "plan applied nothing new".
-if [ "$role" != slave ] && [ -x "$MESH_SEARCH" ]; then
-	procd_open_instance search
-	procd_set_param command "$MESH_SEARCH" "$bridge" 300 --al-mac "02:00:00:00:19:$al_last" --search --quiet
-		procd_set_param respawn
+	if role_is_master "$role" && [ -x "$MESH_SEARCH" ]; then
+		procd_open_instance search
+		procd_set_param command "$MESH_SEARCH" "$bridge" 300 --al-mac "02:00:00:00:19:$al_last" --search --quiet
+		# A bare `respawn` is not harmless: procd fills it in as 3600 5 5, and a process that
+		# exits by design every 300 s burns those five retries in half an hour and is then
+		# dropped for good. Measured on the lab: search died at 23:10, thirty minutes after the
+		# 22:40 start, and children that booted later were never found again.
+		procd_set_param respawn 3600 5 0
+		procd_set_param stderr 1
+		procd_close_instance
+	fi
+
+	# What an AP Metric answer is made of. A vendor agent builds the station count of each of its BSSes from its own
+	# driver, through cspd, and the sandbox has neither: measured on the test environment, the daemon inside it takes
+	# the query (CMDU 0x800b) and sends nothing back, which is why an OpenWrt child router reports no terminals. The
+	# numbers only exist on the host -- the radios live in /sys, and ns-run keeps /sys out of the private root -- so
+	# this loop writes them into $RUNDIR/ap-sta and the responder inside the sandbox reads that file to answer.
+	#
+	# Only a child needs it: the controller is the one that asks, and a controller's own access points are not a BSS
+	# list anybody queries. A board with no Wi-Fi costs one process that writes an empty table, which is the same
+	# shape a child with its radios switched off gives, and both read as "nothing measured".
+	if ! role_is_master "$role" && [ -x "$STA_COLLECT" ]; then
+		procd_open_instance sta-collect
+		procd_set_param command "$STA_COLLECT" "$RUNDIR/ap-sta" 5
+		procd_set_param respawn 3600 5 0
 		procd_set_param stderr 1
 		procd_close_instance
 	fi
@@ -686,5 +1080,6 @@ stop_service() {
 	ip link del zmesh0 >/dev/null 2>&1
 	ip link del lab-peer >/dev/null 2>&1
 	# The plan describes a state the next start publishes again; keeping it could re-apply a stale profile.
-	rm -f "$RUNDIR/state.json" "$RUNDIR/config" "$RUNDIR/restart.sig" "$RUNDIR/wlan-plan"
+	# The same holds for the station counts: an old table beside a daemon that no longer runs would be answered from.
+	rm -f "$RUNDIR/state.json" "$RUNDIR/config" "$RUNDIR/restart.sig" "$RUNDIR/wlan-plan" "$RUNDIR/ap-sta"
 }

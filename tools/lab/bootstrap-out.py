@@ -19,9 +19,9 @@ hashes, so it is never mistaken for the audited bundle: `prepare.py` rejects it
 (its `verify_existing` compares the rootfs hash) and this script refuses to
 overwrite a manifest that does not carry that marker.
 
-    python3 tools/build/bootstrap-out.py            # -> ./out
-    python3 tools/build/bootstrap-out.py --force    # replace a previous synthetic out/
-    python3 tools/build/bootstrap-out.py --out DIR
+    python3 tools/lab/bootstrap-out.py            # -> ./out
+    python3 tools/lab/bootstrap-out.py --force    # replace a previous synthetic out/
+    python3 tools/lab/bootstrap-out.py --out DIR
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from collections import deque
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / "tools" / "dev"))
 
 from prepare import LIBOSS_PUB_SHA256, MULTIAPD_SHA256  # noqa: E402
 from vendor_elf import ELF, audit  # noqa: E402

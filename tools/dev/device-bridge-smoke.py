@@ -22,7 +22,7 @@ from vendor_elf import ELF, audit
 
 
 def main():
-    repo = Path(__file__).resolve().parent
+    repo = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="root@192.168.5.1")
     parser.add_argument("--output", type=Path, default=repo / "out")

@@ -44,6 +44,18 @@ valid_mac() {
 	return 1
 }
 
+# apply_local_of ROLE VALUE -> true when this controller also puts the profile on its own radios. Same rule as the
+# init script: `main`/`auto` are the old spelling of 1 and an unset option on those names means 1; a child never
+# applies locally, because its profile is the controller's.
+apply_local_of() {
+	local v=$2
+	if [ -z "$v" ]; then
+		case "$1" in main|auto) v=1 ;; *) v=0 ;; esac
+	fi
+	case "$v" in 1|yes|on|true|enabled) return 0 ;; esac
+	return 1
+}
+
 case "$1" in
 list)
 	printf '{ "status": {}, "restart": {}, "reboot_node": { "mac": "str" }, "light_node": { "mac": "str", "on": true } }\n'
@@ -67,12 +79,15 @@ call)
 		attached=false
 		[ -e /sys/class/net/zmesh0/master ] && attached=true
 		role=$(uci -q get zte_mesh.main.mesh_role 2>/dev/null)
-		# Three roles, reported under the names the form offers. "auto" is what a main router used to be called and
-		# is still accepted on input, so it is reported as "main"; anything unknown falls back to the default.
-		case "$role" in master|slave) ;; main|auto) role=main ;; *) role=master ;; esac
+		# The two axes the form offers, reported under the names the form uses. `main` and `auto` are the old spelling
+		# of a broadcasting controller, so they are reported as master with local=true; anything unknown falls back to
+		# the default. The page shows "Controller" / "Main router" / "Child router" from these two.
+		is_local=false
+		[ "$role" != slave ] && apply_local_of "$role" "$(uci -q get zte_mesh.main.apply_local 2>/dev/null)" && is_local=true
+		case "$role" in slave) ;; *) role=master ;; esac
 		# What the Wi-Fi applier (usr/libexec/zte-mesh/wlan-sync) did last time it ran. It runs outside the sandbox
 		# and cannot be seen from inside it, so it leaves a plain key=value file next to the plan. Both roles that
-		# apply a profile here -- a child from the M2, a main router from its own configuration -- write it.
+		# apply a profile here -- a child from the M2, a broadcasting controller from its own configuration -- write it.
 		sync=null
 		if [ -s "$RUNDIR/wlan-sync.status" ]; then
 			sy_epoch=$(sed -n 's/^epoch=//p' "$RUNDIR/wlan-sync.status" | head -n 1)
@@ -86,8 +101,8 @@ call)
 				"$(printf '%s' "$sy_bands" | tr -cd '0-9a-zA-Z _,-')" \
 				"$(printf '%s' "$sy_message" | tr -cd '0-9a-zA-Z _,-.:')")
 		fi
-		printf '{ "installed": %s, "running": %s, "attached": %s, "role": "%s", "sync": %s, "age": %d, "state": %s }\n' \
-			"$installed" "$running" "$attached" "$role" "$sync" "$age" "$state"
+		printf '{ "installed": %s, "running": %s, "attached": %s, "role": "%s", "local": %s, "sync": %s, "age": %d, "state": %s }\n' \
+			"$installed" "$running" "$attached" "$role" "$is_local" "$sync" "$age" "$state"
 		;;
 	restart)
 		( /etc/init.d/zte-mesh restart >/dev/null 2>&1 </dev/null & )

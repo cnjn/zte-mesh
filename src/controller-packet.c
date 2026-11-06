@@ -15,7 +15,10 @@
 #include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
+#include "controller-actions.h"
+#include "controller-1905.h"
 #include "controller-packet.h"
+#include "controller-steer.h"
 
 static const uint8_t peer[6] = {2, 0, 0, 0, 0x19, 0x0a};
 static unsigned int be16(const uint8_t *p) { return ((unsigned int)p[0] << 8) | p[1]; }
@@ -343,6 +346,52 @@ done:
     return result;
 }
 
+/* Ask one agent how many clients sit on each BSS it runs: AP Metric Query (CMDU 0x800b) with an empty BSSID list,
+ * built by ap_metrics_query_build() and sent from the daemon's own port with this controller's AL MAC as the source.
+ *
+ * Nothing is read back here. The answer comes to the AL MAC the query was sent from, so it arrives on the daemon's
+ * socket, and the frame hook in controller-trace.c files it in the peers directory like any other frame the daemon
+ * receives. That is the whole point of sending it this way: an OpenWrt child answers from the stand-in, a factory
+ * child answers from its own driver, and the master tells them apart by nothing. 0 = sent, -1 = local error (no
+ * private port, no AL MAC, the socket refused). */
+int controller_ap_metrics_query(const uint8_t agent[6])
+{
+    static uint16_t message_id = 0xb000;
+    struct sockaddr_ll target = { .sll_family = AF_PACKET, .sll_protocol = htons(0x893a), .sll_halen = 6 };
+    struct ifreq interface;
+    uint8_t frame[64], source[6];
+    size_t used;
+    int fd, result, saved, probe;
+    const char *private = getenv("ZTE_MESH_DB_SANDBOX");
+    if (!agent || !private || strcmp(private, "1"))
+        return -1;
+    target.sll_ifindex = (int)if_nametoindex("veth-lab"); /* the daemon's actual port */
+    if (!target.sll_ifindex)
+        return -1;
+    memset(&interface, 0, sizeof(interface));
+    strcpy(interface.ifr_name, "br0"); /* the private identity bridge carries the AL MAC this node is known by */
+    probe = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (probe < 0)
+        return -1;
+    saved = ioctl(probe, SIOCGIFHWADDR, &interface);
+    close(probe);
+    if (saved || interface.ifr_hwaddr.sa_family != 1)
+        return -1;
+    memcpy(source, interface.ifr_hwaddr.sa_data, 6);
+    used = ap_metrics_query_build(frame, sizeof(frame), agent, source, (unsigned int)(message_id++ & 0xffff));
+    if (!used)
+        return -1;
+    memcpy(target.sll_addr, agent, 6);
+    fd = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, htons(0x893a));
+    if (fd < 0)
+        return -1;
+    result = sendto(fd, frame, used, 0, (struct sockaddr *)&target, sizeof(target)) == (ssize_t)used ? 0 : -1;
+    saved = errno;
+    close(fd);
+    errno = saved;
+    return result;
+}
+
 /* The daemon's own frames, header and WSC message type only. */
 int controller_read_frame(int fd, struct controller_frame *frame)
 {
@@ -402,7 +451,14 @@ int controller_read_frame(int fd, struct controller_frame *frame)
 }
 
 /* AP Autoconfiguration Response, built the way the factory controller builds it (the shape the
- * controller_autoconfig_response_matches() validator was recovered against). */
+ * controller_autoconfig_response_matches() validator was recovered against).
+ *
+ * Two known differences from what the factory daemon actually puts on the wire (dissected frame by
+ * frame, docs/research/WIRESHARK_1905.md): the factory response ends with an End of Message TLV and
+ * carries a Multi-AP Profile (0xb3) TLV, this one carries neither. Without the EOM the Wireshark
+ * ieee1905 dissector marks the frame malformed; the ZTE agent does not care, and this exact shape is
+ * what made it answer M1 on the bench, so it is left alone until a child is available to re-prove
+ * that adding the two TLVs does not change that. Do not "fix" it blind. */
 int controller_autoconfig_response(const uint8_t agent[6], unsigned int band, unsigned int mid)
 {
     struct sockaddr_ll target = { .sll_family = AF_PACKET, .sll_protocol = htons(0x893a), .sll_halen = 6 };
@@ -483,5 +539,69 @@ int controller_topology_query(const uint8_t agent[6], unsigned int mid, unsigned
     saved = errno;
     close(fd);
     errno = saved;
+    return result;
+}
+
+/* One client action to one agent, from the daemon's private port: a Client Steering Request (0x8014) for a
+ * kick, or a Client Association Control Request (0x8016) for a ban and for lifting one.
+ *
+ * `bssid` is the BSS the request is about. This controller has no per-client association table yet, so the
+ * service passes the broadcast address, which asks the agent to apply the request to all of its BSSes. Whether
+ * a ZTE agent honours that form is exactly what H-03 has to answer; the failure mode is a request that is
+ * accepted and does nothing, not a frame that breaks the mesh.
+ *
+ * `seconds` is the ban's validity (0 = until lifted). A kick always asks for disassociation-imminent steering
+ * with a 200 ms opportunity window and a 100 TBTT timer: the variant that moves a client ignoring plain BTM. */
+int controller_client_action(const uint8_t agent[6], const uint8_t bssid[6], const uint8_t client[6], int kind,
+                             int allow, unsigned int seconds)
+{
+    struct sockaddr_ll target = { .sll_family = AF_PACKET, .sll_protocol = htons(0x893a), .sll_halen = 6 };
+    uint8_t frame[STEER_FRAME_MAX];
+    size_t used;
+    int fd, result, saved;
+    const char *private = getenv("ZTE_MESH_DB_SANDBOX");
+    if (!agent || !bssid || !client || !private || strcmp(private, "1"))
+        return -1;
+    if (kind == ACTION_KIND_KICK) {
+        struct steer_request request;
+        memset(&request, 0, sizeof(request));
+        memcpy(request.al_mac, peer, 6);
+        memcpy(request.bssid, bssid, 6);
+        memcpy(request.client, client, 6);
+        request.window = 200;
+        request.disassoc_timer = 100;
+        request.mandate = 1;
+        request.disassoc_imminent = 1;
+        used = steer_build_request(frame, sizeof(frame), (unsigned int)(time(NULL) & 0xffff), agent, &request);
+    } else {
+        struct steer_ban ban;
+        memset(&ban, 0, sizeof(ban));
+        memcpy(ban.al_mac, peer, 6);
+        memcpy(ban.bssid, bssid, 6);
+        memcpy(ban.clients[0], client, 6);
+        ban.count = 1;
+        ban.allow = allow ? 1 : 0;
+        ban.validity_seconds = (uint16_t)(seconds > 0xffff ? 0xffff : seconds);
+        used = steer_build_assoc_control(frame, sizeof(frame), (unsigned int)(time(NULL) & 0xffff), agent, &ban);
+    }
+    if (!used)
+        return -1;
+    target.sll_ifindex = (int)if_nametoindex("lab-peer");
+    if (!target.sll_ifindex)
+        return -1;
+    memcpy(target.sll_addr, agent, 6);
+    fd = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(0x893a));
+    if (fd < 0)
+        return -1;
+    result = sendto(fd, frame, used, 0, (struct sockaddr *)&target, sizeof(target)) == (ssize_t)used ? 0 : -1;
+    saved = errno;
+    close(fd);
+    errno = saved;
+    if (!result) {
+        printf("ZTE_PACKET action kind=%s allow=%d agent=%02x:%02x:%02x:%02x:%02x:%02x bytes=%u\n",
+               kind == ACTION_KIND_KICK ? "kick" : "ban", allow ? 1 : 0, agent[0], agent[1], agent[2], agent[3],
+               agent[4], agent[5], (unsigned int)used);
+        fflush(NULL);
+    }
     return result;
 }
