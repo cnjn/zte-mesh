@@ -34,7 +34,12 @@ PY
 export ZTE_JF="$T/jf.py" ZTE_PLUGIN="$PLUGIN"
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then pass=$((pass + 1)); else echo "FAIL $1: got '$2' want '$3'"; fail=$((fail + 1)); fi; }
-call() { printf '%s\n' "$2" | sh -c 'jsonfilter() { python3 "$ZTE_JF" "$@"; }; m=$1; set -- call "$m"; . "$ZTE_PLUGIN"' _ "$1" | tr -d ' \n'; }
+call() { printf '%s\n' "$2" | sh -c 'jsonfilter() { python3 "$ZTE_JF" "$@"; }; uci() { [ "${1:-}" = -q ] && shift
+	case "$2" in
+	zte_mesh.main.mesh_role) [ -n "$UCI_ROLE" ] && { printf "%s\n" "$UCI_ROLE"; return 0; }; return 1 ;;
+	zte_mesh.main.apply_local) [ -n "$UCI_LOCAL" ] && { printf "%s\n" "$UCI_LOCAL"; return 0; }; return 1 ;;
+	esac
+	return 1; }; m=$1; set -- call "$m"; . "$ZTE_PLUGIN"' _ "$1" | tr -d ' \n'; }
 
 # no running service (no state.json): -5
 check no-state "$(call reboot_node '{"mac":"d4:b7:09:0d:77:30"}')" '{"result":-5}'
@@ -50,6 +55,23 @@ case "$status_out" in
 *'"role":"master"'*) pass=$((pass + 1)) ;;
 *) echo "FAIL status-role: got '$status_out'"; fail=$((fail + 1)) ;;
 esac
+
+# The two axes the page draws its title from: mesh_role and apply_local. `main`/`auto` are the old spelling of a
+# broadcasting controller and must report as master with local=true, so an upgraded configuration is not shown as
+# something else; a child is never local, whatever its file says.
+for case_line in 'master||master|false' 'main||master|true' 'auto||master|true' 'master|1|master|true' \
+	'master|0|master|false' 'slave|1|slave|false'; do
+	IFS='|' read -r UCI_ROLE UCI_LOCAL want_role want_local <<EOF
+$case_line
+EOF
+	export UCI_ROLE UCI_LOCAL
+	status_out=$(call status '{}')
+	case "$status_out" in
+	*"\"role\":\"$want_role\""*"\"local\":$want_local"*) pass=$((pass + 1)) ;;
+	*) echo "FAIL status-axes: $case_line -> $status_out"; fail=$((fail + 1)) ;;
+	esac
+	unset UCI_ROLE UCI_LOCAL
+done
 
 # status also reports what the child-side applier did last: it runs outside the sandbox, so the service cannot know.
 printf 'epoch=1761740000\nresult=ok\nchanged=1\nbands=2g 5g\nmessage=\n' > "$T/run/wlan-sync.status"

@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../controller-packet.h"
+#include "../src/controller-packet.h"
 static const uint8_t controller[6] = {2, 0, 0, 0, 0x19, 6};
 static uint8_t frame[1601], base[1601];
 static unsigned int checks;

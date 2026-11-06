@@ -1,6 +1,6 @@
 /* Host test of the agent synchroniser's pure part: the plan text the host-side wlan-sync parses, and the
  * change detector that decides whether a plan has to be written at all. The database side is exercised on the
- * lab router (db-engine-probe --agent-startup), not here: agent_sync_read() needs the vendor shared-memory engine, so
+ * lab router (docs/LAB.md section 3.1), not here: agent_sync_read() needs the vendor shared-memory engine, so
  * the four vendor symbols it uses are stubbed and only agent_sync_format()/agent_sync_changed() are driven.
  */
 #include "agent-sync.h"

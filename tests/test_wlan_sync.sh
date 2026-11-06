@@ -117,6 +117,8 @@ seed_db() {
 	printf 'radio1' > "$DB/default_radio1.device"; printf 'ap' > "$DB/default_radio1.mode"
 	printf 'old-5g' > "$DB/default_radio1.ssid"; printf 'old-key-5g' > "$DB/default_radio1.key"
 	printf 'psk2' > "$DB/default_radio1.encryption"; printf '0' > "$DB/default_radio1.disabled"
+	# Both main BSSs sit on the LAN, which is the network an extra slot inherits (there is no VLAN separation).
+	printf 'lan' > "$DB/default_radio0.network"; printf 'lan' > "$DB/default_radio1.network"
 	: > "$LOG"
 }
 seed_db
@@ -133,6 +135,9 @@ val() { cat "$DB/$1" 2>/dev/null; }
 # The band lookup runs once per plan row and once more from clear_backhaul, so a message about a band can appear
 # more than once in a run: these cases ask whether it was said, not how many times.
 has() { [ "$(grep -c "$1" "$LOG" 2>/dev/null)" -ge 1 ] && echo yes || echo no; }
+# Every run leaves a status file next to the plan (wlan-sync.status): the sandboxed service and the page cannot see
+# what happens outside the sandbox, and without it a failed apply is only a line in the system log.
+status_val() { sed -n "s/^$1=//p" "$T/wlan-sync.status" 2>/dev/null | head -n 1; }
 
 PLAN=$T/plan
 cat > "$PLAN" <<'PLAN'
@@ -297,6 +302,72 @@ printf 'true' > "$DB/radio1.disabled"
 sh "$WLAN_SYNC" "$PLAN" --once >"$T/out" 2>&1
 check "radio off spelled true: switched on" 0 "$(val radio1.disabled)"
 
+# --- a child's seed that equals the air ---------------------------------------------------------------------
+# zte-mesh.init seeds a child from the network this router is already broadcasting, band by band, and its
+# `live_ap_iface` resolves the same sections `radio_section_of` + `ap_iface_of` resolve here (tests/test_init.sh has
+# the ax3600 fixture; the plan below is the service config it produced). The restart then has to find nothing to
+# write: a single no-op write marks the plan applied, and an applied plan commits and reloads every radio on this
+# router -- which is the client drop the two name flips used to cause.
+PLAN_SEED=$T/plan-seed
+cat > "$PLAN_SEED" <<'PLAN'
+rows=2
+0.radio=0
+0.slot=0
+0.instance=DEV.WIFI.AP1
+0.ssid=FRESHR10
+0.key=Ztemesh2631!
+0.enabled=1
+0.hidden=0
+0.access=32
+0.beacon_type=12
+1.radio=1
+1.slot=0
+1.instance=DEV.WIFI.AP5
+1.ssid=FRESHR10-5G
+1.key=Ztemesh2631!
+1.enabled=1
+1.hidden=0
+1.access=32
+1.beacon_type=6
+PLAN
+seed_db_two_5g
+rm -f "$DB/radio1.disabled"
+printf 'FRESHR10' > "$DB/default_radio2.ssid"; printf 'Ztemesh2631!' > "$DB/default_radio2.key"
+printf 'sae-mixed' > "$DB/default_radio2.encryption"; printf '0' > "$DB/default_radio2.hidden"
+printf 'FRESHR10-5G' > "$DB/default_radio1.ssid"; printf 'Ztemesh2631!' > "$DB/default_radio1.key"
+printf 'psk-mixed' > "$DB/default_radio1.encryption"; printf '0' > "$DB/default_radio1.hidden"
+sh "$WLAN_SYNC" "$PLAN_SEED" --once >"$T/out" 2>&1
+check "seed equals air: nothing written" 0 "$(grep -c '^set ' "$LOG")"
+check "seed equals air: no commit" 0 "$(grep -c '^commit ' "$LOG")"
+check "seed equals air: no reload" 0 "$(grep -c '^wifi ' "$LOG")"
+check "seed equals air: reports no change" 0 "$(status_val changed)"
+check "seed equals air: names no band" "" "$(status_val bands)"
+check "seed equals air: still ok" ok "$(status_val result)"
+
+# The same pair one letter away is still a change, so this cannot pass by never writing anything.
+: > "$LOG"
+sed -e 's/^0.ssid=FRESHR10$/0.ssid=FRESHR11/' "$PLAN_SEED" > "$T/plan-seed-diff"
+sh "$WLAN_SYNC" "$T/plan-seed-diff" --once >"$T/out" 2>&1
+check "seed differs: the name is written" FRESHR11 "$(val default_radio2.ssid)"
+check "seed differs: one commit" 1 "$(grep -c '^commit wireless$' "$LOG")"
+
+# A flag the config does not spell out already answers off, so the 0 a plan carries for it is not a difference:
+# writing it would churn UCI and reload the radios for a network that did not move.
+seed_db
+rm -f "$DB/default_radio0.disabled" "$DB/default_radio1.disabled"
+sed -e 's/^0.ssid=zte-agent-2g$/0.ssid=old-2g/' -e 's/^0.key=m2-public-2g-key$/0.key=old-key-2g/' \
+	-e 's/^0.beacon_type=6$/0.beacon_type=3/' -e 's/^1.ssid=zte-agent-5g$/1.ssid=old-5g/' \
+	-e 's/^1.key=m2-public-5g-key$/1.key=old-key-5g/' -e 's/^1.hidden=1$/1.hidden=0/' "$PLAN" > "$T/plan-absent-flags"
+sh "$WLAN_SYNC" "$T/plan-absent-flags" --once >"$T/out" 2>&1
+check "absent flags: nothing invented for disabled" "" "$(val default_radio0.disabled)"
+check "absent flags: nothing invented for hidden" "" "$(val default_radio0.hidden)"
+check "absent flags: no write" 0 "$(grep -c '^set ' "$LOG")"
+check "absent flags: no reload" 0 "$(grep -c '^wifi ' "$LOG")"
+# and a flag the plan *does* want on is still written
+sed -e 's/^1.hidden=0$/1.hidden=1/' "$T/plan-absent-flags" > "$T/plan-hidden-on"
+sh "$WLAN_SYNC" "$T/plan-hidden-on" --once >"$T/out" 2>&1
+check "absent flags: a real 1 is written" 1 "$(val default_radio1.hidden)"
+
 # --- backhaul (multi_ap) ---------------------------------------------------------------------------------
 # A plan as the controller actually fills it: slot 0 is the fronthaul BSS (MapAccessAttr 32) and slot 3 of
 # the 2.4 GHz band is the hidden backhaul BSS (64). Only the 2.4 GHz band gets a backhaul row here, so the
@@ -427,10 +498,279 @@ sh "$WLAN_SYNC" "$PLAN" --once >"$T/out" 2>&1
 check "old plan: fronthaul still marked" 1 "$(val default_radio0.multi_ap)"
 check "old plan: no backhaul section invented" "" "$(val type.zte_backhaul_2g)"
 
+# --- the child end of the same row (backhaul client) ------------------------------------------------------
+# The row whose MapAccessAttr carries bit 6 means the opposite thing depending on which end this router is on.
+# `mesh_role=slave` puts this router on the client side, so the row becomes a `mode=sta` interface, and two
+# options carry the whole feature -- neither is obvious from the plan:
+#   multi_ap 1   netifd copies it into the supplicant's multi_ap_backhaul_sta, which is what lets the association
+#                land on a backhaul BSS; a plain STA is refused by one, and the controller's backhaul SSID is hidden
+#   wds 1        this image sets 4addr from wds and only bridges an interface that has it. Without this the child
+#                associates, the apply reports success, and no 1905 frame ever crosses the radio
+role_child() { printf 'slave' > "$DB/zte_mesh.main.mesh_role"; }
+role_master() { rm -f "$DB/zte_mesh.main.mesh_role"; }
 
-# Every run leaves a status file next to the plan (wlan-sync.status): the sandboxed service and the page cannot see
-# what happens outside the sandbox, and without it a failed apply is only a line in the system log.
-status_val() { sed -n "s/^$1=//p" "$T/wlan-sync.status" 2>/dev/null | head -n 1; }
+seed_db
+backhaul_on
+role_child
+sh "$WLAN_SYNC" "$PLAN_BH" --once >"$T/out" 2>&1
+check "child: client section created" wifi-iface "$(val type.zte_backhaul_sta_2g)"
+check "child: mode is sta" sta "$(val zte_backhaul_sta_2g.mode)"
+check "child: the flag that makes it a backhaul sta" 1 "$(val zte_backhaul_sta_2g.multi_ap)"
+check "child: 4-address and bridged (wds)" 1 "$(val zte_backhaul_sta_2g.wds)"
+check "child: name is the controller's" ZMESH-bh-2g "$(val zte_backhaul_sta_2g.ssid)"
+check "child: key is the controller's" backhaul-2g-key "$(val zte_backhaul_sta_2g.key)"
+check "child: security (beacon 6)" psk-mixed "$(val zte_backhaul_sta_2g.encryption)"
+check "child: radio borrowed from the band" radio0 "$(val zte_backhaul_sta_2g.device)"
+check "child: network is the band's bridge" lan "$(val zte_backhaul_sta_2g.network)"
+check "child: enabled so the link is up" 0 "$(val zte_backhaul_sta_2g.disabled)"
+check "child: no AP-only hidden flag invented" "" "$(val zte_backhaul_sta_2g.hidden)"
+check "child: no backhaul BSS of its own" "" "$(val type.zte_backhaul_2g)"
+check "child: the band's main BSS is still the fronthaul" zte-agent-2g "$(val default_radio0.ssid)"
+check "child: fronthaul of the main BSS marked" 1 "$(val default_radio0.multi_ap)"
+check "child: no client invented for a band the controller did not fill" "" "$(val type.zte_backhaul_sta_5g)"
+
+# A radio that carries no main BSS has no bridge to join: this image hands a sta interface to the network only
+# through wds + network, so the client would associate and still not carry a 1905 frame. The name of the missing
+# piece goes to the log -- a silent unbridged client reads as a working link on the page.
+seed_db
+rm -f "$DB/type.default_radio0" "$DB"/default_radio0.*
+backhaul_on
+role_child
+sh "$WLAN_SYNC" "$PLAN_BH" --once >"$T/out" 2>&1
+check "child without a main BSS: client still written" wifi-iface "$(val type.zte_backhaul_sta_2g)"
+check "child without a main BSS: no network invented" "" "$(val zte_backhaul_sta_2g.network)"
+check "child without a main BSS: the log says it is not bridged" 1 \
+	"$(grep -c 'no network to join (this radio carries no main BSS); it will not be bridged' "$LOG")"
+
+# The same plan again is a no-op: the child must not be re-associated every two seconds.
+seed_db
+backhaul_on
+role_child
+sh "$WLAN_SYNC" "$PLAN_BH" --once >"$T/out" 2>&1
+: > "$LOG"
+sh "$WLAN_SYNC" "$PLAN_BH" --once >"$T/out" 2>&1
+check "child: second run sets nothing" 0 "$(grep -c '^set ' "$LOG")"
+check "child: second run commits nothing" 0 "$(grep -c '^commit ' "$LOG")"
+check "child: second run reloads nothing" 0 "$(grep -c '^wifi ' "$LOG")"
+
+# Changing end while the mode stays on gives the other end's section back -- the plan row did not change, this
+# router's role did, and a stale backhaul BSS on a child (or a stale client on a master) would both conflict with
+# the controller and read as a working link on the page.
+sh "$WLAN_SYNC" "$PLAN_BH" --once >/dev/null 2>&1
+role_master
+sh "$WLAN_SYNC" "$PLAN_BH" --once >"$T/out" 2>&1
+check "sta -> ap: the client section is gone" "" "$(val type.zte_backhaul_sta_2g)"
+check "sta -> ap: the BSS section is built" wifi-iface "$(val type.zte_backhaul_2g)"
+check "sta -> ap: removal says why" 1 "$(grep -c 'ap role runs the other end of the backhaul; removed zte_backhaul_sta_2g' "$LOG")"
+role_child
+sh "$WLAN_SYNC" "$PLAN_BH" --once >"$T/out" 2>&1
+check "ap -> sta: the BSS section is gone" "" "$(val type.zte_backhaul_2g)"
+check "ap -> sta: the client section is built" wifi-iface "$(val type.zte_backhaul_sta_2g)"
+
+# A row that claims a security mode but carries no key is refused at either end. The master would otherwise put an
+# open BSS on the air under a name that is supposed to be private; the child would be configured to join a network
+# it cannot authenticate to, and the page would show a backhaul that was never going to come up.
+sed -e 's/^1.key=backhaul-2g-key$/1.key=/' "$PLAN_BH" > "$T/plan-bh4"
+seed_db
+backhaul_on
+role_child
+sh "$WLAN_SYNC" "$T/plan-bh4" --once >"$T/out" 2>&1
+check "child: a secured row with no key is refused" "" "$(val type.zte_backhaul_sta_2g)"
+check "child: the refusal says what is missing" 1 "$(grep -c 'says psk-mixed but the plan carries no key' "$LOG")"
+check "child: the refusal does not stop the main BSS" zte-agent-2g "$(val default_radio0.ssid)"
+seed_db
+backhaul_on
+role_master
+sh "$WLAN_SYNC" "$T/plan-bh4" --once >"$T/out" 2>&1
+check "master: a secured row with no key is refused" "" "$(val type.zte_backhaul_2g)"
+
+# An open backhaul (beacon 0) has no key to miss, so it is still applied -- and the key it does not have is not
+# written as an empty one.
+sed -e 's/^1.beacon_type=6$/1.beacon_type=0/' -e 's/^1.key=backhaul-2g-key$/1.key=/' "$PLAN_BH" > "$T/plan-bh5"
+seed_db
+backhaul_on
+role_child
+sh "$WLAN_SYNC" "$T/plan-bh5" --once >"$T/out" 2>&1
+check "child: an open backhaul is still applied" wifi-iface "$(val type.zte_backhaul_sta_2g)"
+check "child: open backhaul security" none "$(val zte_backhaul_sta_2g.encryption)"
+check "child: open backhaul carries no empty key" "" "$(val zte_backhaul_sta_2g.key)"
+
+# A row the controller disables is written but kept off, so the child does not associate to a network the
+# controller has stopped intending.
+sed -e 's/^1.enabled=1$/1.enabled=0/' "$PLAN_BH" > "$T/plan-bh6"
+seed_db
+backhaul_on
+role_child
+sh "$WLAN_SYNC" "$T/plan-bh6" --once >"$T/out" 2>&1
+check "child: a disabled row is applied as off" 1 "$(val zte_backhaul_sta_2g.disabled)"
+
+# The role decides the end, nothing else: an unset role is a master, and a name this script has never seen
+# (`main`, `auto`) stays a master too.
+seed_db
+backhaul_on
+printf 'main' > "$DB/zte_mesh.main.mesh_role"
+sh "$WLAN_SYNC" "$PLAN_BH" --once >"$T/out" 2>&1
+check "role main is still the master end" wifi-iface "$(val type.zte_backhaul_2g)"
+check "role main builds no client" "" "$(val type.zte_backhaul_sta_2g)"
+
+
+# --- extra SSID slots (zte_mesh.main.extra_slots) ---------------------------------------------------------
+# The controller hands out up to three extra SSIDs per band (slot 1 guest, 2 spare, 3 hidden backhaul) and the
+# plan carries one row per slot. Off is the default and must stay byte-for-byte the old behaviour; on turns each
+# enabled slot into its own wifi-iface on the band's radio, and removes the section again when the slot goes away.
+extra_on() { printf '1' > "$DB/zte_mesh.main.extra_slots"; }
+extra_off() { rm -f "$DB/zte_mesh.main.extra_slots"; }
+
+PLAN_SLOTS=$T/plan-slots
+cat > "$PLAN_SLOTS" <<'PLAN'
+rows=3
+0.radio=0
+0.slot=0
+0.instance=DEV.WIFI.AP1
+0.ssid=zte-agent-2g
+0.key=m2-public-2g-key
+0.enabled=1
+0.hidden=0
+0.access=32
+0.beacon_type=6
+1.radio=0
+1.slot=1
+1.instance=DEV.WIFI.AP2
+1.ssid=guest-2g
+1.key=guest-2g-key
+1.enabled=1
+1.hidden=0
+1.access=32
+1.beacon_type=3
+2.radio=1
+2.slot=2
+2.instance=DEV.WIFI.AP7
+2.ssid=spare-5g
+2.key=spare-5g-key
+2.enabled=0
+2.hidden=1
+2.access=32
+2.beacon_type=3
+PLAN
+
+# Off (the default): the slots are reported and skipped, exactly as before this option existed.
+seed_db
+extra_off
+sh "$WLAN_SYNC" "$PLAN_SLOTS" --once >"$T/out" 2>&1
+check "slots off: no extra section" "" "$(val type.zte_extra_2g_1)"
+check "slots off: nothing created for the disabled slot either" "" "$(val type.zte_extra_5g_2)"
+check "slots off: the row is reported" 1 "$(grep -c 'slot 1 of radio 0 is not applied' "$LOG")"
+check "slots off: the log names the option" yes "$(has 'zte_mesh.main.extra_slots is off')"
+check "slots off: the main BSS is still applied" zte-agent-2g "$(val default_radio0.ssid)"
+
+# On: an enabled slot becomes its own BSS on its band's radio.
+seed_db
+extra_on
+sh "$WLAN_SYNC" "$PLAN_SLOTS" --once >"$T/out" 2>&1
+check "slot section type" wifi-iface "$(val type.zte_extra_2g_1)"
+check "slot radio" radio0 "$(val zte_extra_2g_1.device)"
+check "slot mode" ap "$(val zte_extra_2g_1.mode)"
+check "slot name is the controller's" guest-2g "$(val zte_extra_2g_1.ssid)"
+check "slot key is the controller's" guest-2g-key "$(val zte_extra_2g_1.key)"
+check "slot security (beacon 3)" psk2 "$(val zte_extra_2g_1.encryption)"
+check "slot enabled" 0 "$(val zte_extra_2g_1.disabled)"
+check "slot hidden flag" 0 "$(val zte_extra_2g_1.hidden)"
+check "slot inherits the band's network" lan "$(val zte_extra_2g_1.network)"
+check "slot is not a backhaul BSS" "" "$(val zte_extra_2g_1.multi_ap)"
+check "slot row does not touch the main SSID" zte-agent-2g "$(val default_radio0.ssid)"
+check "a disabled slot creates nothing" "" "$(val type.zte_extra_5g_2)"
+check "one commit for the whole plan" 1 "$(grep -c '^commit wireless$' "$LOG")"
+check "the apply says the guest slot is not separated" 1 "$(grep -c 'no VLAN separation' "$LOG")"
+
+# Idempotent: the same plan again writes, commits and reloads nothing.
+: > "$LOG"
+sh "$WLAN_SYNC" "$PLAN_SLOTS" --once >"$T/out" 2>&1
+check "second slot run sets nothing" 0 "$(grep -c '^set ' "$LOG")"
+check "second slot run commits nothing" 0 "$(grep -c '^commit ' "$LOG")"
+check "second slot run reloads nothing" 0 "$(grep -c '^wifi ' "$LOG")"
+
+# A slot the plan no longer carries is removed: the child must not keep broadcasting a network the controller
+# stopped handing out. A slot that is merely disabled is the row's job, not the pruner's.
+cat > "$T/plan-slots-none" <<'PLAN'
+rows=2
+0.radio=0
+0.slot=0
+0.ssid=zte-agent-2g
+0.key=m2-public-2g-key
+0.enabled=1
+0.hidden=0
+0.access=32
+0.beacon_type=6
+1.radio=1
+1.slot=2
+1.ssid=spare-5g
+1.key=spare-5g-key
+1.enabled=0
+1.hidden=1
+1.access=32
+1.beacon_type=3
+PLAN
+: > "$LOG"
+sh "$WLAN_SYNC" "$T/plan-slots-none" --once >"$T/out" 2>&1
+check "slot gone: section removed" "" "$(val type.zte_extra_2g_1)"
+check "slot gone: removal logged" 1 "$(grep -c 'removed zte_extra_2g_1' "$LOG")"
+check "slot gone: the main BSS stays" zte-agent-2g "$(val default_radio0.ssid)"
+
+# Switching the mode back to off removes every extra section this script created, and nothing else.
+seed_db
+extra_on
+sh "$WLAN_SYNC" "$PLAN_SLOTS" --once >"$T/out" 2>&1
+extra_off
+: > "$LOG"
+sh "$WLAN_SYNC" "$PLAN_SLOTS" --once >"$T/out" 2>&1
+check "off again: section removed" "" "$(val type.zte_extra_2g_1)"
+check "off again: removal logged" 1 "$(grep -c 'extra slot mode is off; removed 1' "$LOG")"
+check "off again: the main BSS untouched" zte-agent-2g "$(val default_radio0.ssid)"
+
+# An unknown security mode creates nothing; a slot beyond 3 is refused instead of guessed at.
+sed -e 's/^1.beacon_type=3$/1.beacon_type=9/' "$PLAN_SLOTS" > "$T/plan-slots-bad"
+seed_db
+extra_on
+sh "$WLAN_SYNC" "$T/plan-slots-bad" --once >"$T/out" 2>&1
+check "unknown slot mode creates nothing" "" "$(val type.zte_extra_2g_1)"
+check "unknown slot mode logged" 1 "$(grep -c 'slot 1 on 2g: unknown security mode 9' "$LOG")"
+
+sed -e 's/^1.slot=1$/1.slot=4/' "$PLAN_SLOTS" > "$T/plan-slots-range"
+seed_db
+extra_on
+sh "$WLAN_SYNC" "$T/plan-slots-range" --once >"$T/out" 2>&1
+check "slot 4 refused" "" "$(val type.zte_extra_2g_4)"
+check "slot 4 logged" 1 "$(grep -c 'slot 4 of radio 0 is out of range' "$LOG")"
+
+# A slot row without a name is left alone (an empty SSID would create an unnamed, unconnectable BSS).
+sed -e 's/^1.ssid=guest-2g$/1.ssid=/' "$PLAN_SLOTS" > "$T/plan-slots-noname"
+seed_db
+extra_on
+sh "$WLAN_SYNC" "$T/plan-slots-noname" --once >"$T/out" 2>&1
+check "slot without a name creates nothing" "" "$(val type.zte_extra_2g_1)"
+check "slot without a name logged" 1 "$(grep -c 'slot 1 of radio 0 has no name' "$LOG")"
+
+# An extra slot on a band whose radio cannot be resolved is reported and skipped, not written to a guess. This is
+# the ax3600 shape: two '5g' devices, neither pinned, so the band is ambiguous.
+cat > "$T/plan-slots-5g" <<'PLAN'
+rows=1
+0.radio=1
+0.slot=1
+0.ssid=guest-5g
+0.key=guest-5g-key
+0.enabled=1
+0.hidden=0
+0.access=32
+0.beacon_type=3
+PLAN
+seed_db_two_5g
+extra_on
+sh "$WLAN_SYNC" "$T/plan-slots-5g" --once >"$T/out" 2>&1
+check "ambiguous band: no section" "" "$(val type.zte_extra_5g_1)"
+check "ambiguous band: reported" 1 "$(grep -c 'no usable 5g radio; slot 1 left alone' "$LOG")"
+check "ambiguous band: the old main SSID stays" old-card-5g "$(val default_radio0.ssid)"
+
+# Every run leaves a status file next to the plan (wlan-sync.status).
 seed_db
 sh "$WLAN_SYNC" "$PLAN" --once >"$T/out" 2>&1
 check "status: result" ok "$(status_val result)"
@@ -443,6 +783,54 @@ sh "$WLAN_SYNC" "$PLAN" --once >"$T/out" 2>&1
 check "status: a no-op run reports no change" 0 "$(status_val changed)"
 check "status: a no-op run names no band" "" "$(status_val bands)"
 check "status: still ok" ok "$(status_val result)"
+
+# --- the installed wpad variant --------------------------------------------------------------------------
+# The backhaul options this script writes (`multi_ap` on either end, and the `wds` that opens 4-address mode on a
+# client) exist only in the full wpad build: a -basic package accepts them and puts nothing on the air. A run that
+# reported a clean success in that state would be the exact kind of false pass this project keeps having, so the
+# reason goes to the log and into the status message the page reads. WPAD_DB points the lookup at a file, so the
+# test does not depend on the host.
+printf 'P:wpad-basic-mbedtls\nP:libc\n' > "$T/pkg-basic"
+printf 'Package: wpad-mbedtls\n' > "$T/pkg-full"
+seed_db
+backhaul_on
+: > "$LOG"
+WPAD_DB=$T/pkg-basic sh "$WLAN_SYNC" "$PLAN_BH" --once >"$T/out" 2>&1
+check "wpad basic: warning logged" 1 "$(grep -c 'wpad-basic-mbedtls has no Multi-AP support' "$LOG")"
+check "wpad basic: warning in the status" 1 "$(status_val message | grep -c 'wpad-basic-mbedtls has no Multi-AP support')"
+check "wpad basic: still applied" 2 "$(val zte_backhaul_2g.multi_ap)"
+
+# The client end is the same package question and the same false pass: -basic takes multi_ap and wds, associates,
+# and carries no 1905 frame.
+seed_db
+backhaul_on
+role_child
+: > "$LOG"
+WPAD_DB=$T/pkg-basic sh "$WLAN_SYNC" "$PLAN_BH" --once >"$T/out" 2>&1
+check "child: wpad basic warned too" 1 "$(grep -c 'wpad-basic-mbedtls has no Multi-AP support' "$LOG")"
+check "child: wpad basic still writes the 4-address client" 1 "$(val zte_backhaul_sta_2g.wds)"
+check "child: wpad basic names it in the status" 1 "$(status_val message | grep -c 'wpad-basic-mbedtls has no Multi-AP support')"
+
+seed_db
+backhaul_on
+: > "$LOG"
+WPAD_DB=$T/pkg-full sh "$WLAN_SYNC" "$PLAN_BH" --once >"$T/out" 2>&1
+check "full wpad: no warning" "" "$(status_val message)"
+
+# The warning belongs to the backhaul: with it off, a -basic image is perfectly fine.
+seed_db
+backhaul_off
+: > "$LOG"
+WPAD_DB=$T/pkg-basic sh "$WLAN_SYNC" "$PLAN_BH" --once >"$T/out" 2>&1
+check "backhaul off: no wpad warning" "" "$(status_val message)"
+
+# An unreadable package database is not an error: nothing installed is known, so nothing is claimed.
+seed_db
+backhaul_on
+: > "$LOG"
+WPAD_DB=$T/no-such-file sh "$WLAN_SYNC" "$PLAN_BH" --once >"$T/out" 2>&1
+check "no package database: no warning, no failure" "" "$(status_val message)"
+check "no package database: still ok" ok "$(status_val result)"
 
 echo "wlan-sync: $pass passed, $fail failed"
 [ "$fail" = 0 ]

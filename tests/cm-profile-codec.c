@@ -1,6 +1,6 @@
 /* Host boundary tests only; native factory PSK equivalence is tested on device. */
 #define _GNU_SOURCE
-#include "../mesh-bridge.h"
+#include "../src/mesh-bridge.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,10 +8,10 @@
 struct field { const char *name; unsigned int type; };
 #define PROFILE_FIELD(label, dtype, key, saved, value) {label, dtype},
 static const struct field cfg[] = {
-#include "../wlan_cfg.def"
+#include "../src/wlan_cfg.def"
 };
 static const struct field psk[] = {
-#include "../wlan_psk.def"
+#include "../src/wlan_psk.def"
 };
 #undef PROFILE_FIELD
 static int fault, tests;
