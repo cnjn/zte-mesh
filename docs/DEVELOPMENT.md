@@ -4,11 +4,18 @@
 
 ## 1. 机器与连接
 
-**三台测试机的清单（机型、地址、角色、能力差异）只在 [LAB](LAB.md) 第 2.1 节**：`ax3600` 192.168.1.1、`owrt` 192.168.1.20、
-`ubuntu` 192.168.1.191，登机器一律 `python tools/lab/rssh.py`，账号与口令只在本机 `.local/lab-env.md`（脚本读那张表，也认
-`ZTE_LAB_USER_<别名>` / `ZTE_LAB_PASS_<别名>`）。别名 `owrt` 是登录用的名字，
-那台机器跑的同样是 ImmortalWrt——`owrt` 只是登录用的别名，不是另一套系统。以前那台测试主机上的旧清单（2026-10
-之前：mac `192.168.167.93` 上的 `/Volumes/code/sr1010-mesh`、开发机 `git push` + `receive.denyCurrentBranch updateInstead`、
+**三台测试机**（同一台交换机下的 `br-lan` 广播域，1905 帧能互相看见；这张表是机器清单的唯一一份，别的文档指回这里）：
+
+| 机器 | 地址 | 角色 | 关键事实 |
+|---|---|---|---|
+| 小米 AX3600（刷 ImmortalWrt，aarch64）<br>别名 `ax3600` | `192.168.1.1` | 子节点 | 内核 6.12.103 **没有 `CONFIG_COMPAT`、也没有 `BINFMT_MISC`**：ARM32 程序 execve 得 `ENOEXEC`，只能靠私有根里那份 `qemu-arm-static`（第 11.2 节）。装机验证走 `apk`。`radio0.disabled=1` 关掉了 2.4G，所以"一个频段两块射频、`wlan-sync` 放弃该频段"那条路径在这台上测不出来 |
+| ImmortalWrt 虚拟机（x86_64）<br>别名 `owrt` | `192.168.1.20` | 主控 | 与上面那台同一个内核版本；带启动器的包是 `arch: all`，这台能直接装（第 11.3 节） |
+| Ubuntu 22.04（x86_64）<br>别名 `ubuntu` | `192.168.1.191` | 构建机 | `gcc-arm-linux-gnueabi` + `gcc-aarch64-linux-gnu` 都是 11.4，**不用 Docker**（第 2 节） |
+
+下面各节用别名指这三台机器。
+
+登机器就是 `ssh root@<地址>`；账号与口令只在**本机**仓库外的 `.local/lab-env.md`（已 gitignore），不入库、不复述进任何文档或命令回显。
+以前那台测试主机上的旧清单（2026-10 之前：mac `192.168.167.93` 上的 `/Volumes/code/sr1010-mesh`、开发机 `git push` + `receive.denyCurrentBranch updateInstead`、
 ZXSLC SR1010、ZXHN Z506、测试环境里的 ImmortalWrt 虚拟机）已不再保留，历史证据按各自的取证存档查，本文不再维护第二份机器名单。
 这里只留三件别处没有的事：
 
@@ -22,9 +29,15 @@ ZXSLC SR1010、ZXHN Z506、测试环境里的 ImmortalWrt 虚拟机）已不再�
 
 ## 2. 构建
 
-**现役构建机是三台测试机里的 `ubuntu`（192.168.1.191），不用 Docker**：同步 → 编译 → 测试的日常流程在 [LAB](LAB.md) 第 3 节，
-`tools/lab/build.sh` 做的就是把下面这些目标在没有容器的机器上跑一遍。下面这张表是**容器路径**（mac 上的离线镜像
-`sr1010-mesh-shim-builder`，`orbctl start` 先把 Docker 拉起来）——`build.sh` 与 `container-make.sh` 这两个入口还在仓库里，
+**现役构建机是三台测试机里的 `ubuntu`（192.168.1.191），不用 Docker**：那台机器上直接 `make` 下面这些目标，
+要加两个 `-U`（Ubuntu 的 gcc 默认定义 `_FORTIFY_SOURCE`，Debian 的不一样；理由见第 11 节那张表）：
+
+```sh
+make ARMCC=arm-linux-gnueabi-gcc ROUTERCC=aarch64-linux-gnu-gcc all database   # 打包前两个编译器都要交叉
+make ROUTERCC=cc out/ns-run out/ns-run-svctest                                 # 只在这台机器上跑启动器时
+```
+
+下面这张表是**容器路径**（mac 上的离线镜像 `sr1010-mesh-shim-builder`，`orbctl start` 先把 Docker 拉起来）——`build.sh` 与 `container-make.sh` 这两个入口还在仓库里，
 复盘历史产物或需要原厂镜像时才走它。
 
 | 命令 | 做什么 |
@@ -39,15 +52,19 @@ ZXSLC SR1010、ZXHN Z506、测试环境里的 ImmortalWrt 虚拟机）已不再�
   新旧混合的东西。用 git 更新，或先写临时名再 `mv`。产物同理，所以 `container-make.sh` 在容器里删。
 - 运行包内有 `SHA256SUMS` 自校验，`make-runtime.py` 还会审计 ARM32 ABI（强符号、GNU 符号版本）。
 - 改了 C 产物但手上没有原厂镜像时，用**只换成员**的 `python3 openwrt/repack-runtime.py --replace
-  root/lib/libzte_controller_trace.so=out/runtime/lib/libzte_controller_trace.so`（步骤与两个坑见 LAB.md 第 3.0 节）：
-  其余成员逐字节不动，只重算 `SHA256SUMS`，`python3 tests/test_runtime.py` 的守卫会守住"成员与仓库文件一致"。
-  换完要逐条 diff 解出来的两个包，确认只有该成员和 `SHA256SUMS` 变了。少了的那一样是 `make-runtime.py` 的
-  GNU 符号版本审计——重打完对着成品补跑一遍，方法与那个假缺符号的坑在 LAB.md 第 3.0 节。
+  root/lib/libzte_controller_trace.so=out/runtime/lib/libzte_controller_trace.so`：
+  其余成员逐字节不动，只重算 `SHA256SUMS`，`python3 tests/test_runtime.py` 的守卫会守住"成员与仓库文件一致"。四个坑：
+  **① `--replace` 是 argparse 的 `store` 语义**，多个替换项要跟在同一个 `--replace` 后面；写成两个 `--replace` 只有最后一个生效，包悄悄只换了一个成员。
+  **② 重打的基线必须是仓库里已提交的那份 tarball**——从别处（比如刚打好的包传回工作区）再往回传，基线就成了"已经被换过的"那份，成员退回旧版本。
+  **③ 在 Windows 上别用"解出来再 `diff -r`"比包**：归档里 `root/var/{tmp,run,log}` 是指向 `/tmp` 的符号链接，`tar` 建不出链接时会把链接指向的东西
+  **整个拷进解出来的树**（实测落下本机临时目录的一整份副本）。要列成员用 `tar tvzf`（它会照出 `lrwxrwxrwx`），要比字节就逐成员比（`tarfile` 读两遍归档，比名称/类型/模式/大小/内容哈希）。
+  **④ 换成员跳过了 `make-runtime.py` 打包前跑的 GNU 符号版本审计**（`vendor_elf.audit()`）：重打完对着成品再跑一遍，不用解包——把归档里 `root/**` 的 ELF 成员读进内存交给它，
+  `missing_strong_symbols` 与 `missing_versions` 都应为 0。`audit()` 按 **basename** 找提供者（`libc.so.6`），照归档成员名（`root/lib/libc.so.6`）建索引的话每个版本需求都会"找不到提供者"，报出几十个假缺符号。
 - x86_64 主机可用 `Dockerfile.cross`（`make ROUTERCC=aarch64-linux-gnu-gcc`）交叉编译。
 
 ## 3. 跑控制器
 
-三种方式（现役那台 `ubuntu` 上跑服务用 `sudo sh tools/lab/run-service.sh`，见 [LAB](LAB.md) 第 3 节；下面这几条是容器/离线那条路径的入口）：
+三种方式（构建机上手工跑沙箱前要先有 `out/`：没有原厂镜像时用 `python3 tools/build/bootstrap-out.py` 从运行包重建，见第 2 节；仿真开关由 `ZTE_MESH_EMULATED_LAB` 那一条决定，见第 11 节。下面这三条是仓库里现成的入口）：
 
 1. **测试环境（不碰子节点）**：`python3 tools/dev/dev-service-smoke.py --no-attach --seconds 24`——路由器私有命名空间里跑服务，
    验证配置、热更新、守护进程重启，不把线接进 `br-lan`。`tools/dev/dev-config-check.py DIR` 批量传入配置看接受/拒绝，
@@ -132,12 +149,16 @@ ZXSLC SR1010、ZXHN Z506、测试环境里的 ImmortalWrt 虚拟机）已不再�
   `grep tr cut sed awk pgrep wget tftp`；行缓冲超过约 1 KB 会截断，长内容按 500 字符分块 base64 发（`tools/capture/vt.sh`）。
 - `iwconfig` 在刚重启或已关闭的接口上读回的 SSID 不可靠；短时间连续重配 2.4G 会掉到隐藏默认 SSID。
 - 测试路由器没有授时，时钟可能差十几个小时：定时窗口按路由器 `date -u` 算。
+- **`ZTE_DB_ENGINE fail=not-launched-by-sandbox` 是正常的**：`db-engine-probe` 只接受 `ns-run` 的启动方式。同一族里
+  `fail=namespace-not-empty` 是在共享 IPC 命名空间里跑、原厂库里有残留段，也只能用沙箱。
+- **`ZTE_DB_SANDBOX error=private-service-network errno=2`**：`ns-run` 要求 `/sys/module/veth` 存在，`modprobe veth` 即好。
 - **装包后服务起不来，先看是不是缺模拟器**：日志里 `execv errno=8` 几乎总是这个（`ENOEXEC`，内核拒绝执行 ARM32 ELF），
-  不是代码退化。确认顺序：`uname -m` → 私有根里有没有 `qemu-arm-static` → [LAB.md](LAB.md) 第 4.2 节。
+  不是代码退化。确认顺序：`uname -m` → 私有根里有没有 `qemu-arm-static` → 本文第 11.2 节（为什么不在包里、三条出路）。
 
 ## 7. 改了控制器代码之后的检查
 
-1. 本机提交 → 构建机编改动的产物（零警告，`ubuntu` 上 `sh tools/lab/build.sh all database`）→ `test-host` 通过 → `runtime.sh svctest`。
+1. 本机提交 → 构建机编改动的产物（零警告，`ubuntu` 上 `make ARMCC=arm-linux-gnueabi-gcc ROUTERCC=aarch64-linux-gnu-gcc all database`，
+   加第 2 节那两个 `-U`）→ `test-host` 通过 → `runtime.sh svctest`。
 2. 测试环境：`tools/dev/dev-service-smoke.py --no-attach`；涉及配置解析的跑 `tools/dev/dev-config-check.py`；涉及调度的跑 `tools/dev/dev-sched-check.py`。
 3. 中兴原厂路由器（需要时）：`childread.sh` 基线 → `mreplay.py` → 看 `state.json` 节点 `model:"ZXHN Z506"`、`zte:true`、
    `online:true` → `childread.sh` 读回。
@@ -170,7 +191,7 @@ make package/feeds/zte_mesh/zte-mesh/compile \
   就得在自己的 Makefile 里给别的值。两边都成了 `all` 之后这句话不再逼着什么：启动器**不是"给不了两个架构"，而是把三个架构都装进一个包**——
   `arch/<cpu>/{ns-run,mesh-search}` 各一份 `-static` 构建，外层那两个名字是同一份 shell 入口（按 `$0` 选程序、按 `uname -m` 选目录）。
   拆开唯一多出来的是两次事务：升级时先换 `zte-mesh` 还是先换 launcher，中间那几秒服务已按新脚本重启过一次。打包细节与那张映射表在
-  [LAB](LAB.md) 第 4.3 节，脚本是仓库根的 `tools/build/launcher-arches.sh`（`zte-mesh` 的 `Build/Compile` 调用它，`ZTE_MESH_LAUNCHER_BUILD=` 可指路）。
+  本文第 11.3 节，脚本是 `tools/build/launcher-arches.sh`（`zte-mesh` 的 `Build/Compile` 调用它，`ZTE_MESH_LAUNCHER_BUILD=` 可指路）。
   `Build/Compile` 这一行不能省：数据包不写它，OpenWrt 会在只有 tarball 的构建目录里跑 `$(MAKE)`，报 `No targets specified and no makefile found`。
 - **`src-link` 与 `src-git` 对启动器构建脚本的可见性不一样**：`src-link zte_mesh <克隆>/openwrt` 时包目录是指向克隆的符号链接，
   `$(CURDIR)/../../tools/build/launcher-arches.sh` 就落在克隆根上（CI 用的正是这一种，`.github/workflows/build-apk.yml` 的 Install feeds 一步）；
@@ -190,7 +211,7 @@ make package/feeds/zte_mesh/zte-mesh/compile \
   四个包都编好了（那时 launcher 还是单独一个包），步骤红在第 2 秒且日志是空的。**读包这一步现在单独成步，排在 `Upload packages` 之后**——判定的工具坏了只红一次运行，不连累一批能装的包。
 - **包里没有 ARM32 模拟器**（2026-10-31 定）：x86_64 设备和没开 `CONFIG_COMPAT` 的 arm64 设备必须自己准备 `qemu-arm-static`——
   放进私有根，或把 `zte_mesh.main.emulator` 指到**这台机器上的任意绝对路径**（init 比 sha256 后拷进私有根的 `usr/bin/`，2026-11-05 起），
-  否则 controller 实例每 5 秒以 `execv errno=8` 退出。理由与三条出路见 [LAB.md](LAB.md) 第 4.2 节。
+  否则 controller 实例每 5 秒以 `execv errno=8` 退出。理由与三条出路见本文第 11.2 节。
 
 **CI 全部手动触发**（`workflow_dispatch`），push 和 PR 都不会自动跑构建：
 
@@ -302,7 +323,7 @@ gh release create v0.1.0-r23 dist/*.apk dist/SHA256SUMS.txt
 | 内容有改动才写文件 | 只在确实有改动时写入 | 只写真变化 |
 | 一台真实的设备 | **OpenWrt 路由器** 或 **中兴原厂路由器**（按实际那台写）；泛指"得上真实路由器才能验"写 **上机** | 真机、真子路由、真中兴主控 |
 | 机器与环境 | 测试主机、测试环境、测试机 | 实验台、实验室、实验机 |
-| 那台 ImmortalWrt 虚拟机 | 「ImmortalWrt 虚拟机」（`owrt` 只是 `rssh.py` 的别名） | 把 `owrt` 当成系统名 |
+| 那台 ImmortalWrt 虚拟机 | 「ImmortalWrt 虚拟机」（`owrt` 只是第 1 节那张表里的别名） | 把 `owrt` 当成系统名 |
 | 机型 | `ZXHN Z506`（又叫中兴小方糖）、`ZXSLC SR1010`（又叫中兴星云 MAX）、小米 AX3600 | "中兴 Z506"、第一次出现只写 `Z506` / `SR1010` |
 | 跑一份故意做坏的代码，证明判据会红 | 对照组（"对照组跑 HEAD 的 init"） | 反面、反面跑 |
 | 一条判据给不给结论 | 判定、下结论、不作判定 | 判决、弃权 |
@@ -359,11 +380,11 @@ python tests/test_i18n.py        # 12 项：覆盖率、格式符、菜单标题
 手工装到运行中的设备（测试环境里的路由器是拷文件而不是装包）：
 
 ```sh
-python tools/lab/po2lmo.py openwrt/luci-app-zte-mesh/po/zh_Hans/zte-mesh.po /tmp/zte-mesh.zh-cn.lmo
+python tools/build/po2lmo.py openwrt/luci-app-zte-mesh/po/zh_Hans/zte-mesh.po /tmp/zte-mesh.zh-cn.lmo
 cp /tmp/zte-mesh.zh-cn.lmo /usr/lib/lua/luci/i18n/     # 不需要重启服务，刷新页面即可（Ctrl+Shift+R 绕过缓存）
 ```
 
-`tools/lab/po2lmo.py` 不是另写一套格式：按 `modules/luci-base/src/po2lmo.c` 与 `lib/lmo.c` 实现（字符串块 + 16 字节索引 +
+`tools/build/po2lmo.py` 不是另写一套格式：按 `modules/luci-base/src/po2lmo.c` 与 `lib/lmo.c` 实现（字符串块 + 16 字节索引 +
 结尾块长度，键用 SuperFastHash 且以长度作种子），只用来给没有构建机的设备补装；真正的包仍由构建树的 `po2lmo` 生成。
 
 语言怎么选：LuCI「系统 → 语言和界面」里选简体中文（写进 `luci.main.lang`），或保持 `auto` 让 `Accept-Language` 决定。
@@ -377,7 +398,7 @@ cp /tmp/zte-mesh.zh-cn.lmo /usr/lib/lua/luci/i18n/     # 不需要重启服务�
 | 文件 | 是什么 | 谁用 |
 |---|---|---|
 | `db-engine-probe` | ARM32、`-nostdlib` 链原厂 glibc 2.26 的沙箱宿主程序 | **打包进 apk 的那一步**：`repack-runtime.py --replace` 把它塞进 `zte-mesh-runtime.tar.gz` 的 `root/bin/`，随 apk 分发 |
-| `ns-run-x86_64` / `ns-run-aarch64` | 两份宿主架构的沙箱启动器 | 测试主机自己取一份用；设备跑的那两种架构由包里各带一份（[LAB](LAB.md) 第 4.3 节） |
+| `ns-run-x86_64` / `ns-run-aarch64` | 两份宿主架构的沙箱启动器 | 测试主机自己取一份用；设备跑的那两种架构由包里各带一份（本文第 11.3 节） |
 | `libzte_mesh_shim.so` / `libzte_agent_mm.so` | ARM32 的原厂符号 shim | 测试主机上挂给 probe 用 |
 | `*.sha256`、`*-build.log` | 校验和与构建日志 | 追溯（构建失败也发布日志，这是无 token 时读失败日志的唯一通道） |
 
@@ -396,3 +417,119 @@ cp /tmp/zte-mesh.zh-cn.lmo /usr/lib/lua/luci/i18n/     # 不需要重启服务�
 `raw.githubusercontent.com/<owner>/<repo>/lab-tools/prebuilt/<file>` 直链 `wget`，二是那个 workflow 每次触发都把产物
 提交回分支，不能落在 `main` 上。现在产物只走 artifact、设备用的启动器在包里，两个前提都没了；当时换来的代价是 `main`
 落后 47 个提交、apk CI 一直编旧代码，这种双分支别再重建。下次需要"只有某台机器用"的产物，先问它能不能现编。
+
+## 11. ARM32 模拟器与仿真开关
+
+下面几处差异都由仿真环境导致，不是代码退化：
+
+| 差异 | 为什么 | 在哪里 |
+|---|---|---|
+| `-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0` | Ubuntu 的 gcc 默认定义它，把 `controller-profile.c:64` 忽略 `write()` 返回值变成 `-Werror` 错误（Debian 不会）；也避免 `memcpy` 走 `__memcpy_chk` | `tools/build/launcher-arches.sh` 的 `FLAGS` 里写死了，`build-lab-tools.yml` 容器里那次编译也带上；`ubuntu` 那台直接 `make` 要自己加（第 2 节） |
+| `ROUTERCC=cc` | `ns-run`、`exec-check`、`config-bridge-probe` 是 AArch64 静态程序，x86 上跑不了。**打包前必须用 aarch64 重编** | 命令行参数 |
+| `ZTE_MESH_EMULATED_LAB=1` | 见下两条 | `ns-run.c`、`shim.c` |
+| `shim.c` 的 `shmat` 重试 | qemu 的 `shmat()` 对**固定地址**一律返 `EINVAL`（`NULL` 可以、`fixed|SHM_REMAP` 可以、`fixed` 不行）。原厂数据库把段挂在 `0x60000000` 并直接解引用返回值 → 段错误。预载库在 `EINVAL` 时补一次 `SHM_REMAP` | `shim.c` |
+
+两条代码改动都只在 `ZTE_MESH_EMULATED_LAB` 存在时生效，真实路由器上的路径不受影响：`ns-run.c` 放开 `RLIMIT_AS`（qemu 要预留整个
+32 位客户机地址空间 + 翻译缓冲，128 MB 上限必然失败）并把它传给 guest；`shim.c` 在 `shmat` 失败且 `errno == EINVAL` 时带
+`SHM_REMAP` 重试一次。两者都不改变权限模型（`ns-run` 本来就要 root 才走到这里）。
+
+### 11.1 装在设备上时这两个开关由 init 决定
+
+不需要手工 export：`start_service()` 先看 `uname -m`，arm64 上再判断内核能否原生跑 ARM32；只有确实跑不了、
+且私有根里存在 `qemu-arm-static` 时才把这两个变量传给 `ns-run`。`zte_mesh.main.emulator` 可指定路径——**私有根内的
+相对/绝对路径，或这台机器上的绝对路径**（后者由 init 比 sha256 后拷进私有根的 `usr/bin/`，见第 11.2 节），
+`=none` 强制走原生（刷过 `CONFIG_COMPAT=y` 固件之后就是这个状态）。
+
+同一处还问一句启动器：`$NSRUN --launcher-check`，答 127 就不把实例交给 procd。理由与那句拒绝见第 11.3 节。
+
+同一处还有 `zte_mesh.main.al_last`：AL MAC 的末字节（页面"控制器地址末字节"，两位十六进制），默认取 LAN 网桥 MAC 的末字节
+（`02:00:00:00:19:XX`）；写错格式会记一行日志并改用派生值。两台设备**必须**不同，否则 1905 栈会把对端当自己
+（[AGENT_PROBE](research/AGENT_PROBE.md) 第 12 节）。
+
+### 11.2 ARM32 模拟器（`qemu-arm-static`）**不入包**
+
+`zte-mesh` 不装它、也不自动下载安装（启动器并进这个包之前，单独的 `zte-mesh-launcher` 同样不装）。包里只有原厂 ARM32
+运行环境和按 CPU 编出来的启动器；服务能不能起来，取决于设备内核能不能直接跑 ARM32。**这是有意的取舍，不是漏装。**
+
+| 不进包的理由 | 说明 |
+|---|---|
+| OpenWrt 不编它 | feed 里没有 `qemu-user`。打进包就得塞一个预编译第三方静态二进制——二进制再分发，许可与安全维护要另处理 |
+| 必须与**宿主**架构匹配 | aarch64 设备要 arm64 版，x86_64 设备要 amd64 版，而 `zte-mesh` 是 `arch: all`。这一条启动器用"一个 apk 带三份构建 + 入口脚本按 `uname -m` 选"解决过（第 11.3 节）；qemu 不跟着学，是因为下面两条 |
+| 体积不划算 | 静态 qemu-arm 约 11 MB，比整个运行环境包还大；目标设备根本用不到 |
+| 只有一处真的需要 | 只有 chroot 里的 `db-engine-probe` 是原厂 ARM32。`ns-run` / `mesh-search` 是按这台机器的 CPU 编的那一份，本来就与模拟器无关 |
+
+init 怎么判定（`zte-mesh.init` 的 `emulator` 段）：
+
+| 情况 | 判定 | 结果 |
+|---|---|---|
+| `aarch64` / `arm64` | 先读 `/proc/config.gz`（退化 `/proc/config`）的 `CONFIG_COMPAT=y`；**读不到就直接 exec 一次 `$ROOT/lib/ld-linux.so.3`**，能打印自己的 usage（匹配 `*sage:*`）就认定支持 | 支持 → 原生跑 |
+| `x86_64` 及其他 | 一律不可能原生 | **必须**有模拟器 |
+| 任意 | `zte_mesh.main.emulator=<路径>` | 跳过探测，用指定路径。**两种写法都行**：私有根内的（相对，或带 `$ROOT` 前缀的绝对路径）就地用；这台机器上的绝对路径由 init 比 sha256 后拷进私有根的 `usr/bin/<basename>`，相同就不拷，拷不进去则不起服务并说明原因——模拟器在 chroot **之后**才被 exec，沙箱看不见的文件等于没有 |
+| 任意 | `emulator=none` | 强制原生。只用于诊断，不是解决办法 |
+
+**"没有答案"不等于"不支持"**：多数固件（小米 AX3600 上的 ImmortalWrt 6.12.103 就是）不导出 `/proc/config.gz`，早期版本因此
+一律走上模拟器，而包里没有模拟器，服务就每 5 秒退一次。所以探测改成问内核，而不是猜。
+
+私有根默认 `/usr/lib/zte-mesh/root`（`ZTE_MESH_ROOT` 可改）。模拟器是在 chroot **之后**被 exec 的，必须放在私有根内部；
+init 依次找 `/usr/lib/zte-mesh/root/{,usr/bin/,bin/}qemu-arm-static` 三处。找不到会打一条完整说明（含宿主架构与三条出路），
+随后 `execv errno=8`（`ENOEXEC`）。**看到 `errno=8` 先按这一节处理，不要当成代码 bug。**
+
+三条出路，按推荐顺序：
+
+1. **刷带 `CONFIG_COMPAT=y` 的固件**——真实路由器上唯一干净的解法：arm64 内核开了 COMPAT 就能原生跑 ARM32，不需要模拟器，
+   `ZTE_MESH_EMULATED_LAB` 也不会被设置（少了两条仿真专用路径）。配置在 `.github/workflows/build-firmware.yml`
+   （qualcommax/ipq807x 目标，CI 自己编内核，因为 ImageBuilder 改不了内核选项）。
+2. **手工放一个模拟器**——测试环境和临时验证用，取**与设备同架构**的那一份。取哪一个 deb、"较新的发行版里
+   `qemu-arm-static` 只剩一个符号链接"这个坑，以及放好后的确认命令，都写在 [README](../README.md) 的
+   「qemu-arm-static 安装指南」（2026-11-06 逐个下载量过），这里不维护第二份步骤。这份文件不在任何仓库里，也不随包分发。
+3. **`emulator=none`**——确认"这块板子到底能不能原生跑"，不是解决办法。
+
+这台机器上装的 `qemu-user-static` + `binfmt-support` 只方便**在沙箱外**直接跑 ARM 程序；服务是 chroot 后 exec，即便 binfmt
+带 `F` 标志能跨 chroot 生效，解释器文件仍须在根内可见。
+
+### 11.3 启动器与 CPU：一个 apk 带三份构建，入口脚本按 `uname -m` 选
+
+启动器和运行环境在同一个包里：`zte-mesh` 是 `PKGARCH:=all`（2026-11-05 之前它是单独的 `zte-mesh-launcher`，两部分各一个 apk）。
+`package-pack.mk` 一个 Makefile 只读一个 `PKGARCH` 写进 `Architecture:`，而 ELF 只认一种机器，所以包里的做法是**按 CPU 各放一份**：
+
+```
+/usr/libexec/zte-mesh/ns-run          # 入口脚本（同一份文件装成两个名字）
+/usr/libexec/zte-mesh/mesh-search     #   —— $0 的最后一截决定跑哪个程序
+/usr/libexec/zte-mesh/arch/aarch64/{ns-run,mesh-search}
+/usr/libexec/zte-mesh/arch/armv7/{ns-run,mesh-search}
+/usr/libexec/zte-mesh/arch/x86_64/{ns-run,mesh-search}
+```
+
+`uname -m` 决定进哪个目录（`arm64`→`aarch64`、`armv7l`→`armv7`），选中就 `exec`——换程序不换 pid，procd 盯的就是那个 pid，
+`attach` 的 `sandbox_pid()` 也还在 `/proc/*/cmdline` 里 grep 它。
+
+**代价是装机时不再挑机器**：以前的 `DEPENDS:=@(TARGET_zte||TARGET_qualcommax)` 会在 `apk add` 上失败（apk 求解全有或全无，
+一台不匹配的机器会让同一条命令里的其他包一起装不上），现在什么机器都收，那句拒绝改由入口脚本在运行时说清——报本机
+`uname -m` 与包里带的几种架构，`exit 127`。`zte-mesh.init` 在把实例交给 procd 之前先问一次 `--launcher-check`，否则
+`respawn 3600 5 0` 会每 5 秒重开一个 127，而日志里从头到尾不出现"架构"两个字。**问的就是装机要跑的同一份代码**：
+CPU→目录那张映射表不在 init 里抄第二份，读回与人手工跑看到的是同一句第一行。**只有 127 才是"这种架构不在包里"**：
+其余非零（例如 `/usr/libexec/zte-mesh/ns-run` 站着的是合并前手工放的旧 ELF，它不认识这个参数、只打 usage 并回 64）
+由 init 另记一行 `--launcher-check exited <码>`，不冒充架构判定。
+
+构建侧：`tools/build/launcher-arches.sh SRC OUT` 每种架构一次 `-static`（第 8 节；`zte-mesh` 的 `Build/Compile` 从运行包里
+解出三个 `.c` 再调它）。`$(TARGET_CC)` 只保本目标那种架构，脚本用 `-dumpmachine` 认它属于哪个目录名——不认 `ARCH_PACKAGES`
+这类内部变量，因为目录名必须和产出它的那台编译器一致。其余两种架构要这台机器的交叉编译器（CI 那一步装
+`gcc-aarch64-linux-gnu` + `gcc-arm-linux-gnueabihf`；`ubuntu` 那台两种都有，见第 1 节）。可用的环境变量：`ZTE_MESH_ARCHES`
+（编哪几种架构）、`ZTE_MESH_REQUIRE_ARCHES`（缺了哪种架构就报错；CI 设成三种架构全要，于是"少编一种架构"从绿日志里的一行
+变成红）、`ZTE_MESH_CC_<档>`（指定编译器）。armv7 先试 hard-float、退一步用 soft-float。
+
+**每份都是 `-static`，调用方拿不掉**：apk 装到哪台机器都不保证那台的 libc 与编译器同一个 release——编译机用 glibc、
+目标机是 musl 时，动态链接的 ELF 找不到 `/lib64/ld-linux-x86-64.so.2` 那类解释器，`execve` 返回 `ENOENT`，shell 只报一句
+`not found`，看起来像路径或权限问题。静态二进制自带 libc，浮点 ABI 于是也不是运行时的事（armv7 那条退路的依据）。
+
+测试环境上这三条各判什么：
+
+| 要做的 | 命令 | 看什么 |
+|---|---|---|
+| 这台机器的 CPU 在不在包里 | `/usr/libexec/zte-mesh/ns-run --launcher-check` | 退出码 0 且打印 `…/arch/<这种架构>/ns-run`；非 0 时那一句会带上 `carries:` 后面包里的目录名 |
+| 包里的哪几种架构 | `ls /usr/libexec/zte-mesh/arch/` | feed 构建树里只带目标机那种架构，属正常；CI 出的 apk 三个目录都在 |
+| 这种架构不在包里，非要这台跑 | 在这台机器上现编一份：`sh tools/build/launcher-arches.sh src /tmp/la`（`ZTE_MESH_ARCHES` 只留本机那档，x86_64 会退到本机 `cc`） | 拿到 `/tmp/la/<cpu>/{ns-run,mesh-search}` 后放进 `/usr/libexec/zte-mesh/arch/<cpu>/`——**放到外层那两个名字没用**：那两个名字属于包，`apk add` 会重写，而入口只往 `arch/` 下面找（`apk info -L zte-mesh` 判"入口归谁"） |
+
+**armv7 那种架构目前没有测试机**（三台测试环境的 CPU 是 aarch64 / x86_64 / x86_64，中兴原厂路由器不吃 apk），所以那种架构
+只有编译与打包级的证据，运行时读回来的是 [PLAN](PLAN.md) 的 H-16。`ax3600` 跑沙箱要靠私有根里那份 `qemu-arm-static`——
+那是 ARM32 用户态的事，与 `arch/aarch64/` 这两个二进制无关（它们本来就是 aarch64 机器码）。

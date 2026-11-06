@@ -88,7 +88,7 @@
 
 `qemu-arm-static` **不随包分发**（有意的取舍），放哪都行，`zte_mesh.main.emulator` 指过去即可。
 装它的完整步骤在下面的「qemu-arm-static 安装指南」，判定细节与三条出路的原始记录在
-[LAB](docs/LAB.md) 第 4.2 节。
+[DEVELOPMENT](docs/DEVELOPMENT.md) 第 11.2 节。
 
 ## 测试情况
 
@@ -135,8 +135,8 @@ python tests/test_i18n.py                      # 改了界面文案必须跑
 ### 装机验收（在设备上）
 
 ```sh
-sh tools/lab/verify-install.sh /tmp/zte-apk    # 真装包、真重启服务
-sh tools/lab/verify-install.sh                 # 只读不装
+sh tools/dev/verify-install.sh /tmp/zte-apk    # 真装包、真重启服务
+sh tools/dev/verify-install.sh                 # 只读不装
 ```
 
 它打印一串 `KEY=VALUE` 证据行和最后一行 `RESULT=PASS|FAIL`：版本串、三条启动器断言、这批的包内脚本标记、
@@ -172,8 +172,8 @@ sh tools/lab/verify-install.sh                 # 只读不装
 
 ```sh
 # 装：把三个 apk 放到机器上，一条命令装完 + 读回 + 冒烟
-sh tools/lab/verify-install.sh /tmp/zte-apk        # 会真装包、真重启服务
-sh tools/lab/verify-install.sh                     # 只读检查，不装不重启
+sh tools/dev/verify-install.sh /tmp/zte-apk        # 会真装包、真重启服务
+sh tools/dev/verify-install.sh                     # 只读检查，不装不重启
 ```
 
 LuCI → 网络 → **ZTE Mesh**。「常规」里选设备角色，「Wi-Fi 配置」填 2.4G 名称与密码（只有本机也发 Wi-Fi 时才用到）。
@@ -184,7 +184,7 @@ LuCI → 网络 → **ZTE Mesh**。「常规」里选设备角色，「Wi-Fi 配
 
 原厂控制器是 **32 位 ARM** 的程序。这台机器的内核不能直接执行它时，服务用它跑的是一份 `qemu-arm-static`
 （用户态模拟器，不是虚拟机）。**包里不带它，也不会自动下载**——这是有意的取舍，理由见
-[LAB](docs/LAB.md) 第 4.2 节。
+[DEVELOPMENT](docs/DEVELOPMENT.md) 第 11.2 节。
 
 **先判断这台到底要不要装**：
 
@@ -284,7 +284,7 @@ python3 tests/test_i18n.py                           # 改了界面文案必须�
 
 C 侧在 2026-11-04 挪进了 `src/`：`Makefile` 逐文件列源、`tests/*.c` 的 `../` 包含前缀、`.def`/`.inc` 的同目录包含
 都要跟着改，一共动了 74 个跟踪文件（51 个挪、23 个改）；随包分发的 `ns-run.c`/`controller-net.c` 用的是 tar 成员名，成员名一个没动。
-Python 同日挪进 `tools/dev/`：`tests/`、`openwrt/make-runtime.py`、`tools/lab/` 按模块名 import 它们，改的是同一批
+Python 同日挪进 `tools/dev/`：`tests/`、`openwrt/make-runtime.py`、`tools/lab/`（当时还在）按模块名 import 它们，改的是同一批
 `sys.path.insert` 加上 `build.sh`／`Makefile` 的调用路径；根目录只剩构建入口。
 
 ## 文档
@@ -296,10 +296,10 @@ Python 同日挪进 `tools/dev/`：`tests/`、`openwrt/make-runtime.py`、`tools
 | [FEATURE_STATUS](docs/FEATURE_STATUS.md) | **功能总账**：逐项状态与判据 |
 | [PLAN](docs/PLAN.md) | **唯一排期**：分批做什么、主机可测与需上机分开、上机清单 H-01…H-17 |
 | [INSTALL](docs/INSTALL.md) | 用户手册：装包、页面、三种拓扑、验收、卸载 |
-| [DEVELOPMENT](docs/DEVELOPMENT.md) | 构建、打包、测试基线、上机守则与 `prebuilt/` 的取法 |
+| [DEVELOPMENT](docs/DEVELOPMENT.md) | 三台测试机清单、构建、打包、测试基线、上机守则、ARM32 模拟器判定与 `prebuilt/` 的取法 |
 
 **原理与接口，改代码前读**：[ARCHITECTURE](docs/ARCHITECTURE.md)（结构与源文件职责、固件哈希）、
-[SERVICE](docs/SERVICE.md)（UCI/LuCI/CM 映射与热更新）、[LAB](docs/LAB.md)（测试机清单、ARM32 模拟器判定）、
+[SERVICE](docs/SERVICE.md)（UCI/LuCI/CM 映射与热更新）、
 [REAL_CHILD](docs/REAL_CHILD.md)（中兴原厂路由器的配置语法、基线与红线）。
 
 **只读资料，不再随结论更新**：[docs/research/](docs/research/)（原厂逆向与上机取证：功能映射与差距、重放计划与结果、

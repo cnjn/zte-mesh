@@ -36,7 +36,7 @@ def text(path):
 SOURCES = {
     "ns-run.c": REPO / "src" / "ns-run.c",
     "controller-net.c": REPO / "src" / "controller-net.c",
-    "enroller.c": REPO / "tools/lab/enroller.c",
+    "enroller.c": REPO / "src" / "enroller.c",
 }
 
 failures = []

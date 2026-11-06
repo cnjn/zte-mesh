@@ -12,8 +12,7 @@
 
 并入 [ARCHITECTURE](ARCHITECTURE.md) 第 1 到 3 节：原理与"服务自己构造的唯一一类 1905 报文是信道选择请求（CMDU `0x8006`）"在
 第 1 节，私有 netns、原厂共享内存数据库（表结构从 `cspd` 的建表函数还原）、不启动 `cspd` 在第 2 节，CM 替身只替换
-`CmWLANGetAPConfig`、`CmWLANGetPsk` 与那 43 个字段偏移、表结构与写表逻辑的源文件职责在第 3 节（2496 字节 CM 输出的核对命令见
-[LAB](LAB.md)；替身只接受 WPA2-PSK + AES、要求 `ZTE_MESH_DB_SANDBOX=1`、其余 CM 调用走原厂真库见
+`CmWLANGetAPConfig`、`CmWLANGetPsk` 与那 43 个字段偏移、表结构与写表逻辑的源文件职责在第 3 节（2496 字节 CM 输出的核对命令在 Makefile 的 `controller` 目标里；替身只接受 WPA2-PSK + AES、要求 `ZTE_MESH_DB_SANDBOX=1`、其余 CM 调用走原厂真库见
 `EARLY_ACCEPTANCE` 的 B.3.1 节，那份验收记录不随这一支）。
 
 ## 2. 两份固件不是同一个构建

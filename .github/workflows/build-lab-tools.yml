@@ -170,7 +170,7 @@ jobs:
                      gcc-arm-linux-gnueabi libc6-dev-armel-cross make python3 >/dev/null &&
                    arm-linux-gnueabi-gcc --version | head -1 &&
                    ldd --version | head -1 &&
-                   python3 tools/lab/bootstrap-out.py &&
+                   python3 tools/build/bootstrap-out.py &&
                    make out/db-engine-probe ARTIFACTS=out \
                      ARMCC="arm-linux-gnueabi-gcc -D_TIME_BITS=32"' >>"$LOG" 2>&1
           rc=$?

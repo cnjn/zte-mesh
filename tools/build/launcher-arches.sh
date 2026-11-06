@@ -29,8 +29,8 @@
 #       the full list, so a one-architecture apk cannot be published quietly.
 #
 # Every binary is built -static on purpose: the packaged launcher has to run whatever libc is on the
-# machine (docs/LAB.md section 7 tells what a dynamic binary costs when the image's musl is a different
-# release than the toolchain's), and a host cross build has no target rootfs to link against anyway.
+# machine (docs/DEVELOPMENT.md section 11.3 tells what a dynamic binary costs when the image's musl is a
+# different release than the toolchain's), and a host cross build has no target rootfs to link against anyway.
 # -U_FORTIFY_SOURCE is there because Ubuntu's gcc predefines it, and with -static an unchecked write()
 # return in controller-net.c becomes a fortify warning the build should not have to explain.
 

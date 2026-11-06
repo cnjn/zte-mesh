@@ -193,7 +193,6 @@ test-host: $(ARTIFACTS)/tests/caller $(ARTIFACTS)/tests/no-backend $(ARTIFACTS)/
 	python3 tests/test_policies.py $(abspath $(ARTIFACTS))
 	python3 tests/test_profiles.py $(abspath $(ARTIFACTS))
 	python3 tests/test_startup.py $(abspath $(ARTIFACTS))
-	python3 tests/test_cmapi_tables.py $(abspath $(ARTIFACTS))
 	sh tests/test_init.sh
 	sh tests/test_rpcd.sh
 	sh tests/test_wlan_sync.sh

@@ -11,8 +11,8 @@
 # old DEPENDS:=@(TARGET_zte||TARGET_qualcommax) gate used to fail `apk add` on a machine that could not run
 # the sandbox, and an arch:all package installs everywhere by definition. So the check lives here, where it
 # can name the machine it is standing on, and zte-mesh.init asks the same question before it starts an
-# instance (otherwise procd respawns a 127 every five seconds, which is the failure docs/LAB.md describes
-# for a missing emulator).
+# instance (otherwise procd respawns a 127 every five seconds, which is the failure docs/DEVELOPMENT.md
+# section 11 describes for a missing emulator).
 #
 # Nothing is downloaded and nothing is guessed: when this CPU is not in the package, say which ones are.
 
@@ -48,7 +48,7 @@ if [ -e "$bin" ]; then
 	printf 'zte-mesh %s: %s is not runnable on this machine (uname -m says %s)\n' "$name" "$bin" "$machine" >&2
 	[ "$1" = --launcher-check ] && exit 127
 	printf 'The file is there and cannot be run: check its mode (the package installs 755) and what this machine\n' >&2
-	printf 'needs to run it -- tools/lab/build-launcher.sh builds one for the CPU it is standing on.\n' >&2
+	printf 'needs to run it -- the launcher has to be built for the CPU it is standing on.\n' >&2
 	exit 127
 fi
 
@@ -67,6 +67,6 @@ printf 'zte-mesh %s: no build for this machine (uname -m says %s). The launcher 
 [ "$1" = --launcher-check ] && exit 127
 
 printf 'An ELF runs only on the architecture it was compiled for, so nothing in this package runs on it: either\n' >&2
-printf 'build the launcher on the machine itself (tools/lab/build-launcher.sh does exactly that) or start the\n' >&2
-printf 'service on one of the architectures named above.\n' >&2
+printf 'build the launcher on the machine itself, or start the service on one of the architectures\n' >&2
+printf 'named above.\n' >&2
 exit 127

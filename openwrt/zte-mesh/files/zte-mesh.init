@@ -944,10 +944,10 @@ start_service() {
 				[ -x "$candidate" ] && { emulator=${candidate#"$ROOT"}; break; }
 			done
 			# No package ships one (OpenWrt does not build qemu-user, and it would have to match
-			# this board anyway), so this is a lab-only affordance. Say exactly what is missing
-			# instead of letting the sandbox fail later with a bare "execv errno=8". Leaving it
-			# out of the package is deliberate; docs/LAB.md section 4.2 explains why and lists the
-			# three ways out of it.
+			# this board anyway), so this is a test-host-only affordance. Say exactly what is
+			# missing instead of letting the sandbox fail later with a bare "execv errno=8".
+			# Leaving it out of the package is deliberate; docs/DEVELOPMENT.md section 11 explains
+			# why and lists the three ways out of it.
 			[ -z "$emulator" ] && log "this kernel cannot run the 32-bit ARM daemon and no qemu-arm-static was found in $ROOT: put one there (it must be built for $(uname -m), and it must sit inside the private root because it is exec'd after the chroot), or install a firmware built with CONFIG_COMPAT=y, or set zte_mesh.main.emulator=none to force the native path"
 		fi
 	else

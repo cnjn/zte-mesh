@@ -199,7 +199,7 @@ on_machine mips64
 check "the check fails on an uncarried machine" "127" "$?"
 
 # The answer has to be the sentence a person running the program would read, not a shorter one written for the
-# check: zte-mesh.init logs it and tools/lab/verify-install.sh prints its first line as evidence, so an answer
+# check: zte-mesh.init logs it and tools/dev/verify-install.sh prints its first line as evidence, so an answer
 # that only said "not runnable" would leave whoever reads it guessing which CPUs this apk holds.
 out=$("$LIB/ns-run" --launcher-check 2>&1)
 check "the check names the machine it is standing on" \

@@ -14,7 +14,7 @@
  * answered from, so --al-mac defaults to the controller's AL MAC: the sandbox
  * controller receives the M1 and runs the real M2.
  *
- * Wire format as the factory daemon writes it (measured, tools/lab/README.md):
+ * Wire format as the factory daemon writes it (measured, docs/research/AGENT_PROBE.md section 13):
  *   8-byte CMDU header  (version, reserved, type BE, id BE, fragment, flags)
  *   TLVs from offset 8  (1-byte type, 2-byte BE length, value)
  *

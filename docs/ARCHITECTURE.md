@@ -135,7 +135,7 @@ zx279133/vendor-reference/2b5/rootfs.jffs2
   **换掉的还有装机时的架构判定**：以前那句 `DEPENDS:=@(TARGET_zte||TARGET_qualcommax)` 在一台不匹配的
   机器上会让整串 `apk add` 一起失败（apk 求解全有或全无），现在什么机器都收，"这台不在包里"由入口脚本自己说，
   `zte-mesh.init` 在把实例交给 procd 之前问一次 `--launcher-check`——**只有 127 算这一问的答案**，其余非零另说一行。
-  布局、映射表与构建脚本见 [LAB](LAB.md) 第 4.3 节。
+  布局、映射表与构建脚本见 [DEVELOPMENT](DEVELOPMENT.md) 第 11.3 节。
 - 内核要 `CONFIG_COMPAT`（AArch32 用户态）、SysV IPC（原厂数据库是 SysV 共享内存）与 raw socket（`CONFIG_PACKET`，
   1905 帧由 `multiapd` 在用户态自己收）。这三条原来是根目录那份 `kernel.fragment`，零引用、没被任何构建吃过，删掉并把话写在这里。
 - 私有根里保留原厂 loader 和 glibc，不碰 OpenWrt 的 `/lib`；原厂进程看不到 MTD、厂商设备和宿主配置。

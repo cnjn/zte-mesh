@@ -12,7 +12,7 @@ __pycache__/
 *.pcap
 /dist/
 
-# local lab credentials and machine-local notes: never commit (docs/LAB.md 2.1 has the ledger, .local/lab-env.md the passwords)
+# local lab credentials and machine-local notes: never commit (docs/DEVELOPMENT.md section 1 has the ledger, .local/lab-env.md the passwords)
 /.local/
 
 # ARM32 host tools built by build-lab-tools.yml: published as the lab-tools artifact and unpacked

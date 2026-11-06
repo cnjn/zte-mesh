@@ -19,9 +19,9 @@ hashes, so it is never mistaken for the audited bundle: `prepare.py` rejects it
 (its `verify_existing` compares the rootfs hash) and this script refuses to
 overwrite a manifest that does not carry that marker.
 
-    python3 tools/lab/bootstrap-out.py            # -> ./out
-    python3 tools/lab/bootstrap-out.py --force    # replace a previous synthetic out/
-    python3 tools/lab/bootstrap-out.py --out DIR
+    python3 tools/build/bootstrap-out.py            # -> ./out
+    python3 tools/build/bootstrap-out.py --force    # replace a previous synthetic out/
+    python3 tools/build/bootstrap-out.py --out DIR
 """
 
 from __future__ import annotations

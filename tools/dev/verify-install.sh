@@ -1,6 +1,6 @@
 #!/bin/sh
 # Install-and-verify one batch of zte-mesh packages on a lab machine (PLAN C10). Runs on the router under busybox
-# ash; drive it from the workspace with tools/lab/rssh.py. Output is a list of `KEY=VALUE` evidence lines and a final
+# ash; copy it to the router and run it there over ssh. Output is a list of `KEY=VALUE` evidence lines and a final
 # PASS/FAIL, so one run can be pasted into a review as proof and diffed against the next batch.
 #
 #   sh verify-install.sh                 # read the machine back and run the three smokes

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Host test for tools/lab/verify-install.sh without a router: the seven commands it reads through (ubus / apk / uci /
+# Host test for tools/dev/verify-install.sh without a router: the seven commands it reads through (ubus / apk / uci /
 # iw / ip / logread / date) are the same names the script takes from its own environment, so the stubs answer from
 # fixtures and the assertions are about what the script decided.
 # The one program it runs by installed path is the launcher entry script, and that one is the real
@@ -9,7 +9,7 @@
 # What this test guards is the judgement, not the router: which instance set a role implies, which keys of the status
 # document are read, what "nothing should have been written here" means on a controller that touches no radio. Those
 # are the parts that silently rot when the init or the status call changes.
-SCRIPT=${1:-$(dirname "$0")/../tools/lab/verify-install.sh}
+SCRIPT=${1:-$(dirname "$0")/../tools/dev/verify-install.sh}
 [ -f "$SCRIPT" ] || { echo "verify-install.sh not found: $SCRIPT" >&2; exit 1; }
 # the real entry script, not a stub of it: the read-back asks the launcher a question (--launcher-check), so the
 # suite that pins the answer pins the contract between the two files rather than two independent guesses.

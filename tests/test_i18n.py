@@ -17,7 +17,7 @@ import unittest
 from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SOURCE / 'tools/lab'))
+sys.path.insert(0, str(SOURCE / 'tools/build'))
 
 import po2lmo
 

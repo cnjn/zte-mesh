@@ -160,11 +160,12 @@ static void isolate(const char *root, char **command)
     }
     if (chdir(root) || chroot(".") || chdir("/"))
         fail("chroot");
-    /* A software-emulated run (qemu-user on x86_64, tools/lab/) cannot live inside
-     * the 128 MB address-space limit: the emulator reserves the 32-bit guest address
-     * space plus its own translation buffer, and a fixed-address shmat() needs the
-     * preload to add SHM_REMAP. Opt-in, and only for the lab launcher — the device
-     * never sets it, and it still requires root to reach this point.
+    /* A software-emulated run (qemu-user on x86_64, see docs/DEVELOPMENT.md
+     * section 11) cannot live inside the 128 MB address-space limit: the emulator
+     * reserves the 32-bit guest address space plus its own translation buffer, and
+     * a fixed-address shmat() needs the preload to add SHM_REMAP. Opt-in, and only
+     * for a host that runs the sandbox under emulation — the device never sets it,
+     * and it still requires root to reach this point.
      */
     emulated_lab = getenv("ZTE_MESH_EMULATED_LAB") != NULL;
     if (emulated_lab) {
