@@ -205,8 +205,10 @@ static int answer_add(struct ap_bss_metric *answers, unsigned int *count, const 
     return 1;
 }
 
-size_t agent_ap_metrics_answer(const uint8_t *frame, size_t bytes, uint8_t *reply, size_t capacity, uint8_t dest[6])
+size_t agent_ap_metrics_answer(const uint8_t *frame, size_t bytes, uint8_t *reply, size_t capacity,
+                               const uint8_t al[6], uint8_t dest[6])
 {
+    static const uint8_t broadcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
     struct ap_table_row rows[CONTROLLER_AP_BSS_MAX];
     struct ap_bss_metric answers[CONTROLLER_AP_BSS_MAX];
     struct ap_client_group groups[CONTROLLER_AP_BSS_MAX];
@@ -215,11 +217,13 @@ size_t agent_ap_metrics_answer(const uint8_t *frame, size_t bytes, uint8_t *repl
     struct cmdu_header header;
     time_t epoch, now;
     unsigned int listed, row_count, mac_count, k, j, answer_count = 0, group_count = 0;
-    if (!ap_metrics_query_decode(frame, bytes, &header, asked, &listed))
+    if (!al || !ap_metrics_query_decode(frame, bytes, &header, asked, &listed))
         return 0;
-    /* A query sent to a group address is not addressed to this node's AL MAC, and answering one would put that
-     * group address in the reply's source - the key the master files the counts under. */
-    if (frame[0] & 1)
+    /* Only a query addressed to this node's own AL MAC - or to everyone - is this node's question. A query to any
+     * other address, another router's AL or a group address, is answered by nobody here: the reply would either
+     * speak for a node that did not ask, or carry an address that is not this node's as its source, which is the key
+     * the master files the counts under. */
+    if (memcmp(frame, al, 6) && memcmp(frame, broadcast, 6))
         return 0;
     row_count = table_load(rows, CONTROLLER_AP_BSS_MAX, macs, CONTROLLER_CLIENTS_MAX, &mac_count, &epoch);
     if (!row_count)
@@ -275,7 +279,7 @@ size_t agent_ap_metrics_answer(const uint8_t *frame, size_t bytes, uint8_t *repl
                 group_count++;
         }
         memcpy(dest, frame + 6, 6);
-        return ap_metrics_response_build_clients(reply, capacity, dest, frame, header.message_id, answers,
+        return ap_metrics_response_build_clients(reply, capacity, dest, al, header.message_id, answers,
                                                  answer_count, groups, group_count,
                                                  (const uint8_t (*)[6])answer_macs, answer_macs_count);
     }

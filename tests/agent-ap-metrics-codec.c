@@ -28,6 +28,8 @@ static unsigned int checks;
 static const uint8_t master[6] = {2, 0, 0, 0, 0x19, 0x03};
 static const uint8_t child[6] = {2, 0, 0, 0, 0x19, 0xe3};
 static const uint8_t group[6] = {0x01, 0x80, 0xc2, 0x00, 0x00, 0x03};
+static const uint8_t broadcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+static const uint8_t stranger[6] = {2, 0, 0, 0, 0x19, 0xcd};
 static const uint8_t bss_2g[6] = {2, 0, 0, 0, 0x19, 0xb1};
 static const uint8_t bss_5g[6] = {2, 0, 0, 0, 0x19, 0xb2};
 static const uint8_t bss_other[6] = {2, 0, 0, 0, 0x19, 0xb9};
@@ -230,18 +232,18 @@ static void answers_the_table(void)
 
     /* A table that is not the collector's format answers nothing, and so does no table at all. */
     write_table("not a table at all\n");
-    CHECK(agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), dest) == 0);
+    CHECK(agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), child, dest) == 0);
     write_table("epoch=\nb 02:00:00:00:19:b1 7\n");
-    CHECK(agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), dest) == 0);
+    CHECK(agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), child, dest) == 0);
     CHECK(unlink(table) == 0);
-    CHECK(agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), dest) == 0);
+    CHECK(agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), child, dest) == 0);
 
     /* The BSSID the master named, with the count the collector measured on it. */
     counts[0] = 7;
     table_of(text, sizeof(text), 1, bss_2g, counts, 1);
     write_table(text);
     bytes = ask(frame, asked, 1);
-    used = agent_ap_metrics_answer(frame, bytes, reply, sizeof(reply), dest);
+    used = agent_ap_metrics_answer(frame, bytes, reply, sizeof(reply), child, dest);
     CHECK(used == 60);
     CHECK(!memcmp(dest, master, 6));
     CHECK(!memcmp(reply, master, 6) && !memcmp(reply + 6, child, 6));
@@ -254,10 +256,10 @@ static void answers_the_table(void)
      * from "nobody associated", and a zero would erase the difference. A query that names only unknown BSSes gets
      * the same silence the vendor agent produces. */
     memcpy(asked, bss_other, 6);
-    CHECK(agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), dest) == 0);
+    CHECK(agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), child, dest) == 0);
     memcpy(asked, bss_other, 6);
     memcpy(asked + 6, bss_2g, 6);
-    used = agent_ap_metrics_answer(frame, ask(frame, asked, 2), reply, sizeof(reply), dest);
+    used = agent_ap_metrics_answer(frame, ask(frame, asked, 2), reply, sizeof(reply), child, dest);
     CHECK(used == 60 && ap_metrics_by_bss(reply, used, out, CONTROLLER_AP_BSS_MAX) == 1);
     CHECK(!memcmp(out[0].bssid, bss_2g, 6));
 
@@ -265,11 +267,11 @@ static void answers_the_table(void)
      * those clients twice. */
     memcpy(asked, bss_2g, 6);
     memcpy(asked + 6, bss_2g, 6);
-    used = agent_ap_metrics_answer(frame, ask(frame, asked, 2), reply, sizeof(reply), dest);
+    used = agent_ap_metrics_answer(frame, ask(frame, asked, 2), reply, sizeof(reply), child, dest);
     CHECK(used == 60 && ap_metrics_by_bss(reply, used, out, CONTROLLER_AP_BSS_MAX) == 1);
 
     /* An empty list asks about every BSS this node runs. */
-    used = agent_ap_metrics_answer(frame, ask(frame, wide, 0), reply, sizeof(reply), dest);
+    used = agent_ap_metrics_answer(frame, ask(frame, wide, 0), reply, sizeof(reply), child, dest);
     CHECK(used == 60 && ap_metrics_by_bss(reply, used, out, CONTROLLER_AP_BSS_MAX) == 1);
 
     /* Two BSSes, two answers, in the order the query named them - and a BSS with nobody associated is a zero the
@@ -280,30 +282,30 @@ static void answers_the_table(void)
     write_table(text);
     memcpy(asked, bss_5g, 6);
     memcpy(asked + 6, bss_2g, 6);
-    used = agent_ap_metrics_answer(frame, ask(frame, asked, 2), reply, sizeof(reply), dest);
+    used = agent_ap_metrics_answer(frame, ask(frame, asked, 2), reply, sizeof(reply), child, dest);
     CHECK(used == 64 && ap_metrics_by_bss(reply, used, out, CONTROLLER_AP_BSS_MAX) == 2);
     CHECK(!memcmp(out[0].bssid, bss_5g, 6) && out[0].stations == 0);
     CHECK(!memcmp(out[1].bssid, bss_2g, 6) && out[1].stations == 7);
-    used = agent_ap_metrics_answer(frame, ask(frame, wide, 0), reply, sizeof(reply), dest);
+    used = agent_ap_metrics_answer(frame, ask(frame, wide, 0), reply, sizeof(reply), child, dest);
     CHECK(used == 64 && ap_metrics_by_bss(reply, used, out, CONTROLLER_AP_BSS_MAX) == 2);
 
     /* A table nobody refreshed is not a measurement any more, and neither is one from the future - the clock has
      * not settled since boot. */
     table_of(text, sizeof(text), 31, wide, counts, 2);
     write_table(text);
-    CHECK(agent_ap_metrics_answer(frame, ask(frame, wide, 2), reply, sizeof(reply), dest) == 0);
+    CHECK(agent_ap_metrics_answer(frame, ask(frame, wide, 2), reply, sizeof(reply), child, dest) == 0);
     table_of(text, sizeof(text), -5, wide, counts, 2);
     write_table(text);
-    CHECK(agent_ap_metrics_answer(frame, ask(frame, wide, 2), reply, sizeof(reply), dest) == 0);
+    CHECK(agent_ap_metrics_answer(frame, ask(frame, wide, 2), reply, sizeof(reply), child, dest) == 0);
     table_of(text, sizeof(text), 25, wide, counts, 2);
     write_table(text);
-    CHECK(agent_ap_metrics_answer(frame, ask(frame, wide, 2), reply, sizeof(reply), dest) == 64);
+    CHECK(agent_ap_metrics_answer(frame, ask(frame, wide, 2), reply, sizeof(reply), child, dest) == 64);
 
     /* A row that is damage is skipped; the rows around it still answer. */
     table_of(text, sizeof(text), 1, wide, counts, 1);
     strcat(text, "b zz:zz:zz:zz:zz:zz 1\nb 02:00:00:00:19:b2 5\n");
     write_table(text);
-    used = agent_ap_metrics_answer(frame, ask(frame, wide, 2), reply, sizeof(reply), dest);
+    used = agent_ap_metrics_answer(frame, ask(frame, wide, 2), reply, sizeof(reply), child, dest);
     CHECK(used == 64 && ap_metrics_by_bss(reply, used, out, CONTROLLER_AP_BSS_MAX) == 2);
     CHECK(out[0].stations == 7 && out[1].stations == 5);
     /* A count wider than the 16-bit field the answer carries is not half a number on the page. */
@@ -311,13 +313,25 @@ static void answers_the_table(void)
     strcat(text, "b 02:00:00:00:19:b2 70000\n");
     write_table(text);
     memcpy(asked, bss_5g, 6);
-    CHECK(agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), dest) == 0);
+    CHECK(agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), child, dest) == 0);
 
     /* A query sent to a group address is not addressed to this node's AL MAC: answering it would put that address
      * in the reply's source, which is the key the master files the counts under. */
     memcpy(asked, bss_2g, 6);
     bytes = query(frame, group, master, 8, 0, 0x80, asked, 1, 0);
-    CHECK(agent_ap_metrics_answer(frame, bytes, reply, sizeof(reply), dest) == 0);
+    CHECK(agent_ap_metrics_answer(frame, bytes, reply, sizeof(reply), child, dest) == 0);
+
+    /* A query addressed to another node's AL MAC - a stale identity from an earlier boot - is not this node's
+     * question either: answering it is how a reply used to keep that identity alive on the master's page. */
+    bytes = query(frame, stranger, master, 9, 0, 0x80, asked, 1, 0);
+    CHECK(agent_ap_metrics_answer(frame, bytes, reply, sizeof(reply), child, dest) == 0);
+
+    /* Broadcast asks every node, so it is answered - and the reply still leaves with this node's own AL MAC as its
+     * source, not with the address that was asked. */
+    bytes = query(frame, broadcast, master, 10, 0, 0x80, asked, 1, 0);
+    used = agent_ap_metrics_answer(frame, bytes, reply, sizeof(reply), child, dest);
+    CHECK(used == 60);
+    CHECK(!memcmp(reply + 6, child, 6) && !memcmp(dest, master, 6));
 
     /* The reply, read back by the master's own writer: the files behind the page's terminal column. */
     counts[0] = 4;
@@ -325,7 +339,7 @@ static void answers_the_table(void)
     table_of(text, sizeof(text), 1, wide, counts, 2);
     write_table(text);
     bytes = ask(frame, wide, 2);
-    used = agent_ap_metrics_answer(frame, bytes, reply, sizeof(reply), dest);
+    used = agent_ap_metrics_answer(frame, bytes, reply, sizeof(reply), child, dest);
     CHECK(used == 64);
     CHECK(controller_peer_note(reply, used) == 4); /* the digest, one file per BSS, and the client report */
     snprintf(path, sizeof(path), "%s/%s.metrics", peers, child_text);
@@ -349,7 +363,7 @@ static void answers_the_table(void)
     write_table(text);
     bytes = ap_metrics_query_build(frame, sizeof(frame), child, master, 0x4101);
     CHECK(bytes == 60);
-    used = agent_ap_metrics_answer(frame, bytes, reply, sizeof(reply), dest);
+    used = agent_ap_metrics_answer(frame, bytes, reply, sizeof(reply), child, dest);
     CHECK(used == 64);
     CHECK(!memcmp(dest, master, 6));         /* where to send it: back to the MAC that asked */
     CHECK(!memcmp(reply + 6, child, 6));     /* and the child's own AL MAC as the source, which is the key the files use */
@@ -404,7 +418,7 @@ static void reports_clients(void)
              "s 02:00:00:00:19:b1 aa:95:b7:16:e2:40\n"
              "b 02:00:00:00:19:b2 0 FRESHR10-5G\n", (long)time(NULL));
     write_table(text);
-    used = agent_ap_metrics_answer(frame, ask(frame, asked, 2), reply, sizeof(reply), dest);
+    used = agent_ap_metrics_answer(frame, ask(frame, asked, 2), reply, sizeof(reply), child, dest);
     CHECK(used == 92);                        /* 22 header + two 13-byte metrics + 41-byte client TLV + EOM */
     found = ap_clients_decode(reply, used, groups, CONTROLLER_AP_BSS_MAX, macs, CONTROLLER_CLIENTS_MAX);
     CHECK(found == 1);                        /* the AP with nobody associated is not a group */
@@ -430,7 +444,7 @@ static void reports_clients(void)
              "epoch=%ld\n"
              "b 02:00:00:00:19:b1 0 FRESHR10\n", (long)time(NULL));
     write_table(text);
-    used = agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), dest);
+    used = agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), child, dest);
     CHECK(used == 60);
     CHECK(controller_peer_note(reply, used) == 3);
     text_of(path, text, sizeof(text));
@@ -458,7 +472,7 @@ static void bounded_mutations(void)
         cut = seed % (bytes + 1);
         memset(frame + bytes, 0xa5, 8);
         memset(reply + 512, 0x5a, 8);
-        bytes = agent_ap_metrics_answer(frame, cut, reply, 512, dest);
+        bytes = agent_ap_metrics_answer(frame, cut, reply, 512, child, dest);
         if (bytes > 512 || reply[512] != 0x5a || frame[60] != 0xa5)
             damaged++;
     }

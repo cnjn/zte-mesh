@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/if_packet.h>
+#include <net/if.h>
 #include <arpa/inet.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -13,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <time.h>
@@ -134,6 +136,30 @@ EXPORT ssize_t sendto(int fd, const void *data, size_t length, int flags,
     }
     errno = saved; return result;
 }
+/* The AL MAC this sandbox presents: br0 is created with it before the daemon starts, so it is the identity every
+ * 1905 frame of this node carries. The station-count answer has to leave with it as its source - the master files
+ * the counts under the reply's source, and any other MAC there invents a node on its page. Read once: the bridge's
+ * address does not change while the daemon runs, and a sandbox without br0 has no identity to answer as. */
+static const uint8_t *local_al(void)
+{
+    static uint8_t al[6];
+    static int known;
+    struct ifreq request;
+    int fd;
+    if (!known) {
+        memset(&request, 0, sizeof(request));
+        memcpy(request.ifr_name, "br0", 4);
+        fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (fd >= 0) {
+            if (!ioctl(fd, SIOCGIFHWADDR, &request)) {
+                memcpy(al, request.ifr_hwaddr.sa_data, 6);
+                known = 1;
+            }
+            close(fd);
+        }
+    }
+    return known ? al : NULL;
+}
 /* The station-count stand-in. The vendor agent answers an AP Metric Query with nothing, because the numbers it
  * would report come from cspd and the driver layer and neither exists in this sandbox; what the child host
  * measured is in /run/zte-mesh/ap-sta. The reply goes out on the socket the query arrived on, which is the only
@@ -145,6 +171,7 @@ static void answer_ap_metrics(int fd, const uint8_t *frame, size_t bytes, const 
     /* The counts alone answer in sixty bytes; sixteen APs with a full client list and thirty-two-byte SSIDs need
      * about 1.2 kB, which still fits the 1500-byte frame the raw socket carries. */
     uint8_t reply[1400], dest[6];
+    const uint8_t *al;
     struct sockaddr_ll target;
     ssize_t sent;
     size_t used;
@@ -155,7 +182,10 @@ static void answer_ap_metrics(int fd, const uint8_t *frame, size_t bytes, const 
         if (!send_real)
             return;
     }
-    used = agent_ap_metrics_answer(frame, bytes, reply, sizeof(reply), dest);
+    al = local_al();
+    if (!al)
+        return;
+    used = agent_ap_metrics_answer(frame, bytes, reply, sizeof(reply), al, dest);
     if (!used)
         return;
     memset(&target, 0, sizeof(target));

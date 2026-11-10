@@ -19,16 +19,22 @@
  * a table of its own.
  */
 
-/* The answer to one received frame, or 0 to stay silent as the vendor agent does: not a query, no table, a table
- * nobody refreshed in the last two collector intervals, or no BSSID in the query that this node reports.
+/* The answer to one received frame, or 0 to stay silent as the vendor agent does: not a query for this node, no
+ * table, a table nobody refreshed in the last two collector intervals, or no BSSID in the query that this node
+ * reports.
+ *
+ * `al` is this node's own AL MAC - the one br0 carries. A query is answered only when it is addressed to `al` or to
+ * the broadcast address; a query to another router's AL or to any other group address is not this node's question,
+ * and answering it would either speak for a node that did not ask or put an address that is not this node's into the
+ * reply's source. The reply's source is always `al`, the key the master's receive hook files the station counts
+ * under.
  *
  * `reply` gets the 0x800c and `dest` the MAC to send it to - the query's own source, which is how the answer
- * reaches whoever asked rather than a group address. The reply's source is the query's destination, this node's AL
- * MAC: that field is the key the master's receive hook files the station counts under, so a reply from any other
- * MAC lands on the wrong node.
+ * reaches whoever asked rather than a group address.
  *
  * A BSSID the query names and the table does not is left out of the answer entirely, not reported as zero - the
  * master's page distinguishes "no data" from "nobody associated", and a zero would erase that. */
-size_t agent_ap_metrics_answer(const uint8_t *frame, size_t bytes, uint8_t *reply, size_t capacity, uint8_t dest[6]);
+size_t agent_ap_metrics_answer(const uint8_t *frame, size_t bytes, uint8_t *reply, size_t capacity,
+                               const uint8_t al[6], uint8_t dest[6]);
 
 #endif
