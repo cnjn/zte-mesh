@@ -116,15 +116,22 @@ static void first_line(const char *path, char *out, size_t size)
     while (out[0] == ' ' || out[0] == '\t')
         memmove(out, out + 1, strlen(out));
 }
-/* This router's own model and name, for the page only. The identity a child router checks is a different thing:
- * that one is the SR1010 shape in DevInfo and stays as it is (REAL_CHILD.md section 2), because a real ZTE child
- * compares ModelName and rejects anything else. Nothing here is ever handed to the vendor code. */
+/* This router's own model and name, for the page only. The model shown is the one the daemon broadcast
+ * in the mesh (ZTE_MESH_REAL_MODEL, which the init script hands to every role), so this router's own
+ * page and the child list on the controller carry the same string. The board name is the second choice,
+ * for a run outside the service (a lab box, where /tmp/sysinfo/model is readable). The identity a child
+ * router checks is a different thing: that one is the SR1010 shape in DevInfo and stays as it is
+ * (REAL_CHILD.md section 2), because a real ZTE child compares ModelName and rejects anything else.
+ * Nothing here is ever handed to the vendor code. */
 void controller_self_identity(char *model, size_t model_size, char *name, size_t name_size)
 {
     if (model_size) {
-        first_line("/tmp/sysinfo/model", model, model_size);
-        if (!model[0])
-            snprintf(model, model_size, "%s", "router");
+        const char *broadcast = getenv("ZTE_MESH_REAL_MODEL");
+        model[0] = 0;
+        if (broadcast && broadcast[0])
+            snprintf(model, model_size, "%s", broadcast);
+        else
+            first_line("/tmp/sysinfo/model", model, model_size);
     }
     if (name_size) {
         name[0] = 0;

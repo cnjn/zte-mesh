@@ -327,7 +327,45 @@ size_t ap_metrics_query_build(uint8_t *frame, size_t capacity, const uint8_t des
 size_t ap_metrics_response_build(uint8_t *frame, size_t capacity, const uint8_t dest[6], const uint8_t source[6],
                                  unsigned int message_id, const struct ap_bss_metric *bsses, unsigned int count)
 {
-    size_t needed = CONTROLLER_1905_HEADER + (size_t)count * AP_METRICS_TLV_BYTES + 3, used = CONTROLLER_1905_HEADER, k;
+    return ap_metrics_response_build_clients(frame, capacity, dest, source, message_id, bsses, count,
+                                             NULL, 0, NULL, 0);
+}
+
+/* The vendor TLV of the client report, and the size of the value the groups describe: the count byte, every group
+ * header, and every MAC. `0` when the groups do not fit the wire's own fields (an SSID longer than 32, a count the
+ * one-byte header cannot carry); the caller then sends the counts alone. */
+static size_t clients_value_bytes(const struct ap_client_group *groups, unsigned int group_count,
+                                  unsigned int mac_count)
+{
+    size_t bytes = 1;
+    unsigned int k;
+    if (group_count > 255 || mac_count > CONTROLLER_CLIENTS_MAX)
+        return 0;
+    for (k = 0; k < group_count; k++) {
+        size_t ssid = strlen(groups[k].ssid);
+        if (ssid > CONTROLLER_SSID_MAX || groups[k].count > 255 ||
+            groups[k].first > mac_count || groups[k].count > mac_count - groups[k].first)
+            return 0;
+        bytes += 6 + 1 + ssid + 1;
+    }
+    bytes += (size_t)mac_count * 6;
+    return bytes;
+}
+
+size_t ap_metrics_response_build_clients(uint8_t *frame, size_t capacity, const uint8_t dest[6],
+                                         const uint8_t source[6], unsigned int message_id,
+                                         const struct ap_bss_metric *bsses, unsigned int count,
+                                         const struct ap_client_group *groups, unsigned int group_count,
+                                         const uint8_t macs[][6], unsigned int mac_count)
+{
+    size_t value = 0, vendor = 0, needed, used = CONTROLLER_1905_HEADER, k;
+    if (groups) {
+        value = clients_value_bytes(groups, group_count, mac_count);
+        if (!value)
+            return 0;
+        vendor = 3 + 6 + 3 + value;                   /* TLV header, OUI and three vendor bytes, sub-TLV header */
+    }
+    needed = CONTROLLER_1905_HEADER + (size_t)count * AP_METRICS_TLV_BYTES + vendor + 3;
     if (needed < 60)
         needed = 60;                                    /* the raw socket does not pad an Ethernet frame */
     if (!frame || !dest || !source || !bsses || !count || capacity < needed)
@@ -355,6 +393,34 @@ size_t ap_metrics_response_build(uint8_t *frame, size_t capacity, const uint8_t 
         frame[used++] = (uint8_t)bsses[k].stations;
         frame[used++] = 0;                            /* presence bitmap: no estimated-service block follows */
     }
+    if (groups) {
+        frame[used++] = CONTROLLER_TLV_VENDOR;
+        frame[used++] = (uint8_t)((vendor - 3) >> 8);
+        frame[used++] = (uint8_t)(vendor - 3);
+        frame[used++] = 0x00;                         /* OUI 00:19:c6, then the three vendor bytes the walker steps */
+        frame[used++] = 0x19;
+        frame[used++] = 0xc6;
+        frame[used++] = 0;
+        frame[used++] = 0;
+        frame[used++] = 0;
+        frame[used++] = CONTROLLER_VENDOR_TLV_CLIENTS;
+        frame[used++] = (uint8_t)(value >> 8);
+        frame[used++] = (uint8_t)value;
+        frame[used++] = (uint8_t)group_count;
+        for (k = 0; k < group_count; k++) {
+            size_t ssid = strlen(groups[k].ssid);
+            memcpy(frame + used, groups[k].bssid, 6);
+            used += 6;
+            frame[used++] = (uint8_t)ssid;
+            memcpy(frame + used, groups[k].ssid, ssid);
+            used += ssid;
+            frame[used++] = (uint8_t)groups[k].count;
+        }
+        for (k = 0; k < mac_count; k++) {
+            memcpy(frame + used, macs[k], 6);
+            used += 6;
+        }
+    }
     frame[used++] = 0;
     frame[used++] = 0;
     frame[used++] = 0;                                /* End of Message */
@@ -363,4 +429,80 @@ size_t ap_metrics_response_build(uint8_t *frame, size_t capacity, const uint8_t 
         used = 60;
     }
     return used;
+}
+
+/* The value of sub-TLV 0x70. Returns what ap_clients_decode() promises: the group count, or -1 when any count
+ * disagrees with the bytes behind it. A repeated BSSID or a client MAC listed twice is damage too - the page keys
+ * rows by MAC and would show the same device twice, or on two nodes. */
+static int clients_parse(const uint8_t *value, size_t length, struct ap_client_group *groups, unsigned int max_groups,
+                         uint8_t macs[][6], unsigned int max_macs)
+{
+    unsigned int groups_found, k, total = 0;
+    size_t at = 1, mac_at;
+    if (length < 1)
+        return -1;
+    groups_found = value[0];
+    if (groups_found > max_groups)
+        return -1;
+    for (k = 0; k < groups_found; k++) {
+        unsigned int clients, j;
+        size_t ssid;
+        if (length - at < 8)                          /* BSSID, SSID length, client count */
+            return -1;
+        memcpy(groups[k].bssid, value + at, 6);
+        at += 6;
+        ssid = value[at++];
+        if (ssid > CONTROLLER_SSID_MAX || ssid > length - at)
+            return -1;
+        memcpy(groups[k].ssid, value + at, ssid);
+        groups[k].ssid[ssid] = 0;
+        at += ssid;
+        clients = value[at++];
+        groups[k].first = total;
+        groups[k].count = clients;
+        total += clients;
+        if (total > max_macs)
+            return -1;
+        for (j = 0; j < k; j++)
+            if (!memcmp(groups[j].bssid, groups[k].bssid, 6))
+                return -1;
+    }
+    if (length - at != (size_t)total * 6)
+        return -1;
+    mac_at = at;
+    for (k = 0; k < groups_found; k++) {
+        unsigned int j;
+        for (j = 0; j < groups[k].count; j++, mac_at += 6) {
+            unsigned int m;
+            for (m = 0; m < groups[k].first + j; m++)
+                if (!memcmp(macs[m], value + mac_at, 6))
+                    return -1;
+            memcpy(macs[groups[k].first + j], value + mac_at, 6);
+        }
+    }
+    return (int)groups_found;
+}
+
+int ap_clients_decode(const uint8_t *frame, size_t bytes, struct ap_client_group *groups, unsigned int max_groups,
+                      uint8_t macs[][6], unsigned int max_macs)
+{
+    struct tlv_cursor cursor;
+    const uint8_t *value;
+    unsigned int type;
+    size_t length;
+    if (!frame || !groups || !macs)
+        return -1;
+    tlv_open(&cursor, frame, bytes);
+    while (tlv_next(&cursor, &type, &value, &length)) {
+        struct zte_cursor zte;
+        unsigned int sub_type;
+        const uint8_t *sub_value;
+        size_t sub_length;
+        if (type != CONTROLLER_TLV_VENDOR || !zte_vendor_open(&zte, value, length))
+            continue;
+        while (zte_vendor_next(&zte, &sub_type, &sub_value, &sub_length))
+            if (sub_type == CONTROLLER_VENDOR_TLV_CLIENTS)
+                return clients_parse(sub_value, sub_length, groups, max_groups, macs, max_macs);
+    }
+    return -1;
 }

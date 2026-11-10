@@ -20,6 +20,15 @@ var callRestart = rpc.declare({
 	expect: { '': {} }
 });
 
+/* Read-only: the rpcd plugin relays what the host-side collector saw -- DHCP leases, the neighbour table and the
+ * stations on this router's own access points. Which device sits on which child router is not in here yet: the
+ * controller learns a station count per BSS and nothing about who those stations are. */
+var callDevices = rpc.declare({
+	object: 'luci.zte-mesh',
+	method: 'devices',
+	expect: { '': {} }
+});
+
 var callRebootNode = rpc.declare({
 	object: 'luci.zte-mesh',
 	method: 'reboot_node',
@@ -95,7 +104,8 @@ return view.extend({
 		return Promise.all([
 			callStatus(),
 			network.getHostHints(),
-			uci.load('zte_mesh')
+			uci.load('zte_mesh'),
+			callDevices()
 		]);
 	},
 
@@ -129,10 +139,11 @@ return view.extend({
 
 		if (state && state.running) {
 			row(_('Controller address (AL MAC)'), state.al_mac || '-');
-			/* This router's own two names, the ones the system knows. A router whose board name cannot be read
-			 * says "router", which is also what a child that reports nothing is shown as. */
+			/* This router's own two names. The model is the one the daemon broadcasts in the mesh, so it reads
+			 * the same here and in the controller's child list; when neither the broadcast nor the board name
+			 * is known the cell says "-" instead of a made-up "router". */
 			if (state.self) {
-				row(_('Model'), state.self.model || 'router');
+				row(_('Model'), state.self.model || '-');
 				row(_('Host name'), state.self.name || 'router');
 			}
 			if (!child) {
@@ -296,16 +307,101 @@ return view.extend({
 		return table;
 	},
 
+	/* What this router can see itself. Three local tables, merged host-side by MAC and marked with which tables saw the
+	 * device, because they age differently: a lease outlives the device and a neighbour entry only lasts while the
+	 * kernel keeps talking to the address. A wireless row carries the network it is associated to, so a device on a
+	 * guest network is not confused with one on the main network; a wired row says so instead of guessing a port.
+	 * A router of the topology is marked as one: the controller's own child routers are here, and they are not devices.
+	 * A device a child router reported (`via`) is wireless by that report: the address tables of this router cannot see
+	 * which radio another router's client is on, so the Position follows that report and the Node column names the
+	 * child, with the same title the topology table uses. */
+	renderDevices: function(info, list) {
+		var count = 0;
+		var state = info && info.state;
+		var nodes = (state && state.nodes) || [];
+		var aliases = {};
+		uci.sections('zte_mesh', 'zte_mesh_node').forEach(function(sec) {
+			if (sec.mac && sec.name)
+				aliases[normMac(sec.mac)] = sec.name;
+		});
+		var titles = {};
+		nodes.forEach(function(node) {
+			titles[normMac(node.mac)] = aliases[normMac(node.mac)] || node.name || node.model || node.mac;
+		});
+		var table = E('table', { 'class': 'table cbi-section-table' }, [
+			E('tr', { 'class': 'tr table-titles' }, [
+				E('th', { 'class': 'th' }, _('Device')),
+				E('th', { 'class': 'th' }, _('MAC')),
+				E('th', { 'class': 'th' }, _('Address')),
+				E('th', { 'class': 'th' }, _('Position')),
+				E('th', { 'class': 'th' }, _('Node')),
+				E('th', { 'class': 'th' }, _('Seen by')),
+				E('th', { 'class': 'th' }, _('Lease')),
+				E('th', { 'class': 'th' }, _('Note'))
+			])
+		]);
+		var now = Math.round(Date.now() / 1000);
+
+		(list || []).forEach(function(d) {
+			var ip = d.ip && d.ip !== '-' ? d.ip : '';
+			var sources = [];
+			(d.sources || '').split(' ').forEach(function(s) {
+				if (s === 'lease')
+					sources.push(_('DHCP lease'));
+				else if (s === 'neigh')
+					sources.push(_('Neighbour table'));
+				else if (s === 'wlan')
+					sources.push(_('Wireless association'));
+				else if (s === 'assoc')
+					sources.push(_('Child router report'));
+			});
+			var lease = '-';
+			if (d.lease_end > 0) {
+				var left = d.lease_end - now;
+				lease = left > 0 ? _('%d min left').format(Math.ceil(left / 60)) : _('Expired');
+			}
+			/* The SSID is what a reader recognises; the interface name is the diagnosis. One is shown, the other kept
+			 * in the tooltip, so neither replaces the other. A row a child reported without an SSID is still a wireless
+			 * association - it must not fall through to 'Wired', which is what this page used to say about a phone on a
+			 * child's radio because no local table could place it. */
+			var where = d.ssid ? badge(d.ssid) : (d.iface ? badge(d.iface) : (d.via ? _('Wireless') : _('Wired')));
+			var via = d.via ? (titles[normMac(d.via)] || d.via) : '-';
+
+			table.appendChild(E('tr', { 'class': 'tr' }, [
+				E('td', { 'class': 'td' }, d.name || '-'),
+				E('td', { 'class': 'td' }, d.mac),
+				E('td', { 'class': 'td' }, ip
+					? E('a', { 'href': 'http://' + ip + '/', 'target': '_blank', 'rel': 'noreferrer' }, ip)
+					: '-'),
+				E('td', { 'class': 'td', 'title': d.iface || '' }, where),
+				E('td', { 'class': 'td', 'title': d.via || '' }, via),
+				E('td', { 'class': 'td' }, sources.length ? sources.join(', ') : '-'),
+				E('td', { 'class': 'td' }, lease),
+				E('td', { 'class': 'td' }, d.node ? badge(_('Child router')) : '-')
+			]));
+			count++;
+		});
+
+		if (!count)
+			table.appendChild(E('tr', { 'class': 'tr placeholder' }, [
+				E('td', { 'class': 'td', 'colspan': 8 }, E('em', _('Nothing here yet: this router has no DHCP lease, no neighbour entry and no station on its access points.')))
+			]));
+
+		return table;
+	},
+
 	render: function(data) {
-		var info = data[0], hints = data[1];
+		var info = data[0], hints = data[1], devices = data[3];
 		var statusBox = E('div', { 'id': 'zte-mesh-status' }, this.renderStatus(info));
 		var nodesBox = E('div', { 'id': 'zte-mesh-nodes' }, this.renderNodes(info, hints));
+		var devicesBox = E('div', { 'id': 'zte-mesh-devices' }, this.renderDevices(info, devices && devices.devices));
 		var self = this;
 
 		poll.add(function() {
-			return Promise.all([ callStatus(), network.getHostHints() ]).then(function(res) {
+			return Promise.all([ callStatus(), network.getHostHints(), callDevices() ]).then(function(res) {
 				dom.content(statusBox, self.renderStatus(res[0]));
 				dom.content(nodesBox, self.renderNodes(res[0], res[1]));
+				dom.content(devicesBox, self.renderDevices(res[0], res[2] && res[2].devices));
 			});
 		}, 5);
 
@@ -802,6 +898,17 @@ return view.extend({
 			 * section does not exist. The section is left out of the list, not nulled out of it. */
 			if (!child)
 				sections.push(E('div', { 'class': 'cbi-section' }, [ E('h3', _('Child routers')), nodesBox ]));
+
+			/* Read-only and local: no switch, nothing to save. It is a separate section rather than a column of the
+			 * child router table because the two answer different questions -- that table says how many stations a
+			 * router reports, this one says which devices this router itself can name -- and because the device list
+			 * will grow a "which router it is attached to" column once the controller reports associations, without
+			 * the child router table changing shape. */
+			sections.push(E('div', { 'class': 'cbi-section' }, [
+				E('h3', _('Devices')),
+				E('div', { 'class': 'small' }, _('What this router can see itself: its DHCP leases, the neighbour table and the stations on its own access points. A device attached to another router of the mesh is not here, because the controller learns a station count per network and not which stations those are.')),
+				devicesBox
+			]));
 
 			sections.push(formNode);
 			return E(sections);

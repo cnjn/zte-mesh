@@ -47,16 +47,16 @@ static void write_table(const char *text)
     fclose(f);
 }
 
-/* A table of one fresh epoch line and these rows: "<bssid> <count>" is what the collector writes, so the fixtures
- * are its own output shape. */
+/* A table of one fresh epoch line and these rows: "b <bssid> <count>" is what the collector writes (the SSID is
+ * optional on that line and these fixtures leave it out), so the fixtures are its own output shape. */
 static void table_of(char *out, size_t room, long age, const uint8_t *bssid, const unsigned int *counts,
                      unsigned int rows)
 {
     size_t used;
     unsigned int k;
     used = (size_t)snprintf(out, room, "epoch=%ld\n", (long)time(NULL) - age);
-    for (k = 0; k < rows && used < room - 22; k++)
-        used += (size_t)snprintf(out + used, room - used, "%02x:%02x:%02x:%02x:%02x:%02x %u\n",
+    for (k = 0; k < rows && used < room - 24; k++)
+        used += (size_t)snprintf(out + used, room - used, "b %02x:%02x:%02x:%02x:%02x:%02x %u\n",
                                  bssid[k * 6], bssid[k * 6 + 1], bssid[k * 6 + 2], bssid[k * 6 + 3],
                                  bssid[k * 6 + 4], bssid[k * 6 + 5], counts[k]);
 }
@@ -231,7 +231,7 @@ static void answers_the_table(void)
     /* A table that is not the collector's format answers nothing, and so does no table at all. */
     write_table("not a table at all\n");
     CHECK(agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), dest) == 0);
-    write_table("epoch=\n02:00:00:00:19:b1 7\n");
+    write_table("epoch=\nb 02:00:00:00:19:b1 7\n");
     CHECK(agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), dest) == 0);
     CHECK(unlink(table) == 0);
     CHECK(agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), dest) == 0);
@@ -281,11 +281,11 @@ static void answers_the_table(void)
     memcpy(asked, bss_5g, 6);
     memcpy(asked + 6, bss_2g, 6);
     used = agent_ap_metrics_answer(frame, ask(frame, asked, 2), reply, sizeof(reply), dest);
-    CHECK(used == 60 && ap_metrics_by_bss(reply, used, out, CONTROLLER_AP_BSS_MAX) == 2);
+    CHECK(used == 64 && ap_metrics_by_bss(reply, used, out, CONTROLLER_AP_BSS_MAX) == 2);
     CHECK(!memcmp(out[0].bssid, bss_5g, 6) && out[0].stations == 0);
     CHECK(!memcmp(out[1].bssid, bss_2g, 6) && out[1].stations == 7);
     used = agent_ap_metrics_answer(frame, ask(frame, wide, 0), reply, sizeof(reply), dest);
-    CHECK(used == 60 && ap_metrics_by_bss(reply, used, out, CONTROLLER_AP_BSS_MAX) == 2);
+    CHECK(used == 64 && ap_metrics_by_bss(reply, used, out, CONTROLLER_AP_BSS_MAX) == 2);
 
     /* A table nobody refreshed is not a measurement any more, and neither is one from the future - the clock has
      * not settled since boot. */
@@ -297,18 +297,18 @@ static void answers_the_table(void)
     CHECK(agent_ap_metrics_answer(frame, ask(frame, wide, 2), reply, sizeof(reply), dest) == 0);
     table_of(text, sizeof(text), 25, wide, counts, 2);
     write_table(text);
-    CHECK(agent_ap_metrics_answer(frame, ask(frame, wide, 2), reply, sizeof(reply), dest) == 60);
+    CHECK(agent_ap_metrics_answer(frame, ask(frame, wide, 2), reply, sizeof(reply), dest) == 64);
 
     /* A row that is damage is skipped; the rows around it still answer. */
     table_of(text, sizeof(text), 1, wide, counts, 1);
-    strcat(text, "zz:zz:zz:zz:zz:zz 1\n02:00:00:00:19:b2 5\n");
+    strcat(text, "b zz:zz:zz:zz:zz:zz 1\nb 02:00:00:00:19:b2 5\n");
     write_table(text);
     used = agent_ap_metrics_answer(frame, ask(frame, wide, 2), reply, sizeof(reply), dest);
-    CHECK(used == 60 && ap_metrics_by_bss(reply, used, out, CONTROLLER_AP_BSS_MAX) == 2);
+    CHECK(used == 64 && ap_metrics_by_bss(reply, used, out, CONTROLLER_AP_BSS_MAX) == 2);
     CHECK(out[0].stations == 7 && out[1].stations == 5);
     /* A count wider than the 16-bit field the answer carries is not half a number on the page. */
     table_of(text, sizeof(text), 1, wide, counts, 1);
-    strcat(text, "02:00:00:00:19:b2 70000\n");
+    strcat(text, "b 02:00:00:00:19:b2 70000\n");
     write_table(text);
     memcpy(asked, bss_5g, 6);
     CHECK(agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), dest) == 0);
@@ -326,8 +326,8 @@ static void answers_the_table(void)
     write_table(text);
     bytes = ask(frame, wide, 2);
     used = agent_ap_metrics_answer(frame, bytes, reply, sizeof(reply), dest);
-    CHECK(used == 60);
-    CHECK(controller_peer_note(reply, used) == 3); /* the digest plus one file per BSS */
+    CHECK(used == 64);
+    CHECK(controller_peer_note(reply, used) == 4); /* the digest, one file per BSS, and the client report */
     snprintf(path, sizeof(path), "%s/%s.metrics", peers, child_text);
     text_of(path, text, sizeof(text));
     CHECK(!strcmp(text, "stations=6\nhops=1\n"));
@@ -350,11 +350,11 @@ static void answers_the_table(void)
     bytes = ap_metrics_query_build(frame, sizeof(frame), child, master, 0x4101);
     CHECK(bytes == 60);
     used = agent_ap_metrics_answer(frame, bytes, reply, sizeof(reply), dest);
-    CHECK(used == 60);
+    CHECK(used == 64);
     CHECK(!memcmp(dest, master, 6));         /* where to send it: back to the MAC that asked */
     CHECK(!memcmp(reply + 6, child, 6));     /* and the child's own AL MAC as the source, which is the key the files use */
     CHECK(ap_metrics_by_bss(reply, used, out, CONTROLLER_AP_BSS_MAX) == 2);
-    CHECK(controller_peer_note(reply, used) == 3);
+    CHECK(controller_peer_note(reply, used) == 4);
     snprintf(path, sizeof(path), "%s/%s.metrics", peers, child_text);
     text_of(path, text, sizeof(text));
     CHECK(!strcmp(text, "stations=4\nhops=1\n"));
@@ -362,6 +362,80 @@ static void answers_the_table(void)
     snprintf(path, sizeof(path), "%s/%s.%s.sta", peers, child_text, bss_text);
     text_of(path, text, sizeof(text));
     CHECK(!strcmp(text, "3\n"));
+}
+
+/* The client list: what lets the master's device page say which node a phone hangs off, and stop calling it wired
+ * because its own address tables cannot place a radio of another router. The report rides the answer the child
+ * already sends; a factory answer that does not carry it must leave nothing behind, so the page keeps its old
+ * behaviour for a child that cannot report. */
+static void reports_clients(void)
+{
+    uint8_t frame[CONTROLLER_1905_MAX_BYTES + 8], plain[CONTROLLER_1905_MAX_BYTES];
+    uint8_t reply[1400], dest[6], asked[12];
+    struct ap_bss_metric bsses[CONTROLLER_AP_BSS_MAX];
+    struct ap_client_group groups[CONTROLLER_AP_BSS_MAX];
+    uint8_t macs[CONTROLLER_CLIENTS_MAX][6];
+    char text[1024], path[400], child_text[18];
+    size_t plain_used, used;
+    int found;
+
+    mac_text(child_text, sizeof(child_text), child);
+    snprintf(path, sizeof(path), "%s/%s.assoc", peers, child_text);
+    (void)unlink(path);                       /* left over from the exchange above */
+    memcpy(asked, bss_2g, 6);
+    memcpy(asked + 6, bss_5g, 6);
+
+    /* Counts alone: no client TLV, no file, and the decoder says "not reported" rather than "nobody". */
+    memcpy(bsses[0].bssid, bss_2g, 6);
+    bsses[0].stations = 2;
+    memcpy(bsses[1].bssid, bss_5g, 6);
+    bsses[1].stations = 0;
+    plain_used = ap_metrics_response_build(plain, sizeof(plain), master, child, 0x4102, bsses, 2);
+    CHECK(plain_used == 60);
+    CHECK(ap_clients_decode(plain, plain_used, groups, CONTROLLER_AP_BSS_MAX, macs, CONTROLLER_CLIENTS_MAX) == -1);
+    CHECK(controller_peer_note(plain, plain_used) == 3); /* digest and one file per BSS, no client report */
+    CHECK(access(path, F_OK) != 0);
+
+    /* The collector's own table, clients and SSIDs included, with one AP that has nobody on it. */
+    snprintf(text, sizeof(text),
+             "epoch=%ld\n"
+             "b 02:00:00:00:19:b1 2 FRESHR10\n"
+             "s 02:00:00:00:19:b1 aa:95:b7:16:e2:39\n"
+             "s 02:00:00:00:19:b1 aa:95:b7:16:e2:40\n"
+             "b 02:00:00:00:19:b2 0 FRESHR10-5G\n", (long)time(NULL));
+    write_table(text);
+    used = agent_ap_metrics_answer(frame, ask(frame, asked, 2), reply, sizeof(reply), dest);
+    CHECK(used == 92);                        /* 22 header + two 13-byte metrics + 41-byte client TLV + EOM */
+    found = ap_clients_decode(reply, used, groups, CONTROLLER_AP_BSS_MAX, macs, CONTROLLER_CLIENTS_MAX);
+    CHECK(found == 1);                        /* the AP with nobody associated is not a group */
+    CHECK(!memcmp(groups[0].bssid, bss_2g, 6) && !strcmp(groups[0].ssid, "FRESHR10"));
+    CHECK(groups[0].first == 0 && groups[0].count == 2);
+    snprintf(text, sizeof(text), "%02x:%02x:%02x:%02x:%02x:%02x",
+             macs[0][0], macs[0][1], macs[0][2], macs[0][3], macs[0][4], macs[0][5]);
+    CHECK(!strcmp(text, "aa:95:b7:16:e2:39"));
+    snprintf(text, sizeof(text), "%02x:%02x:%02x:%02x:%02x:%02x",
+             macs[1][0], macs[1][1], macs[1][2], macs[1][3], macs[1][4], macs[1][5]);
+    CHECK(!strcmp(text, "aa:95:b7:16:e2:40"));
+
+    /* The master files it: one line per client, the BSSID and the SSID the child measured. */
+    CHECK(controller_peer_note(reply, used) == 4);
+    text_of(path, text, sizeof(text));
+    CHECK(!strncmp(text, "epoch=", 6));
+    CHECK(strstr(text, "\naa:95:b7:16:e2:39\t02:00:00:00:19:b1\tFRESHR10\n") != NULL);
+    CHECK(strstr(text, "\naa:95:b7:16:e2:40\t02:00:00:00:19:b1\tFRESHR10\n") != NULL);
+
+    /* Nobody on any AP: the stamp alone. That is the node saying "empty", which is what clears the previous
+     * report instead of letting a device that left keep a node for another half minute. */
+    snprintf(text, sizeof(text),
+             "epoch=%ld\n"
+             "b 02:00:00:00:19:b1 0 FRESHR10\n", (long)time(NULL));
+    write_table(text);
+    used = agent_ap_metrics_answer(frame, ask(frame, asked, 1), reply, sizeof(reply), dest);
+    CHECK(used == 60);
+    CHECK(controller_peer_note(reply, used) == 3);
+    text_of(path, text, sizeof(text));
+    CHECK(!strncmp(text, "epoch=", 6));
+    CHECK(strchr(text, '\n') && strchr(text, '\n')[1] == 0);
 }
 
 static void bounded_mutations(void)
@@ -413,6 +487,7 @@ int main(void)
     query_decode();
     response_build();
     answers_the_table();
+    reports_clients();
     bounded_mutations();
 
     dir = opendir(peers);

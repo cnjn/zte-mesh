@@ -152,6 +152,9 @@ msgstr "开：这个主控除了把下面的 Wi-Fi 配置下发给子路由，�
 msgid "Child router"
 msgstr "子路由"
 
+msgid "Child router report"
+msgstr "子路由上报"
+
 msgid "Backhaul to the controller"
 msgstr "回控制器的方式"
 
@@ -658,3 +661,48 @@ msgstr "剩余 %d 分钟"
 
 msgid "ran out"
 msgstr "已到期"
+
+msgid "Devices"
+msgstr "设备"
+
+msgid "Device"
+msgstr "设备名"
+
+msgid "Position"
+msgstr "位置"
+
+msgid "Seen by"
+msgstr "来源"
+
+msgid "Lease"
+msgstr "租期"
+
+msgid "Note"
+msgstr "备注"
+
+msgid "DHCP lease"
+msgstr "DHCP 租约"
+
+msgid "Neighbour table"
+msgstr "邻居表"
+
+msgid "Node"
+msgstr "节点"
+
+msgid "Wireless"
+msgstr "无线"
+
+msgid "Wireless association"
+msgstr "无线关联"
+
+msgid "Wired"
+msgstr "有线"
+
+msgid "Expired"
+msgstr "已过期"
+
+msgid "Nothing here yet: this router has no DHCP lease, no neighbour entry and no station on its access points."
+msgstr "还没看到任何设备：本机没有 DHCP 租约、没有邻居表记录，也没有终端关联到它的无线网络。"
+
+msgid "What this router can see itself: its DHCP leases, the neighbour table and the stations on its own access points. A device attached to another router of the mesh is not here, because the controller learns a station count per network and not which stations those are."
+msgstr "本机自己看得到的设备：它的 DHCP 租约、邻居表，以及关联在它自己无线网络上的终端。挂在组网中别的路由器上的设备不在这里——控制器只知道每个网络有几个终端，不知道是哪几个。"

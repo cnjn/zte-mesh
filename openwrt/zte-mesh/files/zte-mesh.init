@@ -846,8 +846,37 @@ launcher_ready() {
 	return 0
 }
 
+# The model this router advertises as its 1905 identity. A real ZTE child checks the vendor and market code
+# (REAL_CHILD.md section 2), not this string; the page and the controller list show it as the broadcasting node's
+# model, so it follows what the radios are: no radio -> ZXSLC SR1010, Wi-Fi 5 -> ZXHN Z506, Wi-Fi 6 -> ZXHN E2631,
+# Wi-Fi 7 -> ZXHN E3710, a radio `iw` cannot classify -> ZXHN E2631 (the fallback).
+model_for_radio() {
+	case "$1" in
+	eht) echo "ZXHN E3710" ;;
+	he) echo "ZXHN E2631" ;;
+	vht) echo "ZXHN Z506" ;;
+	none) echo "ZXSLC SR1010" ;;
+	*) echo "ZXHN E2631" ;;
+	esac
+}
+
+# Highest generation across all phys: EHT (Wi-Fi 7) > HE (Wi-Fi 6) > VHT (Wi-Fi 5). A box with radios but no `iw`
+# answers `unknown`, which keeps the fallback model instead of claiming the box has no radio -- the sysfs entry is
+# what decides that.
+radio_class() {
+	local list
+	[ -n "$(ls /sys/class/ieee80211 2>/dev/null)" ] || { echo none; return; }
+	list=$(iw list 2>/dev/null)
+	case "$list" in
+	*EHT*) echo eht ;;
+	*"HE Iftypes"*) echo he ;;
+	*"VHT Capabilities"*) echo vht ;;
+	*) echo unknown ;;
+	esac
+}
+
 start_service() {
-	local enabled bridge role apply_local backhaul
+	local enabled bridge role apply_local backhaul real_model
 	config_load zte_mesh
 	config_get_bool enabled main enabled 0
 	[ "$enabled" = 1 ] || return 0
@@ -1001,7 +1030,8 @@ start_service() {
 	# The identity a real ZTE child accepts (REAL_CHILD.md section 2): this router's public vendor and
 	# model (no serial) and the child's market code, as mreplay.py --identity passes them. Without them
 	# the child rejects the ZTE layer (reason=1/2): no ZTE node data, no LED or reboot actions.
-	procd_set_param env ZTE_MESH_REAL_MANUFACTURER=ZTE "ZTE_MESH_REAL_MODEL=ZXSLC SR1010" \
+	real_model=$(model_for_radio "$(radio_class)")
+	procd_set_param env ZTE_MESH_REAL_MANUFACTURER=ZTE "ZTE_MESH_REAL_MODEL=$real_model" \
 		ZTE_MESH_REAL_MARKET_SIGN=8000 "ZTE_MESH_AL_LAST=$al_last" $emulated
 	procd_set_param respawn 3600 5 0
 	procd_set_param stderr 1

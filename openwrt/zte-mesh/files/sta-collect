@@ -10,18 +10,20 @@
 # OpenWrt child router.
 #
 # The numbers can only be taken here, outside the sandbox: the radios live in the host's /sys, and ns-run builds the
-# daemon a root with no /proc and no /sys. So this script writes /run/zte-mesh/ap-sta -- an `epoch=<unix time>` line
-# and then one `<bssid> <count>` line per access point -- and the responder library inside the sandbox reads that file
-# to build its answer. That directory is bind-mounted into the private root at the same path, which is how the Wi-Fi
-# plan already travels the other way round (agent-sync.c publishes it there, openwrt/zte-mesh/files/wlan-sync applies
-# it).
+# daemon a root with no /proc and no /sys. So this script writes /run/zte-mesh/ap-sta and the responder library
+# inside the sandbox reads that file to build its answer. The file is an `epoch=<unix time>` line, then per access
+# point a `b <bssid> <count> <ssid>` line, then one `s <bssid> <station>` line per associated client -- the count
+# answers the AP Metric query, and the client list is what lets the page say which node a phone is hanging off
+# (the answer carries it in a vendor sub-TLV; see controller-1905.h). That directory is bind-mounted into the
+# private root at the same path, which is how the Wi-Fi plan already travels the other way round (agent-sync.c
+# publishes it there, openwrt/zte-mesh/files/wlan-sync applies it).
 #
 # The access points come from netifd, filtered to mode=ap, and that filter is the whole job: a client interface --
 # the backhaul station a child builds toward its controller -- has a stations directory of its own, and counting it
 # would report the controller as one of this router's terminals.
 #
-# netifd's reply also carries the Wi-Fi key, so nothing read here is kept or logged: only an interface name and a
-# number leave this script.
+# netifd's reply also carries the Wi-Fi key, so nothing read here is kept or logged: only an interface's BSSID,
+# its SSID, a count and the MACs of the stations associated to it leave this script.
 #
 # A board with no radios, a radio that is down and a missing debugfs all produce an empty table, which is what the
 # responder needs in order to say nothing rather than to answer with counts it never measured.
@@ -48,6 +50,7 @@ for argument in "$@"; do
 done
 [ -n "$FILE" ] || FILE=/run/zte-mesh/ap-sta
 [ -n "$INTERVAL" ] || INTERVAL=5
+TAB=$(printf '\t')
 DIR=${FILE%/*}
 # the stop/switch for this loop alone, beside the table it stops writing (see the note above); its path is derived, so
 # a test that names a table under a temporary root gets its own flag file.
@@ -64,23 +67,26 @@ JSONFILTER=${ZTE_MESH_JSONFILTER:-$(command -v jsonfilter)}
 CLOCK=${ZTE_MESH_CLOCK:-date}
 NET=${ZTE_MESH_NET:-/sys/class/net}
 
-# ap_ifaces -> one interface name per line: the access points netifd has up.
+# ap_ifaces -> "<ifname> <TAB> <ssid>" per access point netifd has up.
+#
+# This image's jsonfilter has no predicate syntax, so every interface object is printed whole (one per line) and
+# picked apart here. Its spacing is jsonfilter's own, so the mode test runs on a copy with the spaces removed while
+# the SSID is taken from the line as it is -- an SSID may contain spaces and must not lose them.
 ap_ifaces() {
-	local line rest
-	# This image's jsonfilter has no predicate syntax, so every interface object is printed whole (one per line)
-	# and picked apart here. Its spacing is jsonfilter's own, so it is removed first rather than matched on.
+	local line compact ifn ssid
 	"$UBUS" call network.wireless status 2>/dev/null |
 		"$JSONFILTER" -e '@.*.interfaces[*]' 2>/dev/null |
-		while read -r line; do
-			line=$(printf '%s' "$line" | tr -d ' ')
-			case "$line" in *'"mode":"ap"'*) ;; *) continue ;; esac
-			case "$line" in *'"ifname":"'*) ;; *) continue ;; esac
-			rest=${line#*'"ifname":"'}
-			printf '%s\n' "${rest%%\"*}"
+		while IFS= read -r line; do
+			compact=$(printf '%s' "$line" | tr -d ' ')
+			case "$compact" in *'"mode":"ap"'*) ;; *) continue ;; esac
+			ifn=$(printf '%s' "$line" | sed -n 's/.*"ifname": *"\([^"]*\)".*/\1/p')
+			[ -n "$ifn" ] || continue
+			ssid=$(printf '%s' "$line" | sed -n 's/.*"ssid": *"\([^"]*\)".*/\1/p')
+			printf '%s\t%s\n' "$ifn" "$ssid"
 		done
 }
 
-# sta_count IFNAME -> the stations mac80211 lists for that interface, or 1 when it lists none at all.
+# sta_base IFNAME -> the stations directory mac80211 has for that interface, or failure when it has none.
 #
 # debugfs is the counter because it is the one that is always there: an ax3600 with the stock ImmortalWrt image has
 # no iw, no hostapd_cli and no wpa_cli, and a directory listing needs no package and no daemon to be talking.
@@ -88,22 +94,21 @@ ap_ifaces() {
 # An absent stations directory is not a measured zero: it means this kernel says nothing about that interface, and a
 # row of zeroes would be quoted back to the controller as a fact. The empty directory is the measurement, and 0 is
 # right for it.
-sta_count() {
-	local base dir seen="" n=0
+sta_base() {
+	local base
 	for base in "$DEBUG"/phy*/"netdev:$1"/stations; do
 		[ -d "$base" ] || continue
-		seen=1
-		for dir in "$base"/*/; do
-			[ -d "$dir" ] || continue
-			n=$((n + 1))
-		done
-		break
+		printf '%s' "$base"
+		return 0
 	done
-	[ -n "$seen" ] || return 1
-	printf '%s' "$n"
+	return 1
 }
 
 # collect -> the table, rewritten whole, and the number of rows in AP_COUNT.
+#
+# A row is the access point's BSSID and count, then one line per station associated to it: the responder answers
+# the count, and the station list is what the master files as "who is on that node". The station lines follow
+# their own access point's line because the reader takes them in that order.
 #
 # The responder reads this while a query is being answered, so a half-written file would be a half-reported mesh:
 # build it in a temporary name and move it over the old one, which is atomic within a directory.
@@ -112,19 +117,38 @@ sta_count() {
 # leaves its last table sitting there and the responder would go on quoting it for ever. A row is only worth
 # answering with while the file behind it is fresh.
 collect() {
-	local tmp="$DIR/.ap-sta.$$" ifn bssid sta
+	local tmp="$DIR/.ap-sta.$$" ifn bssid ssid base dir mac n sta_macs
 	AP_COUNT=0
 	( umask 077; : > "$tmp" ) || return 1
 	{
 		printf 'epoch=%s\n' "$("$CLOCK" +%s)"
-		for ifn in $(ap_ifaces); do
+		ap_ifaces | while IFS="$TAB" read -r ifn ssid; do
+			[ -n "$ifn" ] || continue
 			bssid=$(cat "$NET/$ifn/address" 2>/dev/null)
 			[ -n "$bssid" ] || continue
-			sta=$(sta_count "$ifn") || continue
-			printf '%s %s\n' "$bssid" "$sta"
-			AP_COUNT=$((AP_COUNT + 1))
+			base=$(sta_base "$ifn") || continue
+			n=0
+			sta_macs=""
+			for dir in "$base"/*/; do
+				[ -d "$dir" ] || continue
+				mac=${dir%/}
+				mac=${mac##*/}
+				case "$mac" in
+				*:*) sta_macs="$sta_macs $mac"; n=$((n + 1)) ;;
+				esac
+			done
+			# A tab or a newline in an SSID would split the table's own line, so control bytes become spaces.
+			ssid=$(printf '%s' "$ssid" | sed 's/[[:cntrl:]]/ /g')
+			printf 'b %s %s %s\n' "$bssid" "$n" "$ssid"
+			for mac in $sta_macs; do
+				printf 's %s %s\n' "$bssid" "$mac"
+			done
 		done
 	} > "$tmp"
+	# The loop above runs on the far side of a pipe, so its counter cannot come back through the shell; the rows
+	# it wrote are the count.
+	AP_COUNT=$(awk '$1 == "b" { rows++ } END { print rows + 0 }' "$tmp" 2>/dev/null)
+	case "$AP_COUNT" in ''|*[!0-9]*) AP_COUNT=0 ;; esac
 	if mv -f "$tmp" "$FILE"; then
 		return 0
 	fi

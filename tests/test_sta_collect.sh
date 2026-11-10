@@ -93,11 +93,13 @@ run() {
 	PATH="$BIN:$PATH" sh "$STA_COLLECT" "$TABLE" 5 --once
 }
 
-# 1. the two access points, their measured counts, and the client left out.
+# 1. the two access points, their measured counts, the network each broadcasts, and the client left out.
 run
 check "epoch line" "epoch=1700000000" "$(sed -n 1p "$TABLE" 2>/dev/null)"
-check "one row per access point" "aa:aa:aa:00:00:01 2
-aa:aa:aa:00:00:02 0" "$(rows)"
+check "one row per access point, with its stations" "b aa:aa:aa:00:00:01 2 FIX2G
+s aa:aa:aa:00:00:01 11:22:33:44:55:66
+s aa:aa:aa:00:00:01 77:88:99:aa:bb:cc
+b aa:aa:aa:00:00:02 0 FIX5G" "$(rows)"
 check "backhaul client not counted" "0" "$(rows | grep -c 'aa:aa:aa:00:00:03')"
 check "key never written" "0" "$(cat "$TABLE" | grep -ci 'fixture-not-a-key')"
 check "startup log" "1" "$(log_has 'collecting 2 access point(s)')"
@@ -107,7 +109,9 @@ check "no temporary table left behind" "ap-sta" "$(ls "$RUN" | tr '\n' ' ' | sed
 # 2. an interface the kernel says nothing about is not a measured zero: no row at all.
 rm -rf "$DBG/phy1/netdev:phy2-ap0"
 run
-check "no stations directory: no row" "aa:aa:aa:00:00:01 2" "$(rows)"
+check "no stations directory: no row" "b aa:aa:aa:00:00:01 2 FIX2G
+s aa:aa:aa:00:00:01 11:22:33:44:55:66
+s aa:aa:aa:00:00:01 77:88:99:aa:bb:cc" "$(rows)"
 check "and the count said in the log matches" "1" "$(log_has 'collecting 1 access point(s)')"
 
 # 3. no debugfs tree at all (a kernel built without mac80211 debug, or a mount that is gone) is an empty table, not a
@@ -128,14 +132,16 @@ check "no debugfs: nothing complained about" "0" "$(log_has 'cannot write')"
 sta_dir phy1 phy2-ap0
 mv "$NET/phy1-ap0/address" "$T/hidden-mac"
 run
-check "interface without an address: row skipped" "aa:aa:aa:00:00:02 0" "$(rows)"
+check "interface without an address: row skipped" "b aa:aa:aa:00:00:02 0 FIX5G" "$(rows)"
 mv "$T/hidden-mac" "$NET/phy1-ap0/address"
 
 # 5. an object without an ifname is not a crash and not a row.
 printf '%s\n' '{ "section": "default_radio1", "config": { "mode": "ap" } }' >> "$FIX/ifaces"
 run
-check "object without an ifname skipped" "aa:aa:aa:00:00:01 2
-aa:aa:aa:00:00:02 0" "$(rows)"
+check "object without an ifname skipped" "b aa:aa:aa:00:00:01 2 FIX2G
+s aa:aa:aa:00:00:01 11:22:33:44:55:66
+s aa:aa:aa:00:00:01 77:88:99:aa:bb:cc
+b aa:aa:aa:00:00:02 0 FIX5G" "$(rows)"
 
 # 6. a mode other than ap never reaches the table, whatever it is called.
 printf '%s\n' '{ "section": "mesh", "config": { "mode": "mesh" }, "ifname": "phy1-mesh0" }' >> "$FIX/ifaces"
@@ -175,8 +181,10 @@ check "no run directory: names it" "1" "$(log_has "no $T/gone: no access point c
 #    answer, whatever they said.
 printf '%s\n' "epoch=1600000000" "ab:ab:ab:ab:ab:ab 9" > "$TABLE"
 run
-check "a previous table is replaced, not appended to" "aa:aa:aa:00:00:01 2
-aa:aa:aa:00:00:02 0" "$(rows)"
+check "a previous table is replaced, not appended to" "b aa:aa:aa:00:00:01 2 FIX2G
+s aa:aa:aa:00:00:01 11:22:33:44:55:66
+s aa:aa:aa:00:00:01 77:88:99:aa:bb:cc
+b aa:aa:aa:00:00:02 0 FIX5G" "$(rows)"
 check "the epoch moves with the clock" "epoch=1700000000" "$(sed -n 1p "$TABLE")"
 
 # 10. the pause flag stops this loop and nothing else: the last table stays where the responder can read it (and age),
@@ -186,8 +194,10 @@ printf '%s\n' 'pause' > "$RUN/collect-pause"
 : > "$LOG"
 run
 check "paused: the epoch does not move" "epoch=1700000000" "$(sed -n 1p "$TABLE")"
-check "paused: rows kept" "aa:aa:aa:00:00:01 2
-aa:aa:aa:00:00:02 0" "$(rows)"
+check "paused: rows kept" "b aa:aa:aa:00:00:01 2 FIX2G
+s aa:aa:aa:00:00:01 11:22:33:44:55:66
+s aa:aa:aa:00:00:01 77:88:99:aa:bb:cc
+b aa:aa:aa:00:00:02 0 FIX5G" "$(rows)"
 check "paused: names the flag" "1" "$(log_has 'paused by .*collect-pause')"
 check "paused: not collecting" "0" "$(log_has 'collecting')"
 check "paused: exit 0" "0" "$(run; echo $?)"
@@ -195,8 +205,10 @@ check "paused: exit 0" "0" "$(run; echo $?)"
 # the loop is one process -- which is the "said once" the script promises.
 check "paused twice: one stop line per process" "1" "$(log_has 'paused by')"
 check "paused twice: still the same table" "epoch=1700000000
-aa:aa:aa:00:00:01 2
-aa:aa:aa:00:00:02 0" "$(cat "$TABLE")"
+b aa:aa:aa:00:00:01 2 FIX2G
+s aa:aa:aa:00:00:01 11:22:33:44:55:66
+s aa:aa:aa:00:00:01 77:88:99:aa:bb:cc
+b aa:aa:aa:00:00:02 0 FIX5G" "$(cat "$TABLE")"
 rm -f "$RUN/collect-pause"
 : > "$LOG"
 printf '1800000000\n' > "$FIX/epoch"

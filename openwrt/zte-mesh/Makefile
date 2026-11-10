@@ -13,7 +13,7 @@
 # (files/launcher-dispatch). Both halves are arch:all now, so the split stopped buying anything and
 # started costing a moment: two packages are two transactions, and an upgrade that lands one before
 # the other leaves the box running a controller from one package against a launcher from the other
-# (measured on the lab router on 2026-11-05: /tmp/log/apk.log is the record). One apk, one
+# (/tmp/log/apk.log on the lab router is the record). One apk, one
 # `apk add`, one moment at which the two halves are the same version.
 #
 # What arch:all gives up is the install-time rejection. `DEPENDS:=@(TARGET_zte||TARGET_qualcommax)`
@@ -31,7 +31,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=zte-mesh
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=23
+PKG_RELEASE:=27
 PKG_LICENSE:=GPL-2.0-only
 # The tarball carries proprietary ARM32 vendor code; keep it out of shared builds.
 PKG_FLAGS:=nonshared
@@ -105,6 +105,7 @@ define Package/zte-mesh/install
 	$(INSTALL_BIN) ./files/attach $(1)/usr/libexec/zte-mesh/attach
 	$(INSTALL_BIN) ./files/wlan-sync $(1)/usr/libexec/zte-mesh/wlan-sync
 	$(INSTALL_BIN) ./files/sta-collect $(1)/usr/libexec/zte-mesh/sta-collect
+	$(INSTALL_BIN) ./files/device-list $(1)/usr/libexec/zte-mesh/device-list
 	$(INSTALL_DIR) $(1)/etc/init.d $(1)/etc/config $(1)/usr/libexec/rpcd
 	$(INSTALL_BIN) ./files/zte-mesh.init $(1)/etc/init.d/zte-mesh
 	$(INSTALL_CONF) ./files/zte-mesh.config $(1)/etc/config/zte_mesh

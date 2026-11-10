@@ -80,6 +80,56 @@ static int write_bss(const uint8_t *mac, const struct ap_bss_metric *bss)
     return n > 0 && write_named(name, text, (size_t)n);
 }
 
+/* An SSID as it can sit on a tab-separated line: control bytes (a newline would start a new row, a tab would
+ * shift the columns) become spaces. The child sanitizes before sending; this side sanitizes again because the
+ * frame is the other router's, not this one's. */
+static void assoc_ssid(char out[CONTROLLER_SSID_MAX + 1], const char *text)
+{
+    size_t k;
+    for (k = 0; k < CONTROLLER_SSID_MAX && text[k]; k++) {
+        unsigned char c = (unsigned char)text[k];
+        out[k] = (c < 0x20 || c == 0x7f) ? ' ' : (char)c;
+    }
+    out[k] = 0;
+}
+
+/* "<MAC>.assoc": the clients a node reports as associated to its own APs, one per line:
+ *
+ *   epoch=<unix>
+ *   <station> <TAB> <BSSID> <TAB> <SSID>
+ *
+ * The stamp is this side's clock, the moment the report arrived: "has this node told us lately" is a question
+ * about the reader's own clock, and clock skew between the two routers must not decide whether a device shows.
+ * The whole file is rewritten per report, so a client that left is gone from the next; a report with no client
+ * writes the stamp alone, which is the node saying "nobody is on my APs" rather than "no answer". */
+static int write_assoc(const uint8_t *mac, const struct ap_client_group *groups, unsigned int group_count,
+                       const uint8_t macs[][6], unsigned int mac_count)
+{
+    char text[2300], ssid[CONTROLLER_SSID_MAX + 1];
+    size_t used;
+    unsigned int k, j;
+    int n = snprintf(text, sizeof(text), "epoch=%ld\n", (long)time(NULL));
+    if (n <= 0)
+        return 0;
+    used = (size_t)n;
+    for (k = 0; k < group_count; k++) {
+        assoc_ssid(ssid, groups[k].ssid);
+        for (j = 0; j < groups[k].count && groups[k].first + j < mac_count; j++) {
+            const uint8_t *station = macs[groups[k].first + j];
+            n = snprintf(text + used, sizeof(text) - used,
+                         "%02x:%02x:%02x:%02x:%02x:%02x\t"
+                         "%02x:%02x:%02x:%02x:%02x:%02x\t%s\n",
+                         station[0], station[1], station[2], station[3], station[4], station[5],
+                         groups[k].bssid[0], groups[k].bssid[1], groups[k].bssid[2],
+                         groups[k].bssid[3], groups[k].bssid[4], groups[k].bssid[5], ssid);
+            if (n <= 0 || (size_t)n >= sizeof(text) - used)
+                return 0;
+            used += (size_t)n;
+        }
+    }
+    return write_peer(mac, "assoc", text, used);
+}
+
 /* Is this MAC one of the PEERS_KNOWN the daemon will record? 1 = admitted (a known MAC, or a new one with room
  * left), 0 = the budget is full and this frame is from a stranger. */
 static int admit(const uint8_t *mac)
@@ -195,6 +245,19 @@ int controller_peer_note(const uint8_t *frame, size_t bytes)
      * decoder will not split (a repeated BSSID, more than CONTROLLER_AP_BSS_MAX of them) still leaves a number. */
     for (k = 0; k < bss_count; k++)
         written += write_bss(mac, &bss_list[k]);
+    /* The same answer may carry the node's client list (vendor sub-TLV 0x70, see controller-1905.h). A node that
+     * does not - a factory child, or a build from before this existed - leaves no file, and the reader then has
+     * nothing to attribute, which is the state before this feature. */
+    if (header.type == CONTROLLER_MSG_AP_METRICS_RESPONSE) {
+        struct ap_client_group groups[CONTROLLER_AP_BSS_MAX];
+        uint8_t client_macs[CONTROLLER_CLIENTS_MAX][6];
+        int found = ap_clients_decode(frame, bytes, groups, CONTROLLER_AP_BSS_MAX, client_macs,
+                                      CONTROLLER_CLIENTS_MAX);
+        if (found >= 0) {
+            unsigned int clients = found ? groups[found - 1].first + groups[found - 1].count : 0;
+            written += write_assoc(mac, groups, (unsigned int)found, client_macs, clients);
+        }
+    }
     return written;
 }
 

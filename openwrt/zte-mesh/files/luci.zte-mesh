@@ -5,8 +5,13 @@
 #
 #   ubus call luci.zte-mesh status
 #   ubus call luci.zte-mesh restart
+#   ubus call luci.zte-mesh devices
 #   ubus call luci.zte-mesh reboot_node '{"mac":"aa:bb:cc:dd:ee:ff"}'
 #   ubus call luci.zte-mesh light_node  '{"mac":"aa:bb:cc:dd:ee:ff","on":true}'
+#
+# devices relays the JSON the host-side collector `device-list` writes (DHCP leases, the neighbour table and the
+# stations on this router's own access points). The controller cannot answer it: it knows a station count per BSS
+# and nothing about which stations those are.
 #
 # reboot_node / light_node hand a one-line request to the running controller service (a file in
 # /run/zte-mesh/actions, consumed within a second) and wait a few seconds for its answer in state.json:
@@ -58,7 +63,7 @@ apply_local_of() {
 
 case "$1" in
 list)
-	printf '{ "status": {}, "restart": {}, "reboot_node": { "mac": "str" }, "light_node": { "mac": "str", "on": true } }\n'
+	printf '{ "status": {}, "restart": {}, "devices": {}, "reboot_node": { "mac": "str" }, "light_node": { "mac": "str", "on": true } }\n'
 	;;
 call)
 	case "$2" in
@@ -107,6 +112,15 @@ call)
 	restart)
 		( /etc/init.d/zte-mesh restart >/dev/null 2>&1 </dev/null & )
 		printf '{ "result": 0 }\n'
+		;;
+	devices)
+		# Read-only: the list is collected host-side and relayed as it is. A router that lost the collector still
+		# answers, with an empty list and epoch -1, because the page must not turn a missing script into an error.
+		device_list=${ZTE_MESH_DEVICE_LIST:-/usr/libexec/zte-mesh/device-list}
+		out=""
+		[ -r "$device_list" ] && out=$(sh "$device_list" 2>/dev/null)
+		[ -n "$out" ] || out='{ "epoch": -1, "devices": [] }'
+		printf '%s\n' "$out"
 		;;
 	reboot_node|light_node)
 		read -r input

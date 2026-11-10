@@ -142,7 +142,9 @@ EXPORT ssize_t sendto(int fd, const void *data, size_t length, int flags,
 static void answer_ap_metrics(int fd, const uint8_t *frame, size_t bytes, const struct sockaddr_storage *address)
 {
     static ssize_t (*send_real)(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
-    uint8_t reply[256], dest[6];
+    /* The counts alone answer in sixty bytes; sixteen APs with a full client list and thirty-two-byte SSIDs need
+     * about 1.2 kB, which still fits the 1500-byte frame the raw socket carries. */
+    uint8_t reply[1400], dest[6];
     struct sockaddr_ll target;
     ssize_t sent;
     size_t used;

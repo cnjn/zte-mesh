@@ -107,7 +107,7 @@ static int file_text(const char *path, char *out, size_t capacity)
  * sandbox runs as this same UID. A symlink planted there must not steer the write: the plan carries passphrases. */
 static void plan_write_tests(void)
 {
-    char root[80], path[128], temp[128], victim[128], escaped[128], text[512];
+    char root[80], path[128], temp[132], victim[128], escaped[128], text[512];
     struct stat st;
     int fd;
 

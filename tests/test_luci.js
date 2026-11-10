@@ -112,9 +112,42 @@ const result = fn(...names.map(n => mocks[n]), s => s, E);
 			process.exit(1);
 		}
 	}
+	/* The device list is read-only and local: one row per device, the tables that saw it named one by one, the
+	 * network it is associated to as the position (the interface name is the diagnosis and lives in the tooltip),
+	 * and a router of the topology marked as one so a child is not read as a device. */
+	let bad0 = 0;
+	{
+		/* The fourth device is what a child router reported: this router's own tables only know the address, so the
+		 * report is what makes it wireless, and the Node column names the child with the same title the topology
+		 * table uses -- the model here, since the child has no name and no alias. */
+		const info = { state: { nodes: [ { mac: '02:00:00:00:19:e3', name: '', model: 'ZXHN E2631' } ] } };
+		const table = viewDef.renderDevices(info, [
+			{ mac: '00:01:f3:96:43:cf', ip: '192.168.1.162', name: 'DESKTOP-JSJGOJL', ssid: '', iface: '', lease_end: 0, sources: 'lease neigh', node: false, via: '' },
+			{ mac: '0a:95:b7:16:e2:39', ip: '192.168.1.222', name: 'Xiaomi-15', ssid: 'FIX2G', iface: 'phy1-ap0', lease_end: Math.round(Date.now() / 1000) + 600, sources: 'lease neigh wlan', node: false, via: '' },
+			{ mac: 'd4:b7:09:0d:77:30', ip: '192.168.1.171', name: '', ssid: '', iface: '', lease_end: 0, sources: 'neigh', node: true, via: '' },
+			{ mac: 'aa:95:b7:16:e2:40', ip: '192.168.1.223', name: '', ssid: '', iface: '', lease_end: 0, sources: 'neigh assoc', node: false, via: '02:00:00:00:19:e3' }
+		]);
+		const t = JSON.stringify(table);
+		if (table.kids.length !== 4) { console.log('device table has', table.kids.length, 'rows, want 4'); bad0++; }
+		for (const want of ['DESKTOP-JSJGOJL', 'DHCP lease', 'Neighbour table', 'Wired', 'FIX2G', 'phy1-ap0',
+		                    'Wireless association', '10 min left', 'Child router', 'Node', 'Child router report']) {
+			if (!t.includes(want)) { console.log('device table lacks ' + JSON.stringify(want)); bad0++; }
+		}
+		/* The reported device must not fall through to 'Wired', which is what the page used to say about a phone on
+		 * a child's radio: its Position is 'Wireless', and the Node cell carries the child's title. */
+		const reported = JSON.stringify(table.kids[3]) || '';
+		if (!reported.includes('Wireless') || !reported.includes('ZXHN E2631') || reported.includes('Wired')) {
+			console.log('reported device row is not attributed to its node:', reported);
+			bad0++;
+		}
+		/* A device with no lease is not a device with an expired one: the lease cell is a dash, and nobody is told
+		 * that a static address "ran out". */
+		if (t.includes('Expired')) { console.log('a device without a lease shows Expired'); bad0++; }
+		const empty = JSON.stringify(viewDef.renderDevices(null, []));
+		if (!empty.includes('Nothing here yet')) { console.log('an empty device list has no explanation'); bad0++; }
+	}
 	/* Device actions: the status box is the only place a ban or a kick can be seen to have worked, so it has to
 	 * spell out the address, the verb, the state and the time left. */
-	let bad0 = 0;
 	{
 		const box = viewDef.renderStatus({ installed: true, running: true, age: 1, role: 'master', state: { running: true, nodes: [],
 			al_mac: '02:00:00:00:19:e3', config_applied: 1,

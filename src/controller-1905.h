@@ -113,6 +113,51 @@ int ap_metrics_query_decode(const uint8_t *frame, size_t bytes, struct cmdu_head
 size_t ap_metrics_response_build(uint8_t *frame, size_t capacity, const uint8_t dest[6], const uint8_t source[6],
                                  unsigned int message_id, const struct ap_bss_metric *bsses, unsigned int count);
 
+/* The client list a node reports beside its station counts, in the vendor container of the same AP Metrics
+ * Response (0x800c): OUI 00:19:c6, sub-TLV 0x70. The number is this repository's own, not the vendor's - no
+ * capture carries it, and the vendor's walker drops a sub-TLV it has no handler for. It exists because the vendor
+ * agent inside the sandbox cannot report it either: its station table comes from cspd, which does not run here, and
+ * the list that can be measured lives on the host. So the child answers the query it already answers, and the
+ * master files the list beside the counts; a factory child simply sends the plain response and stays unattributed.
+
+   value: group count(1), then per group { BSSID[6], SSID length(1), SSID[length], client count(1) }, then every
+   client MAC of every group, in group order, six bytes each. A MAC appears once: a station is associated to one
+   BSS at a time, and a repeat would make the page count it twice. */
+#define CONTROLLER_VENDOR_TLV_CLIENTS 0x70
+#define CONTROLLER_SSID_MAX 32
+
+/* One BSS of a client report. `first` is where its MACs start in the decoder's one flat array, so a frame of
+ * thirty-two clients does not cost the caller a per-group array of that size. */
+struct ap_client_group {
+    uint8_t bssid[6];
+    char ssid[CONTROLLER_SSID_MAX + 1];
+    unsigned int first;
+    unsigned int count;
+};
+
+/* The largest client list a report carries. Beyond this the child drops clients rather than the whole answer:
+ * the counts are still exact, and a home access point that reaches the cap has more devices than a page row list
+ * is worth. */
+#define CONTROLLER_CLIENTS_MAX 32
+
+/* The client report of one frame: -1 = no client TLV (a factory child, a damaged one, or an older writer), 0 = the
+ * TLV is there and the node runs no client on it (which is what clears the master's copy), otherwise the number of
+ * groups copied. A group that repeats a BSSID, a count that disagrees with the bytes behind it, a list longer than
+ * `max_macs` - all of it reads as -1: a partial attribution is worse than none, because the page would show a
+ * device on a node it is not on. */
+int ap_clients_decode(const uint8_t *frame, size_t bytes, struct ap_client_group *groups, unsigned int max_groups,
+                      uint8_t macs[][6], unsigned int max_macs);
+
+/* ap_metrics_response_build() with the client TLV appended before End of Message. `groups` NULL = the plain
+ * answer; `groups` with `group_count` 0 = the node measured no client at all, which is still an answer. `macs`
+ * holds the clients of every group in order, `mac_count` their total. Returns 0 when the whole frame - TLVs,
+ * vendor header and MAC list - does not fit in `capacity`. */
+size_t ap_metrics_response_build_clients(uint8_t *frame, size_t capacity, const uint8_t dest[6],
+                                         const uint8_t source[6], unsigned int message_id,
+                                         const struct ap_bss_metric *bsses, unsigned int count,
+                                         const struct ap_client_group *groups, unsigned int group_count,
+                                         const uint8_t macs[][6], unsigned int mac_count);
+
 /* The query that starts the exchange, built the way a controller builds it: CMDU 0x800b with a 0x93 that lists no
  * BSSID, so the agent answers for every BSS it runs. `dest` is that agent's AL MAC and `source` this controller's,
  * because the answer comes back to the Ethernet source of the query and is filed under it. 60 bytes on the wire,

@@ -43,11 +43,28 @@ call() { printf '%s\n' "$2" | sh -c 'jsonfilter() { "$PY" "$ZTE_JF" "$@"; }; uci
 	zte_mesh.main.apply_local) [ -n "$UCI_LOCAL" ] && { printf "%s\n" "$UCI_LOCAL"; return 0; }; return 1 ;;
 	esac
 	return 1; }; m=$1; set -- call "$m"; . "$ZTE_PLUGIN"' _ "$1" | tr -d ' \n'; }
+# The same call without the whitespace squeeze: the devices answer is JSON relayed from another program, spaces and
+# all, so it is compared as it came out.
+callraw() { printf '%s\n' "$2" | sh -c 'm=$1; set -- call "$m"; . "$ZTE_PLUGIN"' _ "$1"; }
 
 # no running service (no state.json): -5
 check no-state "$(call reboot_node '{"mac":"d4:b7:09:0d:77:30"}')" '{"result":-5}'
 # list declares the methods
-check list "$(sh -c 'set -- list; . "$ZTE_PLUGIN"' | tr -d ' ')" '{"status":{},"restart":{},"reboot_node":{"mac":"str"},"light_node":{"mac":"str","on":true}}'
+check list "$(sh -c 'set -- list; . "$ZTE_PLUGIN"' | tr -d ' ')" '{"status":{},"restart":{},"devices":{},"reboot_node":{"mac":"str"},"light_node":{"mac":"str","on":true}}'
+
+# devices relays the collector's JSON untouched, and a collector that is gone or does not answer is an empty list with
+# epoch -1: the device list is read-only, so a router missing the script must still answer the page.
+printf '#!/bin/sh\ncat "$ZTE_DEV_FIX"\n' > "$T/devices.sh"
+printf '#!/bin/sh\nexit 1\n' > "$T/devices-broken.sh"
+printf '{ "epoch": 1, "devices": [ { "mac": "aa:bb:cc:dd:ee:ff", "ip": "192.168.1.7", "name": "", "ssid": "", "iface": "", "lease_end": 0, "sources": "neigh", "node": false } ] }\n' > "$T/devices.json"
+export ZTE_DEV_FIX=$T/devices.json
+export ZTE_MESH_DEVICE_LIST=$T/devices.sh
+check devices-relay "$(callraw devices '{}')" "$(cat "$T/devices.json")"
+export ZTE_MESH_DEVICE_LIST=$T/absent
+check devices-missing "$(callraw devices '{}' | tr -d ' \n')" '{"epoch":-1,"devices":[]}'
+export ZTE_MESH_DEVICE_LIST=$T/devices-broken.sh
+check devices-broken "$(callraw devices '{}' | tr -d ' \n')" '{"epoch":-1,"devices":[]}'
+unset ZTE_MESH_DEVICE_LIST
 
 # fake service: answer status 0 for every request, remember the request text
 echo '{"actions":[]}' > "$T/run/state.json"

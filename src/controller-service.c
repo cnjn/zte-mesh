@@ -914,8 +914,8 @@ static int write_state(const struct service_state *state)
     used += (size_t)snprintf(json + used, sizeof(json) - used, "%s,\"nodes\":[", quoted);
     for (i = 0; i < count && used + 2400 < sizeof(json); i++) {
         /* A node that reports no model or name is common enough (a non-ZTE child, or a row added before its identity
-         * TLV arrived). "router" is what the page shows instead of an empty cell. The row that carries our own
-         * address is this router, so it gets this router's system model and host name. */
+         * TLV arrived). An empty cell is the honest answer: the page shows "-" rather than a made-up model name.
+         * The row that carries our own address is this router, so it gets this router's own model and host name. */
         const char *model = nodes[i].model, *name = nodes[i].name;
         char reported[72]; /* one line from peers/<mac>.software: a version is at most 64 bytes */
         const char *software = nodes[i].software;
@@ -923,8 +923,6 @@ static int write_state(const struct service_state *state)
             model = self_model;
             name = self_name;
         } else {
-            if (!model[0])
-                model = "router";
             if (!name[0])
                 name = "router";
         }

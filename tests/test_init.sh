@@ -79,6 +79,23 @@ uci() {
 }
 . "$INIT"
 
+# 0. The advertised model follows the radio generation; start_service passes radio_class's answer through this
+#    mapping. The class itself needs /sys and iw, so only the mapping is a host-testable string table.
+model_case() {
+	local got
+	got=$(model_for_radio "$1")
+	if [ "$got" = "$2" ]; then
+		pass=$((pass + 1))
+	else
+		fail=$((fail + 1)); echo "FAIL model_for_radio($1) = '$got', want '$2'"
+	fi
+}
+model_case none "ZXSLC SR1010"
+model_case vht "ZXHN Z506"
+model_case he "ZXHN E2631"
+model_case eht "ZXHN E3710"
+model_case unknown "ZXHN E2631"
+
 # uci TEXT ... ; case NAME EXPECT-RC [expected output file text | -]
 run() {
 	local name="$1" want_rc="$2" expect="$3" rc got mode f
