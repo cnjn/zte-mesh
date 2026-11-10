@@ -264,7 +264,10 @@ static int plan_write(const char *path, const char *text, size_t bytes)
     int fd, status = -1, saved;
     if (!path || snprintf(temp, sizeof(temp), "%s.tmp", path) >= (int)sizeof(temp))
         return -1;
-    fd = open(temp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    /* O_NOFOLLOW: the temp name is fixed and the exchange directory is writable by the vendor daemon, which runs as
+     * this same UID inside this same chroot. A symlink planted there would otherwise let it aim this write at another
+     * file in the exchange area (the host-written config, for one). The chroot is what keeps it out of the host root. */
+    fd = open(temp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (fd < 0)
         return -1;
     if (write(fd, text, bytes) == (ssize_t)bytes && fsync(fd) == 0)

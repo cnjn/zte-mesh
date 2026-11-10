@@ -7,6 +7,9 @@ T=$(mktemp -d) || exit 1
 # refuse; going through pwd gives the POSIX form there and changes nothing on Linux.
 T=$(cd "$T" && pwd)
 trap 'kill $SVC 2>/dev/null; rm -rf "$T"' EXIT
+# Git Bash installs the interpreter as `python`; OpenWrt hosts and the CI container only have `python3`.
+PY=$(command -v python3 || command -v python) || { echo "test_rpcd: no python3/python" >&2; exit 1; }
+export PY
 export ZTE_MESH_RUNDIR=$T/run ZTE_MESH_ACTION_WAIT=3
 mkdir -p "$T/run/actions"
 # The stub is a python file run through a shell function of the sourcing shell: the container that runs make test-host mounts
@@ -34,7 +37,7 @@ PY
 export ZTE_JF="$T/jf.py" ZTE_PLUGIN="$PLUGIN"
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then pass=$((pass + 1)); else echo "FAIL $1: got '$2' want '$3'"; fail=$((fail + 1)); fi; }
-call() { printf '%s\n' "$2" | sh -c 'jsonfilter() { python3 "$ZTE_JF" "$@"; }; uci() { [ "${1:-}" = -q ] && shift
+call() { printf '%s\n' "$2" | sh -c 'jsonfilter() { "$PY" "$ZTE_JF" "$@"; }; uci() { [ "${1:-}" = -q ] && shift
 	case "$2" in
 	zte_mesh.main.mesh_role) [ -n "$UCI_ROLE" ] && { printf "%s\n" "$UCI_ROLE"; return 0; }; return 1 ;;
 	zte_mesh.main.apply_local) [ -n "$UCI_LOCAL" ] && { printf "%s\n" "$UCI_LOCAL"; return 0; }; return 1 ;;

@@ -3,10 +3,11 @@
 # what it produces for each, and what it says when one of them is missing.
 #
 # No real compiler is called. $PATH gets stub compilers named after the triples they claim (--dumpmachine
-# answers their own name), and two of them write a file where the -o names one. That is enough to grade the
-# part that matters for packaging: an apk is only "one package, any machine" if the build says out loud
-# which machines it actually covers, fails when CI asked for all three, and leaves no half-built directory
-# behind.
+# answers their own name), and they write a 20-byte ELF header where the -o names one -- honest ones for the CPU
+# the output directory claims, `cc-liar` always for aarch64. That is enough to grade the part that matters for
+# packaging: an apk is only "one package, any machine" if the build says out loud which machines it actually
+# covers, checks that claim against the binary it produced, fails when CI asked for all three, and leaves no
+# half-built directory behind.
 #
 # Run with the shell OpenWrt uses: busybox ash tests/test_launcher_arches.sh
 #
@@ -49,7 +50,9 @@ for f in ns-run.c controller-net.c enroller.c; do printf 'int main(void){return 
 cat > "$BIN/stub" <<'STUB'
 #!/bin/sh
 # A compiler that only pretends: --dumpmachine answers the triple its own file name is built from, and a
-# build is a file written at -o. "bad" in the name is the compiler that fails.
+# build is a 20-byte ELF header written at -o. "bad" in the name is the compiler that fails, "liar" the one
+# that builds for the wrong CPU -- it always emits aarch64, which is what the host's own cc does on an ARM64
+# build machine when the script asks it for x86_64.
 me=${0##*/}
 printf '%s\n' "$*" >> "$ZTE_MESH_TEST_CC_LOG"
 triple=${me%-gcc}
@@ -68,14 +71,30 @@ for a in "$@"; do
 	prev=$a
 done
 [ -n "$out" ] || { printf '%s: no -o\n' "$me" >&2; exit 1; }
-printf 'stub binary\n' > "$out"
+# The output directory is the CPU the build claims, so an honest stub says the same thing back.
+arch=${out%/*}; arch=${arch##*/}
+case $me in
+*liar*) arch=aarch64 ;;
+esac
+case $arch in
+aarch64) class=2; machine=183 ;;
+armv7) class=1; machine=40 ;;
+*) class=2; machine=62 ;;
+esac
+# awk's %c on a number is the byte, which printf's \0 escape is not: dash reads at most two octal digits
+# after it, so \0177 comes out as byte 15 and a literal '7' -- a header that is not an ELF header at all.
+LC_ALL=C awk -v class="$class" -v machine="$machine" 'BEGIN {
+	printf "%c%c%c%c%c%c%c%c", 127, 69, 76, 70, class, 1, 1, 0
+	for (i = 0; i < 8; i++) printf "%c", 0
+	printf "%c%c%c%c", 2, 0, machine % 256, int(machine / 256)
+}' > "$out"
 chmod 755 "$out"
 STUB
 
 # One stub per role. The two named after triples are what $(TARGET_CC) looks like to the script; neither
 # name is in the script's default candidate list, so a case that does not set a compiler really has none.
 # cc-ok and cc-bad are the only names a case can point at through ZTE_MESH_CC_*.
-for name in cc-ok cc-bad aarch64-openwrt-linux-musl-gcc mipsel-openwrt-linux-gnu-gcc; do
+for name in cc-ok cc-bad cc-liar aarch64-openwrt-linux-musl-gcc mipsel-openwrt-linux-gnu-gcc; do
 	cp "$BIN/stub" "$BIN/$name"
 	chmod 755 "$BIN/$name"
 done
@@ -135,6 +154,38 @@ has "the next candidate is tried" "built armv7 with cc-ok" "$out"
 build 'ZTE_MESH_CC_AARCH64=cc-bad' 'ZTE_MESH_CC_ARMV7='"$NONE" 'ZTE_MESH_CC_X86_64='"$NONE" --
 check "a compiler that fails is a failure" "1" "$rc"
 has "and the log says which" "every compiler for aarch64 failed" "$out"
+# the reason used to be redirected into the null that `2>/dev/null >&2` had just opened, so "the last one said:"
+# was always followed by silence -- in the build log as well as here
+has "and the compiler's own words reach the log" "deliberate failure" "$out"
+
+# --- a compiler that answers for the wrong CPU ---------------------------------------------------------------------
+# The x86_64 fallback is the build host's own musl-gcc/cc. On an ARM64 build machine that compiler emits ARM64
+# code and exits 0, so the old script filed an ARM64 ELF under x86_64/ and reported success -- the dispatcher
+# would then exec it on a real x86_64 router and fail there, with the package claiming to cover that CPU.
+build 'ZTE_MESH_CC_AARCH64=cc-ok' 'ZTE_MESH_CC_ARMV7=cc-ok' 'ZTE_MESH_CC_X86_64=cc-liar' --
+check "the other two still build" "0" "$rc"
+has "and are the ones listed" "architectures built: aarch64 armv7" "$out"
+has "the wrong-CPU build is a failed attempt" "every compiler for x86_64 failed" "$out"
+has "and the reason names the CPU" "is not x86_64 code" "$out"
+check "no x86_64 binary is left behind" "no" "$(present "$OUT/x86_64/ns-run")"
+check "no empty x86_64 directory either" "no" "$([ -d "$OUT/x86_64" ] && printf yes || printf no)"
+
+build 'ZTE_MESH_CC_AARCH64=cc-ok' 'ZTE_MESH_CC_ARMV7=cc-ok' 'ZTE_MESH_CC_X86_64=cc-liar' 'ZTE_MESH_REQUIRE_ARCHES=aarch64 armv7 x86_64' --
+check "CI asking for all three refuses the impostor" "1" "$rc"
+has "and names the architecture it did not get" "x86_64 was required and is not in the package" "$out"
+
+# Rejection is per attempt: the next candidate still gets its turn, and an honest one wins.
+build 'ZTE_MESH_CC_AARCH64=cc-ok' 'ZTE_MESH_CC_ARMV7=cc-liar cc-ok' 'ZTE_MESH_CC_X86_64=cc-ok' --
+check "a wrong-CPU candidate does not end the search" "0" "$rc"
+has "the honest candidate builds it" "built armv7 with cc-ok" "$out"
+check "armv7 really is there" "yes" "$(present "$OUT/armv7/ns-run")"
+
+# The target toolchain goes through the same read-back: a compiler named for one triple that emits another is
+# not believed just because the caller passed it in.
+build 'ZTE_MESH_TARGET_CC=cc-liar' 'ZTE_MESH_TARGET_ARCH=x86_64' 'ZTE_MESH_CC_AARCH64='"$NONE" 'ZTE_MESH_CC_ARMV7='"$NONE" --
+check "the caller's own toolchain is checked too" "1" "$rc"
+has "and nothing is reported as built" "architectures built:" "$out"
+check "no x86_64 binary from the target toolchain" "no" "$(present "$OUT/x86_64/ns-run")"
 
 # --- the toolchain the caller already has ------------------------------------------------------------------------
 build 'ZTE_MESH_TARGET_CC=aarch64-openwrt-linux-musl-gcc' 'ZTE_MESH_TARGET_CFLAGS=-O2 -pipe -fno-caller-saves' 'ZTE_MESH_CC_ARMV7='"$NONE" 'ZTE_MESH_CC_X86_64='"$NONE" --

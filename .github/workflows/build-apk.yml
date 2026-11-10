@@ -22,9 +22,11 @@ name: Build APK
 #    <dir>/immortalwrt + <dir>/linux-mainline-zte-zxslc-sr1010/linux-6.18.38.
 #
 # `make package/<pkg>/compile` walks the dependency graph in tmp/.packagedeps,
-# so every declared runtime dep of zte-mesh gets built first. Two of them are
-# pointless (or actively harmful) to build here, and a CI-only sed trims them
-# from DEPENDS before defconfig:
+# so every dep in DEPENDS gets built first. Three of zte-mesh's runtime deps are
+# pointless (or actively harmful) to build here, so a CI-only sed moves them out
+# of DEPENDS and into EXTRA_DEPENDS before defconfig. EXTRA_DEPENDS reaches the
+# apk's depends list (package-pack.mk) but never the build graph, so the board
+# still installs them while this workflow never builds them:
 #
 #  * +kmod-veth +kmod-sched-core - config-6.18 has neither CONFIG_VETH nor
 #    CONFIG_NET_SCH_INGRESS/CONFIG_NET_CLS_ACT, so on this target they can only
@@ -35,10 +37,11 @@ name: Build APK
 #    fetches often enough to waste whole runs, and neither has to be built to
 #    produce these apks (the launcher is -static, so it links no target libc).
 #
-# The zte-mesh apk therefore declares no runtime dep at all on this target, and
-# no target either: it is PKGARCH:=all and carries one static launcher build per
-# CPU, so the same bytes install on a board this workflow never built for. The
-# kernel package is additionally neutralised rather than avoided:
+# The zte-mesh apk still declares all three runtime deps on this target (via
+# EXTRA_DEPENDS); it names no target either: it is PKGARCH:=all and carries one
+# static launcher build per CPU, so the same bytes install on a board this
+# workflow never built for. The kernel package is additionally neutralised
+# rather than avoided:
 # package/kernel/linux has an EMPTY Build/Compile and its install step only copies
 # $(LINUX_DIR)/modules.builtin and strings modules.builtin.modinfo, so two empty
 # placeholder files in the kernel tree make it a zero-second no-op if it enters
@@ -90,11 +93,11 @@ concurrency:
   cancel-in-progress: true
 
 # Runtime dependencies are decided per target instead of by one blind sed: a
-# target that compiles its own kernel modules keeps +kmod-veth +kmod-sched-core,
-# so the packaged apk carries a real dependency and the board ends up with a
-# working veth pair; a target built against an external kernel tree that this
-# workflow never compiles cannot produce those kmods at all, and merely naming
-# them drags package/kernel/linux (and a kernel build) into the graph.
+# target that compiles its own kernel modules keeps +kmod-veth +kmod-sched-core
+# in DEPENDS; a target built against an external kernel tree that this workflow
+# never compiles cannot produce those kmods at all, and merely naming them in
+# DEPENDS drags package/kernel/linux (and a kernel build) into the graph. Either
+# way the apk keeps the runtime deps: trimmed ones move to EXTRA_DEPENDS.
 env:
   # zte/zx279133 points at an external kernel tree (see the header), which this
   # workflow never compiles -> kmod-* deps could only ever be empty stubs.
@@ -372,24 +375,26 @@ jobs:
           #    and the resulting apk carries them: without veth the launcher
           #    stops at "error=private-service-network errno=2".
           #
-          # Trimming happens in this build tree only; the source keeps the full
-          # DEPENDS so a packaged target still gets what it declares.
+          # A dep trimmed from DEPENDS is not dropped from the artifact: it moves
+          # to EXTRA_DEPENDS, which package-pack.mk merges into the apk's depends
+          # list but package-dumpinfo.mk / package-metadata.pl never read, so it
+          # stays out of the build graph. The board still gets iproute2 and the
+          # veth module at install time; this workflow just never builds them.
+          # EXTRA_DEPENDS items need a version constraint (package-pack.mk errors
+          # on an unversioned one), hence "(>=0)" - any version satisfies.
           #
-          # Must run before `make defconfig`: defconfig resolves the dependencies
-          # and would pin CONFIG_PACKAGE_kmod-veth=m, dragging the kernel package
-          # back in even though DEPENDS no longer mentions it.
-          # The runtime deps sit on the one package that carries everything: zte-mesh is arch:all and holds both
-          # the scripts and the tarball and the compiled launcher, so everything that only a real board can satisfy
-          # -- iproute2, the veth module -- is declared there. Trimming has to happen there or the apk would still
-          # drag a kernel build in.
+          # Must run before `make defconfig`: defconfig resolves DEPENDS and would
+          # pin CONFIG_PACKAGE_kmod-veth=m, dragging the kernel package back in.
           MK=../../zte-mesh/openwrt/zte-mesh/Makefile
           echo "target builds kernel modules: $TARGET_BUILDS_KERNEL_MODULES"
           echo "trim ip-full:                  $TRIM_IP_FULL"
           echo "before: $(grep -n 'DEPENDS' "$MK")"
 
+          EXTRA_DEPS=""
           if [ "$TRIM_IP_FULL" = 'true' ]; then
             sed -i -E 's/[[:space:]]*\+ip-full//g' "$MK"
-            echo "trimmed +ip-full (download-only dep, 403-prone)"
+            EXTRA_DEPS="ip-full (>=0)"
+            echo "trimmed +ip-full from the build graph; kept as a runtime dep via EXTRA_DEPENDS"
           else
             echo "kept +ip-full"
           fi
@@ -400,12 +405,17 @@ jobs:
             echo "kept +kmod-veth +kmod-sched-core: this target can build them"
           else
             sed -i -E 's/[[:space:]]*\+(kmod-veth|kmod-sched-core)//g' "$MK"
-            echo "trimmed +kmod-veth +kmod-sched-core: no in-tree kernel here"
+            EXTRA_DEPS="${EXTRA_DEPS:+$EXTRA_DEPS, }kmod-veth (>=0), kmod-sched-core (>=0)"
+            echo "trimmed +kmod-veth +kmod-sched-core from the build graph; kept as runtime deps via EXTRA_DEPENDS"
+          fi
+
+          if [ -n "$EXTRA_DEPS" ]; then
+            sed -i -E "s|^([[:space:]]*DEPENDS:=.*)$|\1\n  EXTRA_DEPENDS:=$EXTRA_DEPS|" "$MK"
           fi
           echo "after:  $(grep -n 'DEPENDS' "$MK")"
 
           if [ "$TRIM_IP_FULL" = 'true' ] && [ "$TARGET_BUILDS_KERNEL_MODULES" = 'false' ] &&
-             grep -qE '\+(kmod-veth|kmod-sched-core|ip-full)' "$MK"; then
+             grep -E '^[[:space:]]*DEPENDS:=' "$MK" | grep -qE '\+(kmod-veth|kmod-sched-core|ip-full)'; then
             echo "runtime deps were not trimmed properly in $MK" >&2
             exit 1
           fi
@@ -599,7 +609,7 @@ jobs:
           # intermittently answer 403 to automated fetches, and one unlucky
           # mirror sweep would otherwise abort the build long after the
           # toolchain work. iproute2 is deliberately NOT built (see the
-          # "Trim runtime deps" step), so luci-base is the only download left.
+          # "Decide runtime deps for this target" step), so luci-base is the only download left.
           prefetch() {
             for i in 1 2 3; do
               make -j"$(nproc)" "$1" >>"$LOG" 2>&1 && return 0
@@ -705,6 +715,31 @@ jobs:
           MESH_APK=$PWD/$MESH_APK
           APK_TOOL=$PWD/sr1010/immortalwrt/staging_dir/host/bin/apk
           test -x "$APK_TOOL" || { echo "$APK_TOOL is not the host apk that packaged this" >&2; exit 1; }
+          # The trimmed runtime deps must survive into the artifact's depends list: EXTRA_DEPENDS is what
+          # carries them past the build-graph trim, and a Makefile/pack regression that drops them would
+          # otherwise ship an apk that installs on a fresh board with no iproute2 and no veth module.
+          # adbdump carries them in info.depends as plain strings ("ip-full>=0", "libc"), not as objects
+          # with a name key. Run 42343102511 went red on a correct apk because the reader walked every
+          # "name" in the document and so collected the paths/files entries instead of the dependencies.
+          # Read the one field that holds them and strip the version constraint. tests/test_build_deps.sh
+          # runs this extracted reader against fixtures, including one where the three names appear only
+          # as file names -- that is the shape the broken reader accepted.
+          DEPS_JSON=$("$APK_TOOL" adbdump --format json "$MESH_APK") || {
+            echo "cannot read metadata of $MESH_APK" >&2; exit 1; }
+          printf '%s\n' "$DEPS_JSON" | python3 -c '
+          import json, re, sys
+          info = json.load(sys.stdin).get("info", {})
+          if info.get("name") != "zte-mesh":
+              sys.exit("adbdump did not describe zte-mesh: " + repr(info.get("name")))
+          deps = info.get("depends", [])
+          have = {re.split(r"[<>=!~]", d, maxsplit=1)[0] for d in deps}
+          print("apk depends: " + ", ".join(deps))
+          need = {"ip-full", "kmod-veth", "kmod-sched-core"}
+          missing = need - have
+          if missing:
+              sys.exit("apk lost runtime deps (EXTRA_DEPENDS did not reach it): " + ", ".join(sorted(missing)))
+          print("runtime deps present: " + ", ".join(sorted(need)))
+          ' || exit 1
           MEMBERS_DIR=$(mktemp -d)
           if ! ( cd "$MEMBERS_DIR" && "$APK_TOOL" --allow-untrusted extract "$MESH_APK" >/dev/null 2>&1 ); then
             echo "cannot extract $MESH_APK: $(file -b "$MESH_APK")" >&2

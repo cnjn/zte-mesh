@@ -1042,13 +1042,15 @@ static void client_actions_reconcile(const struct service_config *config, long n
         if (intents[i].kind == ACTION_KIND_BAN)
             intents[i].minutes = config->ban_minutes;
     if (actions_configure(&actions, now, intents, config->intent_count) < 0)
-        return; /* more rules than the table holds; the config parser already refuses that case */
+        return; /* invalid input; the config parser already refuses more rules than ACTION_MAX. A table that is
+                 * merely full is not this case -- it defers the intent and still ticks, which is what frees it. */
 
     n = actions_tick(&actions, now, due, ACTION_MAX);
     if (!n)
         return;
     count = controller_read_nodes(nodes, MAX_NODES);
     for (i = 0; i < n; i++) {
+        int sent = 0, failed = 0;
         for (k = 0; k < count; k++) {
             char text[18];
             uint8_t agent[6];
@@ -1057,8 +1059,12 @@ static void client_actions_reconcile(const struct service_config *config, long n
             snprintf(text, sizeof(text), "%s", nodes[k].mac);
             if (text_to_mac(agent, text))
                 continue;
-            (void)controller_client_action(agent, every_bss, due[i].mac, due[i].kind, due[i].allow, 0);
+            if (controller_client_action(agent, every_bss, due[i].mac, due[i].kind, due[i].allow, 0) == 0)
+                sent = 1;
+            else
+                failed = 1;
         }
+        actions_send_result(&actions, &due[i], sent && !failed);
     }
 }
 
@@ -2024,6 +2030,9 @@ int controller_service(void)
         printf("ZTE_MESH_SERVICE role=slave controller_features=off epoch=%ld\n", (long)time(NULL));
     action_reconcile(0); /* a request from before this start is stale: a reboot must not be replayed */
     int renew_sent = 0, election_attempts = 0;
+    /* The two one-shots below are keyed to the daemon's own start, not the service's: a hot role edit replaces the
+     * daemon (apply_new_config) and the new one needs the same settling time a fresh start gets. */
+    long role_started = state.started;
     struct radio_push radio_push[2] = {{0, 0, 0}, {0, 0, 0}};
     struct radio_agent radio_agent = {{0}, 0};
     struct mlo_push mlo_push[MLO_NODES];
@@ -2040,7 +2049,7 @@ int controller_service(void)
         if (info.si_pid == child)
             break;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        if (!renew_sent && now.tv_sec - state.started >= 5) {
+        if (!renew_sent && now.tv_sec - role_started >= 5) {
             /* Once the daemon's acd task is up, broadcast an AP-autoconfiguration
              * Renew so an agent that had onboarded against a previous controller
              * instance re-runs autoconfiguration against this one instead of
@@ -2059,7 +2068,7 @@ int controller_service(void)
          * (0x909b, multiapd.acd.acd, docs/research/AGENT_PROBE.md section 5.3). The payload is a four-byte zero
          * probe: if the trigger does not exist the status is non-zero and nothing is lost. Retried a few times
          * because the acd task is not necessarily up when the daemon reports itself started. */
-        if (slave && election_attempts < 3 && now.tv_sec - state.started >= 8 + election_attempts * 12) {
+        if (slave && election_attempts < 3 && now.tv_sec - role_started >= 8 + election_attempts * 12) {
             int status = controller_election_trigger();
             election_attempts++;
             printf("ZTE_MESH_SERVICE agent_election attempt=%d status=%d epoch=%ld\n", election_attempts, status,
@@ -2097,6 +2106,25 @@ int controller_service(void)
             radio_agent.mac[0] = 0;
         }
         clock_gettime(CLOCK_MONOTONIC, &now);
+        /* The role was read once at start, and a hot edit of the service config changes it here: apply_new_config
+         * writes the factory's role triple and replaces the daemon, while the branch below kept using the value
+         * this process started with. A router switched to slave went on running controller features against agents
+         * it no longer has and never polled the M2 rows into a Wi-Fi plan; switched back it did the opposite. Only
+         * a change that reached the database counts -- apply_new_config leaves current->role alone when the writes
+         * fail, so reading it back here is also the answer to "did the switch happen".
+         *
+         * The one-shots restart with the role. Without that, a child switched to an hour into the run fires its
+         * election trigger against an acd task that is not up yet (the gate is measured from the daemon's start),
+         * and one that was a child first has already spent all three attempts and never joins. */
+        int now_slave = config.role_set && config.role == CONTROLLER_ROLE_SLAVE;
+        if (now_slave != slave) {
+            printf("ZTE_MESH_SERVICE role_loop role=%s epoch=%ld\n", now_slave ? "slave" : "master", (long)time(NULL));
+            fflush(NULL);
+            slave = now_slave;
+            renew_sent = 0;
+            election_attempts = 0;
+            role_started = now.tv_sec;
+        }
         if (state.role_settle_at && now.tv_sec >= state.role_settle_at && !state.respawn_pending) {
             /* stand-in for cspd's cooperator_mgr + the daemon's _autoSetRole (router mode: master): Mode 0 -> 2, then the
              * second restart that _autoSetRole requests with ASEND(0xa93d) */

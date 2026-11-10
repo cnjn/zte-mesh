@@ -545,10 +545,14 @@ write_local_plan() {
 write_config() {
 	local e0 s0 k0 e1 s1 k1 sync suffix v radio key a b role apply_local backhaul pin2g pin5g h0 b0 h1 b1 s1_air k1_air
 	local sh0 sb0 sh1 sb1 seed2g="" seed5g="" sync_forced="" declared0="" bands=""
+	local bridge al_last_override emulator
 	config_load zte_mesh
 	config_get role main mesh_role ""
 	config_get apply_local main apply_local ""
 	apply_local=$(apply_local_value "$role" "$apply_local") || { bad "apply_local must be 0 or 1"; return 1; }
+	config_get bridge main bridge br-lan
+	config_get al_last_override main al_last ""
+	config_get emulator main emulator ""
 	config_get e0 main wifi_24g_enabled 1
 	config_get s0 main wifi_24g_ssid ""
 	config_get k0 main wifi_24g_key ""
@@ -786,13 +790,22 @@ write_config() {
 	# sits inert until some later restart: switching the extra SSIDs off on a child leaves it broadcasting the guest
 	# network it was told to drop. Only the two roles that run an applier can act on any of them, so only theirs carry
 	# these tokens; on a controller-only box it would restart the service for values that change nothing there.
+	#
+	# The last three are the opposite again: start_service() reads them once and bakes them into the instances --
+	# `bridge` is the interface `attach` and `mesh-search` are handed and the LAN MAC the AL MAC is derived from,
+	# `al_last` is that derivation's override (as typed: the byte it produces follows from it and `bridge`), and
+	# `emulator` decides whether the daemon runs natively. None of them reaches the config file or the plan, so
+	# nothing inside the sandbox ever sees a change, and no instance is added or removed. Every role reads them,
+	# so every role carries them. Without these a save sits inert until somebody restarts by hand -- the page offers
+	# the first two, and `emulator` is a hand-edited option that behaves the same way.
 	{ grep -E '^(mesh\.role|wifi\.dual_band_sync|band_steer\.|roam\.|mlo\.enable)' "$RUNDIR/config" | cut -d= -f1 | sort
 	  echo "$VERSION_MODE"
 	  role_is_master "$role" && echo role=master || echo role=slave
 	  apply_here "$role" "$apply_local" && echo local=on || echo local=off
 	  if sync_runs "$role" "$apply_local"; then
 	  	echo "backhaul=$backhaul extra_slots=$EXTRA_SLOTS pin2g=$pin2g pin5g=$pin5g"
-	  fi; } | tr '\n' ' ' > "$RUNDIR/restart.sig"
+	  fi
+	  echo "bridge=$bridge al_last=$al_last_override emulator=$emulator"; } | tr '\n' ' ' > "$RUNDIR/restart.sig"
 }
 
 # The three refusals that belong before procd ever gets an instance, split out of start_service() so the host
@@ -944,10 +957,10 @@ start_service() {
 				[ -x "$candidate" ] && { emulator=${candidate#"$ROOT"}; break; }
 			done
 			# No package ships one (OpenWrt does not build qemu-user, and it would have to match
-			# this board anyway), so this is a test-host-only affordance. Say exactly what is
-			# missing instead of letting the sandbox fail later with a bare "execv errno=8".
-			# Leaving it out of the package is deliberate; docs/DEVELOPMENT.md section 11 explains
-			# why and lists the three ways out of it.
+			# this board anyway), so this is a lab-only affordance. Say exactly what is missing
+			# instead of letting the sandbox fail later with a bare "execv errno=8". Leaving it
+			# out of the package is deliberate; docs/LAB.md section 4.2 explains why and lists the
+			# three ways out of it.
 			[ -z "$emulator" ] && log "this kernel cannot run the 32-bit ARM daemon and no qemu-arm-static was found in $ROOT: put one there (it must be built for $(uname -m), and it must sit inside the private root because it is exec'd after the chroot), or install a firmware built with CONFIG_COMPAT=y, or set zte_mesh.main.emulator=none to force the native path"
 		fi
 	else
@@ -1063,7 +1076,17 @@ start_service() {
 }
 
 reload_service() {
-	local old new
+	local enabled old new
+	# The page's off switch is zte_mesh.main.enabled, and start_service() reads it before it builds anything. A
+	# reload arrives here instead, and write_config() describes the profile rather than whether it runs -- so it
+	# succeeds for a disabled service too, the signature matches, and the answer used to be "nothing to do": the
+	# controller kept running after the page said off. Read here, before the signature is compared.
+	config_load zte_mesh
+	config_get_bool enabled main enabled 0
+	if [ "$enabled" != 1 ]; then
+		stop
+		return 0
+	fi
 	old=$(cat "$RUNDIR/restart.sig" 2>/dev/null)
 	if ! write_config; then
 		stop

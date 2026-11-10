@@ -556,16 +556,32 @@ int controller_client_action(const uint8_t agent[6], const uint8_t bssid[6], con
                              int allow, unsigned int seconds)
 {
     struct sockaddr_ll target = { .sll_family = AF_PACKET, .sll_protocol = htons(0x893a), .sll_halen = 6 };
-    uint8_t frame[STEER_FRAME_MAX];
+    uint8_t frame[STEER_FRAME_MAX], source[6];
+    struct ifreq interface = {0};
     size_t used;
-    int fd, result, saved;
+    int fd, result = -1, saved;
     const char *private = getenv("ZTE_MESH_DB_SANDBOX");
-    if (!agent || !bssid || !client || !private || strcmp(private, "1"))
+    if (!agent || !bssid || !client || !private || strcmp(private, "1") ||
+        (kind != ACTION_KIND_KICK && kind != ACTION_KIND_BAN))
         return -1;
+    target.sll_ifindex = (int)if_nametoindex("veth-lab");
+    if (!target.sll_ifindex)
+        return -1;
+    fd = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(0x893a));
+    if (fd < 0)
+        return -1;
+    strcpy(interface.ifr_name, "br0");
+    if (ioctl(fd, SIOCGIFHWADDR, &interface))
+        goto done;
+    if (interface.ifr_hwaddr.sa_family != 1) {
+        errno = EAFNOSUPPORT;
+        goto done;
+    }
+    memcpy(source, interface.ifr_hwaddr.sa_data, sizeof(source));
     if (kind == ACTION_KIND_KICK) {
         struct steer_request request;
         memset(&request, 0, sizeof(request));
-        memcpy(request.al_mac, peer, 6);
+        memcpy(request.al_mac, source, 6);
         memcpy(request.bssid, bssid, 6);
         memcpy(request.client, client, 6);
         request.window = 200;
@@ -576,7 +592,7 @@ int controller_client_action(const uint8_t agent[6], const uint8_t bssid[6], con
     } else {
         struct steer_ban ban;
         memset(&ban, 0, sizeof(ban));
-        memcpy(ban.al_mac, peer, 6);
+        memcpy(ban.al_mac, source, 6);
         memcpy(ban.bssid, bssid, 6);
         memcpy(ban.clients[0], client, 6);
         ban.count = 1;
@@ -584,16 +600,13 @@ int controller_client_action(const uint8_t agent[6], const uint8_t bssid[6], con
         ban.validity_seconds = (uint16_t)(seconds > 0xffff ? 0xffff : seconds);
         used = steer_build_assoc_control(frame, sizeof(frame), (unsigned int)(time(NULL) & 0xffff), agent, &ban);
     }
-    if (!used)
-        return -1;
-    target.sll_ifindex = (int)if_nametoindex("lab-peer");
-    if (!target.sll_ifindex)
-        return -1;
+    if (!used) {
+        errno = EINVAL;
+        goto done;
+    }
     memcpy(target.sll_addr, agent, 6);
-    fd = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(0x893a));
-    if (fd < 0)
-        return -1;
     result = sendto(fd, frame, used, 0, (struct sockaddr *)&target, sizeof(target)) == (ssize_t)used ? 0 : -1;
+done:
     saved = errno;
     close(fd);
     errno = saved;

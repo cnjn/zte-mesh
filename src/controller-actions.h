@@ -8,15 +8,15 @@
  * agent reboots, and a ban the user removed has to be lifted on the agent as well or the client stays out.
  *
  * So the rules live here, as a state machine over (now, intents) with no sockets, no files and no clock of its
- * own: the daemon hands in the time and sends whatever tick() says is due; a host test hands in made-up times
- * and reads the same answers.
+ * own: the daemon hands in the time, sends whatever tick() says is due and reports each send result; a host test
+ * hands in made-up times and results.
  *
  * Vocabulary: a KICK is one-shot (steer this client off, learn whether it worked), a BAN is a standing rule
  * (keep this client off this BSS until the time runs out or the user removes it). */
 
 #define ACTION_MAX 8
-#define ACTION_KICK_RETRY 5      /* seconds between BTM requests for the same client */
-#define ACTION_KICK_TRIES 3      /* BTM requests before giving up */
+#define ACTION_KICK_RETRY 5      /* seconds between kick attempts; also retries for failed/unconfirmed sends */
+#define ACTION_KICK_TRIES 3      /* kick send attempts before giving up */
 #define ACTION_BAN_REFRESH 120   /* seconds between repetitions of a ban (an agent that restarted forgot it) */
 
 enum action_kind { ACTION_KIND_NONE = 0, ACTION_KIND_KICK = 1, ACTION_KIND_BAN = 2 };
@@ -30,7 +30,8 @@ struct action_entry {
     uint8_t mac[6];
     int kind;        /* action_kind */
     int state;       /* action_state */
-    int lift;        /* ban only: the rule is gone, send the matching "allow" and drop it */
+    int lift;        /* ban only: the rule is gone; drop it after a successful "allow" send */
+    int releasing;   /* ban only: send "allow" rather than block after removal or expiry */
     unsigned int minutes; /* ban only: the lifetime this entry was anchored with (0 = until the user undoes it) */
     long expires;    /* ban: unban at this time (0 = until the user undoes it); kick: give up at this time */
     long next;       /* earliest time for the next transmission */
@@ -67,13 +68,23 @@ void actions_clear(struct action_table *table);
 /* Applies the configured intents and keeps the state of everything already known, so reloading the config does
  * not re-kick a client that has been dealt with. A ban that disappears from the intents is turned into a
  * pending undo instead of being dropped; a kick that disappears is simply forgotten.
- * Returns the number of entries after the change, or -1 when there are more intents than ACTION_MAX. */
+ * Returns the number of entries after the change, or -1 for invalid input (no table, intents without a list, or
+ * more than ACTION_MAX of them). A full table is not invalid input: an intent that does not fit yet is deferred,
+ * because the entries holding the room are bans waiting for their undo to go out, and only the tick that follows
+ * this call can send it. Call again with the same intents and it is inserted once the release has drained. */
 int actions_configure(struct action_table *table, long now, const struct action_intent *intents,
                       unsigned int count);
 
-/* Collects up to `max` transmissions that are due at `now` and advances the table. Returns how many were put
- * in `out`. Calling it twice with the same `now` never yields the same work twice. */
+/* Collects up to `max` transmissions due at `now`, marks them pending and advances next/attempts, not sent or
+ * expired. Returns how many were put in `out`. Unchanged intents never yield the same work twice at the same
+ * `now`; failed or unconfirmed sends retry after ACTION_KICK_RETRY, within the kick attempt/timeout limits. */
 unsigned int actions_tick(struct action_table *table, long now, struct action_due *out, unsigned int max);
+
+/* Local send result, not an agent reply: call once per due before the next configure/tick (no delayed results).
+ * `ok` means at least one eligible agent was sent to and none failed. Success marks sent or completes an allow
+ * (drop a removed ban, expire a timed ban); failure leaves it pending with the retry already set by tick.
+ * Successful block sends use ACTION_BAN_REFRESH instead of the retry interval. Matches both MAC and kind. */
+void actions_send_result(struct action_table *table, const struct action_due *due, int ok);
 
 /* Feedback from the agent (a BTM report or a Steering Completed naming this client). `ok` = 1 means the client
  * did what was asked. Only KICK entries are affected; a ban has no per-client answer. */

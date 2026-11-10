@@ -11,12 +11,24 @@ T=$(cd "$T" && pwd)
 trap 'rm -rf "$T"' EXIT
 RUNDIR=$T/run; export ZTE_MESH_RUNDIR=$RUNDIR
 LOGF=$T/log
-pass=0; fail=0; AFTER_LOAD=''
+pass=0; fail=0; AFTER_LOAD=''; LOADED=''
+CHECK_PERMISSIONS=1
+( umask 077; : > "$T/mode-check" ) || exit 1
+mode_check=$(find "$T/mode-check" -type f -perm 0600) || exit 1
+if [ -z "$mode_check" ]; then
+	case "$(uname -s)" in
+	MINGW*|MSYS*)
+		CHECK_PERMISSIONS=0
+		echo "SKIP config permissions: this filesystem cannot represent 0600; verify on Linux" ;;
+	*) echo "FAIL permissions probe: expected 0600" >&2; exit 1 ;;
+	esac
+fi
 
 logger() { for _a; do :; done; echo "$_a" >> "$LOGF"; }
 date() { printf '%s\n' "${STUB_TZ:-+0000}"; }
+# Track assigned names to avoid forking a pipeline to scan all shell variables.
 config_load() {
-	SECS=""; local line cur="" n=0 k v t
+	SECS=""; LOADED=''; local line cur="" n=0 k v t
 	while IFS= read -r line; do
 		line=${line#"${line%%[![:space:]]*}"}
 		case "$line" in
@@ -24,12 +36,12 @@ config_load() {
 		config\ *)
 			set -- $line; t=$2; cur=${3:-}; cur=${cur#\'}; cur=${cur%\'}
 			[ -n "$cur" ] || { n=$((n + 1)); cur=cfg$n; }
-			SECS="$SECS $cur"; eval "T_$cur=\$t" ;;
+			SECS="$SECS $cur"; eval "T_$cur=\$t"; LOADED="$LOADED T_$cur" ;;
 		option\ *)
 			line=${line#option }; k=${line%% *}; v=${line#* }
 			# like libuci: a quoted value ends at its closing quote, an unquoted '#' starts a comment
 			case "$v" in \'*) v=${v#\'}; v=${v%%\'*} ;; *) v=${v%%[[:space:]#]*} ;; esac
-			eval "V_${cur}_$k=\$v" ;;
+			eval "V_${cur}_$k=\$v"; LOADED="$LOADED V_${cur}_$k" ;;
 		esac
 	done < "$UCI"
 	[ -z "$AFTER_LOAD" ] || eval "$AFTER_LOAD"
@@ -38,6 +50,16 @@ config_get() {
 	local _s
 	eval "_s=\${V_${2}_${3}+set}"
 	if [ -n "$_s" ]; then eval "$1=\$V_${2}_${3}"; else eval "$1=\${4:-}"; fi
+}
+# libubox's spelling of a boolean: the words below are 1, everything else (including an absent option) is 0.
+config_get_bool() {
+	local _v
+	config_get "$1" "$2" "$3" "${4:-}"
+	eval "_v=\$$1"
+	case $(echo "$_v" | tr 'A-Z' 'a-z') in
+	1|on|true|yes|enabled) eval "$1=1" ;;
+	*) eval "$1=0" ;;
+	esac
 }
 config_foreach() {
 	local s t
@@ -59,24 +81,29 @@ uci() {
 
 # uci TEXT ... ; case NAME EXPECT-RC [expected output file text | -]
 run() {
-	local name="$1" want_rc="$2" expect="$3" rc got
+	local name="$1" want_rc="$2" expect="$3" rc got mode f
 	rm -rf "$RUNDIR" "$LOGF"; : > "$LOGF"
 	UCI=$T/uci; printf '%s\n' "$UCI_TEXT" > "$UCI"
-	for _v in $(set | grep -o '^[VT]_[A-Za-z0-9_]*=' | tr -d '='); do unset "$_v"; done
+	for _v in $LOADED; do unset "$_v"; done
 	write_config; rc=$?
 	if [ "$rc" != "$want_rc" ]; then
 		echo "FAIL $name: rc=$rc want $want_rc ($(tail -1 "$LOGF"))"; fail=$((fail + 1)); return
 	fi
 	if [ "$want_rc" = 0 ]; then
 		got=$(cat "$RUNDIR/config")
-		[ -z "$(find "$RUNDIR/config" -perm -077 2>/dev/null)" ] || { echo "FAIL $name: config is not 0600"; fail=$((fail + 1)); return; }
+		if [ "$CHECK_PERMISSIONS" = 1 ]; then
+			mode=$(find "$RUNDIR/config" -type f -perm 0600) && [ "$mode" = "$RUNDIR/config" ] || {
+				echo "FAIL $name: config is not 0600"; fail=$((fail + 1)); return;
+			}
+		fi
 		[ "$got" = "$expect" ] || { echo "FAIL $name: output differs"; echo "--- got"; echo "$got"; echo "--- want"; echo "$expect"; fail=$((fail + 1)); return; }
-		ls "$RUNDIR"/.config.* >/dev/null 2>&1 && { echo "FAIL $name: temp file left behind"; fail=$((fail + 1)); return; }
 	else
 		[ ! -e "$RUNDIR/config" ] || { echo "FAIL $name: a refused configuration still wrote the file"; fail=$((fail + 1)); return; }
-		ls "$RUNDIR"/.config.* >/dev/null 2>&1 && { echo "FAIL $name: temp file left behind"; fail=$((fail + 1)); return; }
 		case "$(cat "$LOGF")" in *"$expect"*) ;; *) echo "FAIL $name: log lacks '$expect': $(tail -1 "$LOGF")"; fail=$((fail + 1)); return ;; esac
 	fi
+	for f in "$RUNDIR"/.config.*; do
+		[ ! -e "$f" ] && [ ! -L "$f" ] || { echo "FAIL $name: temp file left behind"; fail=$((fail + 1)); return; }
+	done
 	[ "$want_rc" != 0 ] || [ -z "$DUMP_DIR" ] || cp "$RUNDIR/config" "$DUMP_DIR/$(printf %02d $((pass + 1)))-$name.conf"
 	WIRELESS_DB=''
 	pass=$((pass + 1))
@@ -101,7 +128,7 @@ radio1.enabled=1
 radio1.ssid=home-5
 radio1.key=password-5g"
 [ "$(cat "$RUNDIR/version_mode.host")" = 128 ] || { echo "FAIL legacy: version_mode.host"; fail=$((fail + 1)); }
-[ "$(cat "$RUNDIR/restart.sig")" = "128 role=master local=off " ] || { echo "FAIL legacy: restart.sig='$(cat "$RUNDIR/restart.sig")'"; fail=$((fail + 1)); }
+[ "$(cat "$RUNDIR/restart.sig")" = "128 role=master local=off bridge=br-lan al_last= emulator= " ] || { echo "FAIL legacy: restart.sig='$(cat "$RUNDIR/restart.sig")'"; fail=$((fail + 1)); }
 
 # 1b. the shipped template as it is (default name ImmortalWrt, default password Ztemesh2631!): bands synchronised (the
 # factory baseline), so the 5 GHz band takes the 2.4 GHz name, key and security and the child's 5 GHz network is not renamed
@@ -313,7 +340,7 @@ band_steer.rssi5=-110
 roam.rssi24=-60
 roam.rssi5=-70
 ban.minutes=30"
-[ "$(cat "$RUNDIR/restart.sig")" = "band_steer.enabled band_steer.rssi24 band_steer.rssi5 mesh.role mlo.enable roam.force roam.rssi24 roam.rssi5 wifi.dual_band_sync 128 role=master local=on backhaul=multi_ap extra_slots=1 pin2g=radio2 pin5g=radio1 " ] ||
+[ "$(cat "$RUNDIR/restart.sig")" = "band_steer.enabled band_steer.rssi24 band_steer.rssi5 mesh.role mlo.enable roam.force roam.rssi24 roam.rssi5 wifi.dual_band_sync 128 role=master local=on backhaul=multi_ap extra_slots=1 pin2g=radio2 pin5g=radio1 bridge=br-lan al_last= emulator= " ] ||
 	{ echo "FAIL all-options: restart.sig='$(cat "$RUNDIR/restart.sig")'"; fail=$((fail + 1)); }
 # 8b. without dual-band sync the 5 GHz band keeps its own hidden flag, security and MAC filter policy
 UCI_TEXT=$(printf '%s\n' "$UCI_TEXT" | sed "s/wifi_dual_band_sync '1'/wifi_dual_band_sync '0'/")
@@ -627,7 +654,7 @@ radio0.ssid=home
 radio0.key=password-24
 radio1.enabled=1
 mesh.role=master"
-[ "$(cat "$RUNDIR/restart.sig")" = "mesh.role 128 role=master local=on backhaul=off extra_slots=0 pin2g= pin5g= " ] ||
+[ "$(cat "$RUNDIR/restart.sig")" = "mesh.role 128 role=master local=on backhaul=off extra_slots=0 pin2g= pin5g= bridge=br-lan al_last= emulator= " ] ||
 	{ echo "FAIL role-local-sig: restart.sig='$(cat "$RUNDIR/restart.sig")'"; fail=$((fail + 1)); }
 
 # 8l. a child ignores apply_local: its plan is the controller's, so the flag must not resurrect a local plan here,
@@ -645,7 +672,7 @@ mesh.role=slave"
 AFTER_LOAD=''
 [ "$(cat "$RUNDIR/wlan-plan" 2>/dev/null)" = sentinel ] ||
 	{ echo "FAIL role-slave-local-keeps-plan: apply_local wrote a plan on a child"; fail=$((fail + 1)); }
-[ "$(cat "$RUNDIR/restart.sig")" = "mesh.role 128 role=slave local=off backhaul=off extra_slots=0 pin2g= pin5g= " ] ||
+[ "$(cat "$RUNDIR/restart.sig")" = "mesh.role 128 role=slave local=off backhaul=off extra_slots=0 pin2g= pin5g= bridge=br-lan al_last= emulator= " ] ||
 	{ echo "FAIL role-slave-local: restart.sig='$(cat "$RUNDIR/restart.sig")'"; fail=$((fail + 1)); }
 
 # 8n. the applier reads four options straight out of UCI, and none of them belongs in the signature for the reason the
@@ -707,6 +734,84 @@ case "$CHILD_PIN" in *'pin2g=radio1 '*) ;; *) echo "FAIL applier-sig: the pin mi
 [ "$ONLY_ALL" = "$ONLY_PLAIN" ] ||
 	{ echo "FAIL applier-sig: a controller-only box restarts for values it ignores ('$ONLY_PLAIN' -> '$ONLY_ALL')"; fail=$((fail + 1)); }
 case "$ONLY_ALL" in *extra_slots*|*pin*|*backhaul*) echo "FAIL applier-sig: the role that runs no applier carries them ($ONLY_ALL)"; fail=$((fail + 1)) ;; esac
+
+# 8o. the three options start_service() bakes into the instances: the bridge `attach` and `mesh-search` are handed
+# (and the LAN MAC the AL MAC is derived from), that derivation's override, and the emulator decision. None of them
+# reaches the config file or the plan, so nothing inside the sandbox sees a change and no instance is added or
+# removed -- without a token here a save on the page sits inert until somebody restarts by hand. Every role reads
+# all three, including the controller-only one that deliberately carries none of the applier tokens above.
+sig_of master "option bridge 'br-guest'" only-bridge; ONLY_BRIDGE=$SIG
+sig_of master "option bridge 'br-lan'" only-bridge-default; ONLY_BRIDGE_DEFAULT=$SIG
+sig_of slave "option al_last 'e3'" child-al; CHILD_AL=$SIG
+sig_of master "option emulator 'none'" only-emulator; ONLY_EMULATOR=$SIG
+[ "$ONLY_PLAIN" != "$ONLY_BRIDGE" ] ||
+	{ echo "FAIL instance-sig: a controller-only box kept the same signature after the bridge moved ($ONLY_PLAIN)"; fail=$((fail + 1)); }
+[ "$CHILD" != "$CHILD_AL" ] ||
+	{ echo "FAIL instance-sig: a child kept the same signature after the AL MAC override changed ($CHILD)"; fail=$((fail + 1)); }
+[ "$ONLY_PLAIN" != "$ONLY_EMULATOR" ] ||
+	{ echo "FAIL instance-sig: the emulator decision is missing from the signature ($ONLY_PLAIN)"; fail=$((fail + 1)); }
+[ "$ONLY_PLAIN" = "$ONLY_BRIDGE_DEFAULT" ] ||
+	{ echo "FAIL instance-sig: bridge=br-lan differs from an unset bridge ('$ONLY_PLAIN' -> '$ONLY_BRIDGE_DEFAULT')"; fail=$((fail + 1)); }
+
+# 8p. reload_service() is the path a save on the page actually takes, and it is not start_service(): the signature
+# decides whether procd restarts. `enabled` is the page's off switch and used to be invisible here -- write_config()
+# describes the profile rather than whether it runs, so it succeeds for a disabled service, the two signatures match
+# and the answer was "nothing to do" while the controller kept running. rc.common and procd are replaced by three
+# recorders; what is graded is which of them reload_service() called, not what they would have done.
+ACTIONS=''; RUNNING=1
+stop() { ACTIONS="$ACTIONS stop"; }
+restart() { ACTIONS="$ACTIONS restart"; }
+procd_running() { [ "$RUNNING" = 1 ]; }
+# reload_case NAME OLD-OPTIONS NEW-OPTIONS WANT-ACTIONS [WANT-RC] -- write the old profile, then save the new one.
+reload_case() {
+	local name="$1" rc
+	ACTIONS=''
+	rm -rf "$RUNDIR"
+	UCI=$T/uci
+	printf '%s\n' "$BASE
+$2" > "$UCI"
+	for _v in $LOADED; do unset "$_v"; done
+	write_config || { fail=$((fail + 1)); echo "FAIL reload $name: the baseline profile was refused"; return; }
+	printf '%s\n' "$BASE
+$3" > "$UCI"
+	for _v in $LOADED; do unset "$_v"; done
+	reload_service; rc=$?
+	if [ "$rc" != "${5:-0}" ]; then
+		fail=$((fail + 1)); echo "FAIL reload $name: rc=$rc want ${5:-0}"; return
+	fi
+	if [ "$ACTIONS" != "$4" ]; then
+		fail=$((fail + 1)); echo "FAIL reload $name: called '$ACTIONS', want '$4'"; return
+	fi
+	pass=$((pass + 1))
+}
+reload_case unchanged "option enabled '1'" "option enabled '1'" ''
+reload_case turned-off "option enabled '1'" "option enabled '0'" ' stop'
+# The off switch has to work even when the profile left behind cannot be saved: the refusal path below answers 1,
+# and a page that cannot switch the service off because of an unrelated field is the worse failure.
+reload_case turned-off-bad-profile "option enabled '1'" "option enabled '0'
+	option wifi_24g_enabled '2'" ' stop'
+reload_case bridge "option enabled '1'" "option enabled '1'
+	option bridge 'br-guest'" ' restart'
+reload_case al-last "option enabled '1'" "option enabled '1'
+	option al_last 'e3'" ' restart'
+reload_case emulator "option enabled '1'" "option enabled '1'
+	option emulator 'none'" ' restart'
+reload_case refused "option enabled '1'" "option enabled '1'
+	option wifi_24g_enabled '2'" ' stop' 1
+# A signature that says nothing changed is only an answer while the daemon is actually up.
+RUNNING=0
+reload_case not-running "option enabled '1'" "option enabled '1'" ' restart'
+# Turning it back on: a stopped service has no signature (stop_service removes it), so the comparison differs and
+# procd is asked to restart -- which is stop + start, and start_service() reads enabled again.
+ACTIONS=''
+rm -rf "$RUNDIR"
+printf '%s\n' "$BASE
+	option enabled '1'" > "$UCI"
+for _v in $LOADED; do unset "$_v"; done
+reload_service
+if [ "$ACTIONS" = ' restart' ]; then pass=$((pass + 1)); else
+	fail=$((fail + 1)); echo "FAIL reload turned-on: called '$ACTIONS', want ' restart'"; fi
+RUNNING=1
 
 # 8m. written explicitly, apply_local wins over the legacy name: `main` with 0 is a controller that was told to keep
 # its own radios alone.
@@ -1449,7 +1554,7 @@ done
 # The exit code is the whole judgement, so the needles are the question, the two answers and the fact that
 # they are keyed off the number -- an ELF left under this name by hand answers 64, and calling that "no
 # build for this machine" is a diagnosis that sends the reader to the wrong file (read back in a real
-# upgrade on the lab router on 2026-11-05).
+# upgrade on 2026-11-05; docs/journal/2026-11-05.md).
 for needle in '"$NSRUN" --launcher-check 2>&1' 'launcher_status=$?' '"$launcher_status" = 127' \
 	'has no launcher build for' '--launcher-check exited $launcher_status' \
 	'$NSRUN is missing from package zte-mesh'; do

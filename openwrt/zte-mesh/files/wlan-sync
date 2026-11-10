@@ -405,6 +405,19 @@ prune_extras() {
 	done
 }
 
+# prune_backhaul SEEN -> drop the backhaul sections whose row the plan no longer carries. clear_backhaul has already
+# taken the end this router is *not* on; this is the end it still is, where a band the controller stopped publishing
+# used to leave a BSS advertising -- or a client pointing at -- a network that is no longer there.
+prune_backhaul() {
+	local seen="$1" section
+	for section in $(uci -q show wireless | sed -n 's/^wireless\.\(zte_backhaul[a-z0-9_]*\)=wifi-iface$/\1/p'); do
+		case " $seen " in *" $section "*) continue ;; esac
+		uci -q delete "wireless.$section"
+		changed
+		log "the plan no longer carries the backhaul of ${section##*_}; removed $section"
+	done
+}
+
 # clear_extras -> remove every extra slot this script created, once the mode is off
 clear_extras() {
 	local section removed=0
@@ -461,6 +474,7 @@ apply_plan() {
 	SIDE=$(backhaul_side)
 	EXTRA=$(extra_slots_mode)
 	SEEN_EXTRAS=""
+	SEEN_BACKHAUL=""
 	CHANGED=0
 	if [ "$BACKHAUL" = multi_ap ]; then
 		# the sections of the end this router is not on go; the ones it is on stay until the plan says otherwise
@@ -471,7 +485,8 @@ apply_plan() {
 	[ "$EXTRA" = on ] || clear_extras
 	rows=$(sed -n 's/^rows=//p' "$plan" | head -n 1)
 	case "$rows" in ''|*[!0-9]*) log "plan has no row count"; return 1 ;; esac
-	[ "$rows" -gt 0 ] || return 0
+	# rows=0 falls through to the two prunes below with nothing seen: a plan that carries no rows has stopped
+	# handing out every extra slot and every backhaul, and returning early here used to leave them all on the air.
 	index=0
 	while [ "$index" -lt "$rows" ]; do
 		radio=$(sed -n "s/^$index\.radio=//p" "$plan" | head -n 1)
@@ -495,6 +510,13 @@ apply_plan() {
 			if [ "$BACKHAUL" != multi_ap ]; then
 				log "radio $radio: plan carries a backhaul BSS but backhaul mode is off; not applied"
 				continue
+			fi
+			# Seen as soon as the plan names it, even if it cannot be applied: pruning is about the plan
+			# dropping the row, not about this router failing to build one (the same rule as the extra slots).
+			if [ "$SIDE" = sta ]; then
+				SEEN_BACKHAUL="$SEEN_BACKHAUL zte_backhaul_sta_$band"
+			else
+				SEEN_BACKHAUL="$SEEN_BACKHAUL zte_backhaul_$band"
 			fi
 			[ -n "$ssid" ] || { log "radio $radio: backhaul row has no name in the plan; left alone"; continue; }
 			# A row that says it is secured and carries no key is refused at either end: the BSS would go on the
@@ -556,6 +578,8 @@ apply_plan() {
 	# A slot this run did not see is gone from the plan: its section must go too, or the child keeps
 	# broadcasting a network the controller has stopped handing out.
 	[ "$EXTRA" = on ] && prune_extras "$SEEN_EXTRAS"
+	# The same for the end of the backhaul this router is on. clear_backhaul only took the end it left.
+	[ "$BACKHAUL" = multi_ap ] && prune_backhaul "$SEEN_BACKHAUL"
 	key=""
 	return 0
 }
@@ -580,13 +604,19 @@ stamp() {
 
 # One line per run, next to the plan: when it last ran, what it did, and which bands it touched. Without it the only
 # trace of a failed apply is a log line the page cannot read. Fields are plain text on purpose (no quoting game).
+# `owed` is the one field that is read back: it says the values reached /etc/config/wireless but the radios were
+# never told, and it has to outlive the process because procd respawns this script (see apply_and_reload).
 write_status() {
-	local result="$1" message="${2:-}" now
+	local result="$1" message="${2:-}" now tmp
 	now=$(date +%s 2>/dev/null) || now=0
-	( umask 022
-	  printf 'epoch=%s\nresult=%s\nchanged=%s\nbands=%s\nmessage=%s\n' \
-		"$now" "$result" "${CHANGED:-0}" "${APPLIED# }" "$message" > "$STATUS.tmp" &&
-	  mv "$STATUS.tmp" "$STATUS" ) 2>/dev/null || log "cannot write $STATUS"
+	( umask 077
+	  # The temp goes in the host parent, not the shared directory: the sandbox is the same UID and can swap a
+	  # file there between mktemp and the printf that reopens it. The chroot only bind-mounts the shared dir itself.
+	  tmp=$(mktemp "$(dirname "$STATUS")/../.wlan-sync.XXXXXX") || exit 1
+	  trap 'rm -f "$tmp"' 0
+	  printf 'epoch=%s\nresult=%s\nchanged=%s\nbands=%s\nowed=%s\nmessage=%s\n' \
+		"$now" "$result" "${CHANGED:-0}" "${APPLIED# }" "${OWED:-0}" "$message" > "$tmp" &&
+	  mv -fT "$tmp" "$STATUS" ) 2>/dev/null || log "cannot write $STATUS"
 }
 
 apply_and_reload() {
@@ -596,12 +626,16 @@ apply_and_reload() {
 	apply_plan "$1" || { write_status error "the plan could not be applied"; return 1; }
 	warning=$(wpad_warning) || warning=""
 	[ -n "$warning" ] && log "$warning"
-	if [ "$CHANGED" = 1 ]; then
-		uci commit wireless || { log "uci commit failed"; write_status error "uci commit failed"; return 1; }
+	# OWED is an earlier attempt's unfinished half. By the time this runs the values are already in
+	# /etc/config/wireless -- the commit landed and the reload did not -- so apply_plan finds nothing to change,
+	# CHANGED is 0, and without this the run would report ok having reloaded nothing.
+	if [ "$CHANGED" = 1 ] || [ "$OWED" = 1 ]; then
+		uci commit wireless || { log "uci commit failed"; OWED=1; write_status error "uci commit failed"; return 1; }
 		# wifi reload re-reads every radio; a full restart is not needed and would drop the backhaul.
 		if command -v wifi >/dev/null 2>&1; then
-			wifi reload >/dev/null 2>&1 || { log "wifi reload failed"; write_status error "wifi reload failed"; return 1; }
+			wifi reload >/dev/null 2>&1 || { log "wifi reload failed"; OWED=1; write_status error "wifi reload failed"; return 1; }
 		fi
+		OWED=0
 		log "applied; wireless committed and reloaded"
 	else
 		log "plan applied nothing new"
@@ -618,13 +652,34 @@ mark_band() {
 	return 0
 }
 
+# A commit and reload an earlier process did not finish. Read back before the first pass: the values are already in
+# /etc/config/wireless by now, so this run finds nothing to change and would report ok having reloaded nothing.
+OWED=$(sed -n 's/^owed=//p' "$STATUS" 2>/dev/null | head -n 1)
+case "$OWED" in 1) ;; *) OWED=0 ;; esac
+
+# `last` is the stamp of the plan that was applied *successfully*, so a failed one stays new and is tried again.
+# Not every two seconds though: `wifi reload` re-reads every radio, and hammering it would keep dropping clients on
+# bands whose settings never moved. A different plan is always applied at once -- that is the controller saying
+# something new, and making it wait out a backoff is its own bug.
+RETRY_SECONDS=30
 last=""
+failed=""
+retry_at=0
 while :; do
 	if [ -r "$PLAN" ]; then
 		current=$(stamp "$PLAN")
+		now=$(date +%s 2>/dev/null) || now=0
+		due=0
 		if [ "$current" != "$last" ]; then
-			apply_and_reload "$PLAN"
-			last=$current
+			due=1
+			[ "$current" = "$failed" ] && [ "$now" -lt "$retry_at" ] && due=0
+		fi
+		if [ "$due" = 1 ]; then
+			if apply_and_reload "$PLAN"; then
+				last=$current failed="" retry_at=0
+			else
+				failed=$current retry_at=$((now + RETRY_SECONDS))
+			fi
 		fi
 	fi
 	[ "${ONCE:-0}" = 1 ] && exit 0

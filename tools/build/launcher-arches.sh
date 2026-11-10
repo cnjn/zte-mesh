@@ -29,8 +29,8 @@
 #       the full list, so a one-architecture apk cannot be published quietly.
 #
 # Every binary is built -static on purpose: the packaged launcher has to run whatever libc is on the
-# machine (docs/DEVELOPMENT.md section 11.3 tells what a dynamic binary costs when the image's musl is a
-# different release than the toolchain's), and a host cross build has no target rootfs to link against anyway.
+# machine (docs/LAB.md section 7 tells what a dynamic binary costs when the image's musl is a different
+# release than the toolchain's), and a host cross build has no target rootfs to link against anyway.
 # -U_FORTIFY_SOURCE is there because Ubuntu's gcc predefines it, and with -static an unchecked write()
 # return in controller-net.c becomes a fortify warning the build should not have to explain.
 
@@ -90,6 +90,25 @@ done
 
 mkdir -p "$OUT" || exit 1
 
+# elf_is ARCH FILE -> does this binary's own header say it runs on ARCH? The directory name is a claim the
+# dispatcher acts on at run time, and a compiler that answers the call is not necessarily a compiler for that
+# CPU: the x86_64 fallback below is the build host's own musl-gcc/cc, which on an ARM64 host emits ARM64 code
+# and exits 0. So the claim is read back from e_machine (offset 18, little endian) and EI_CLASS (offset 4)
+# rather than believed. An unreadable header fails too -- "cannot confirm" is not "confirmed".
+elf_is() {
+	od -An -tu1 -N20 "$2" 2>/dev/null | awk -v want="$1" '
+		{ for (i = 1; i <= NF; i++) b[++n] = $i }
+		END {
+			if (n < 20) exit 1
+			if (b[1] != 127 || b[2] != 69 || b[3] != 76 || b[4] != 70) exit 1
+			machine = b[19] + b[20] * 256
+			if (want == "aarch64") exit !(machine == 183 && b[5] == 2)
+			if (want == "x86_64") exit !(machine == 62 && b[5] == 2)
+			if (want == "armv7") exit !(machine == 40 && b[5] == 1)
+			exit 1
+		}'
+}
+
 # try_cc ARCH SYSROOT COMPILER... -- one build of both programs. SYSROOT is "none" for the compiler's own
 # search path; what follows it is the compiler, which may be several words.
 try_cc() {
@@ -99,8 +118,17 @@ try_cc() {
 	srarg=""
 	[ "$sr" = none ] || srarg="--sysroot=$sr"
 	# shellcheck disable=SC2086 -- FLAGS, EXTRA_FLAGS and the compiler command are word lists on purpose
-	"$@" $FLAGS $srarg $EXTRA_FLAGS -o "$OUT/$target/ns-run" "$SRC/ns-run.c" "$SRC/controller-net.c" 2>"$OUT/.last-attempt.log" &&
-		"$@" $FLAGS $srarg $EXTRA_FLAGS -o "$OUT/$target/mesh-search" "$SRC/enroller.c" 2>>"$OUT/.last-attempt.log"
+	"$@" $FLAGS $srarg $EXTRA_FLAGS -o "$OUT/$target/ns-run" "$SRC/ns-run.c" "$SRC/controller-net.c" 2>"$OUT/.last-attempt.log" || return 1
+	# shellcheck disable=SC2086
+	"$@" $FLAGS $srarg $EXTRA_FLAGS -o "$OUT/$target/mesh-search" "$SRC/enroller.c" 2>>"$OUT/.last-attempt.log" || return 1
+	for prog in ns-run mesh-search; do
+		if ! elf_is "$target" "$OUT/$target/$prog"; then
+			printf 'the %s this compiler built is not %s code (ELF header unreadable, or e_machine/EI_CLASS say another CPU)\n' \
+				"$prog" "$target" >>"$OUT/.last-attempt.log"
+			return 1
+		fi
+	done
+	return 0
 }
 
 built=""
@@ -133,6 +161,9 @@ for arch in $ARCHES; do
 		[ -n "$candidates" ] || case $arch in
 			aarch64) candidates="aarch64-linux-gnu-gcc" ;;
 			armv7) candidates="arm-linux-gnueabihf-gcc arm-linux-gnueabi-gcc" ;;
+			# The host's own compiler, which is only an x86_64 cross compiler when the host is x86_64.
+			# try_cc reads the ELF header back, so on any other host this candidate is rejected rather
+			# than filed under x86_64.
 			*) candidates="musl-gcc cc" ;;
 		esac
 		sysroots=none
@@ -177,7 +208,9 @@ for arch in $ARCHES; do
 				"$arch" "$candidates" "$arch" >&2
 		else
 			printf 'every compiler for %s failed (tried: %s); the last one said:\n' "$arch" "$candidates" >&2
-			tail -n 5 "$OUT/.last-attempt.log" 2>/dev/null >&2
+			# >&2 first: `2>/dev/null >&2` points stdout at the null that was just opened, so the reason
+			# never reached the build log and a failed architecture looked like a silent one.
+			tail -n 5 "$OUT/.last-attempt.log" >&2 2>/dev/null
 		fi
 		rm -f "$OUT/$arch/ns-run" "$OUT/$arch/mesh-search"
 		rmdir "$OUT/$arch" 2>/dev/null

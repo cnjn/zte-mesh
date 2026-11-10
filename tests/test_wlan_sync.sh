@@ -82,6 +82,9 @@ delete)
 	;;
 commit)
 	echo "commit $*" >> "$UCI_DB.log"
+	# An `if`, not `[ … ] && exit 1`: this is the last command of the stub, and a false test would otherwise
+	# become its exit status -- every commit in every case would fail.
+	if [ "${UCI_COMMIT_FAIL:-0}" = 1 ]; then exit 1; fi
 	;;
 *)
 	[ "$quiet" = 1 ] || echo "uci: unknown $cmd" >&2
@@ -92,6 +95,7 @@ UCI
 cat > "$T/bin/wifi" <<'WIFI'
 #!/bin/sh
 echo "wifi $*" >> "$UCI_DB.log"
+if [ "${WIFI_FAIL:-0}" = 1 ]; then exit 1; fi
 WIFI
 cat > "$T/bin/logger" <<'LOGGER'
 #!/bin/sh
@@ -613,6 +617,109 @@ sh "$WLAN_SYNC" "$PLAN_BH" --once >"$T/out" 2>&1
 check "role main is still the master end" wifi-iface "$(val type.zte_backhaul_2g)"
 check "role main builds no client" "" "$(val type.zte_backhaul_sta_2g)"
 
+# --- a backhaul row the plan stops carrying ---------------------------------------------------------------
+# clear_backhaul only takes the end this router *left* (master->child, or the mode going off). The end it is still
+# on kept every section it had ever built: a controller that stopped publishing the 5 GHz backhaul left a master
+# advertising a BSS nobody joins and a child with a client pointing at a network that is gone. The extra slots
+# already had this rule (prune_extras); the backhaul did not.
+PLAN_BH2=$T/plan-bh-both
+cat > "$PLAN_BH2" <<'PLAN'
+rows=4
+0.radio=0
+0.slot=0
+0.ssid=zte-agent-2g
+0.key=m2-public-2g-key
+0.enabled=1
+0.hidden=0
+0.access=32
+0.beacon_type=6
+1.radio=0
+1.slot=3
+1.ssid=ZMESH-bh-2g
+1.key=backhaul-2g-key
+1.enabled=1
+1.hidden=1
+1.access=64
+1.beacon_type=6
+2.radio=1
+2.slot=0
+2.ssid=zte-agent-5g
+2.key=m2-public-5g-key
+2.enabled=1
+2.hidden=0
+2.access=32
+2.beacon_type=3
+3.radio=1
+3.slot=3
+3.ssid=ZMESH-bh-5g
+3.key=backhaul-5g-key
+3.enabled=1
+3.hidden=1
+3.access=64
+3.beacon_type=3
+PLAN
+sed -e '/^3\./d' -e 's/^rows=4$/rows=3/' "$PLAN_BH2" > "$T/plan-bh-drop5g"
+sed -e 's/^3.ssid=ZMESH-bh-5g$/3.ssid=/' "$PLAN_BH2" > "$T/plan-bh-noname"
+
+seed_db
+backhaul_on
+role_master
+sh "$WLAN_SYNC" "$PLAN_BH2" --once >"$T/out" 2>&1
+check "both bands: the 2g BSS is built" wifi-iface "$(val type.zte_backhaul_2g)"
+check "both bands: the 5g BSS is built" wifi-iface "$(val type.zte_backhaul_5g)"
+: > "$LOG"
+sh "$WLAN_SYNC" "$T/plan-bh-drop5g" --once >"$T/out" 2>&1
+check "dropped row: the 5g BSS is removed" "" "$(val type.zte_backhaul_5g)"
+check "dropped row: the 2g BSS stays" wifi-iface "$(val type.zte_backhaul_2g)"
+check "dropped row: the removal is said" yes \
+	"$(has 'the plan no longer carries the backhaul of 5g; removed zte_backhaul_5g')"
+check "dropped row: one commit" 1 "$(grep -c '^commit wireless$' "$LOG")"
+check "dropped row: one reload" 1 "$(grep -c '^wifi reload$' "$LOG")"
+check "dropped row: the fronthaul of the main BSS stays" 1 "$(val default_radio0.multi_ap)"
+
+seed_db
+backhaul_on
+role_child
+sh "$WLAN_SYNC" "$PLAN_BH2" --once >"$T/out" 2>&1
+check "child both bands: the 2g client is built" wifi-iface "$(val type.zte_backhaul_sta_2g)"
+check "child both bands: the 5g client is built" wifi-iface "$(val type.zte_backhaul_sta_5g)"
+: > "$LOG"
+sh "$WLAN_SYNC" "$T/plan-bh-drop5g" --once >"$T/out" 2>&1
+check "child dropped row: the 5g client is removed" "" "$(val type.zte_backhaul_sta_5g)"
+check "child dropped row: the 2g client stays" wifi-iface "$(val type.zte_backhaul_sta_2g)"
+check "child dropped row: no BSS of its own appears" "" "$(val type.zte_backhaul_5g)"
+check "child dropped row: the removal is said" yes \
+	"$(has 'the plan no longer carries the backhaul of 5g; removed zte_backhaul_sta_5g')"
+
+# A row the plan still names is not a dropped row, even when this router cannot build it: pruning is about the
+# controller taking the network back, not about a half-filled M2. The same rule the extra slots already follow.
+seed_db
+backhaul_on
+role_master
+sh "$WLAN_SYNC" "$PLAN_BH2" --once >"$T/out" 2>&1
+: > "$LOG"
+sh "$WLAN_SYNC" "$T/plan-bh-noname" --once >"$T/out" 2>&1
+check "row still named: the section is kept" wifi-iface "$(val type.zte_backhaul_5g)"
+check "row still named: the refusal is said" yes "$(has 'backhaul row has no name in the plan')"
+check "row still named: nothing was pruned" no "$(has 'the plan no longer carries the backhaul')"
+
+# rows=0 says the same thing once: the plan carries nothing, so everything this script owns goes. The early return
+# used to skip both prunes and leave the whole set on the air.
+printf 'rows=0\n' > "$T/plan-empty"
+seed_db
+backhaul_on
+role_master
+# extra_on/extra_off are defined by the section below; this case only needs the option set.
+printf '1' > "$DB/zte_mesh.main.extra_slots"
+sh "$WLAN_SYNC" "$PLAN_BH2" --once >"$T/out" 2>&1
+printf 'wifi-iface' > "$DB/type.zte_extra_2g_1"
+: > "$LOG"
+sh "$WLAN_SYNC" "$T/plan-empty" --once >"$T/out" 2>&1
+check "empty plan: both backhaul BSSes go" "" "$(val type.zte_backhaul_2g)$(val type.zte_backhaul_5g)"
+check "empty plan: the extra slot goes too" "" "$(val type.zte_extra_2g_1)"
+check "empty plan: the mode is still on, so the fronthaul flag stays" 1 "$(val default_radio0.multi_ap)"
+check "empty plan: not an error" ok "$(status_val result)"
+
 
 # --- extra SSID slots (zte_mesh.main.extra_slots) ---------------------------------------------------------
 # The controller hands out up to three extra SSIDs per band (slot 1 guest, 2 spare, 3 hidden backhaul) and the
@@ -783,6 +890,254 @@ sh "$WLAN_SYNC" "$PLAN" --once >"$T/out" 2>&1
 check "status: a no-op run reports no change" 0 "$(status_val changed)"
 check "status: a no-op run names no band" "" "$(status_val bands)"
 check "status: still ok" ok "$(status_val result)"
+
+# --- a failed apply is not a finished one -----------------------------------------------------------------
+# The loop used to record the plan's digest whether the apply worked or not, so a plan whose `wifi reload` failed
+# was never tried again while its content stayed the same. After a respawn it was worse: the commit had landed, so
+# the next process found /etc/config/wireless already matching the plan, changed nothing, skipped the reload and
+# reported ok. `owed` in the status file is what carries that unfinished half across the process boundary.
+seed_db
+WIFI_FAIL=1 sh "$WLAN_SYNC" "$PLAN" --once >"$T/out" 2>&1
+check "reload failed: the values were still written" zte-agent-2g "$(val default_radio0.ssid)"
+check "reload failed: status is error" error "$(status_val result)"
+check "reload failed: the message names the reload" "wifi reload failed" "$(status_val message)"
+check "reload failed: a reload is owed" 1 "$(status_val owed)"
+
+# A new process, the same plan, wifi working again. Nothing is left to write -- and that is exactly the case that
+# used to report ok without reloading: the radios never picked up the profile the config file already holds.
+: > "$LOG"
+sh "$WLAN_SYNC" "$PLAN" --once >"$T/out" 2>&1
+check "respawn: nothing left to write" 0 "$(grep -c '^set ' "$LOG")"
+check "respawn: the owed commit happens" 1 "$(grep -c '^commit wireless$' "$LOG")"
+check "respawn: the owed reload happens" 1 "$(grep -c '^wifi reload$' "$LOG")"
+check "respawn: now ok" ok "$(status_val result)"
+check "respawn: nothing owed any more" 0 "$(status_val owed)"
+
+# A healthy no-op still owes nothing: the flag must not turn every quiet pass into a reload of every radio.
+: > "$LOG"
+sh "$WLAN_SYNC" "$PLAN" --once >"$T/out" 2>&1
+check "no-op: no reload" 0 "$(grep -c '^wifi ' "$LOG")"
+check "no-op: nothing owed" 0 "$(status_val owed)"
+check "no-op: still ok" ok "$(status_val result)"
+
+# The other half of the same failure: the commit did not land, so no reload was attempted and the next run owes both.
+seed_db
+UCI_COMMIT_FAIL=1 sh "$WLAN_SYNC" "$PLAN" --once >"$T/out" 2>&1
+check "commit failed: status is error" error "$(status_val result)"
+check "commit failed: the message names the commit" "uci commit failed" "$(status_val message)"
+check "commit failed: a reload is owed" 1 "$(status_val owed)"
+check "commit failed: no reload was attempted" 0 "$(grep -c '^wifi ' "$LOG")"
+: > "$LOG"
+sh "$WLAN_SYNC" "$PLAN" --once >"$T/out" 2>&1
+check "commit retried: the commit happens" 1 "$(grep -c '^commit wireless$' "$LOG")"
+check "commit retried: the reload happens" 1 "$(grep -c '^wifi reload$' "$LOG")"
+check "commit retried: now ok" ok "$(status_val result)"
+check "commit retried: nothing owed" 0 "$(status_val owed)"
+
+# The loop itself, driven by a sleep stub that advances a fake clock and stops the script after the asked number of
+# passes. Waiting out the real 30 s backoff is not a host test, and `--once` never reaches the retry at all.
+loop_bin=$T/loop-bin
+loop_clock=$T/loop-clock
+loop_plan=$T/loop-plan
+mkdir -p "$loop_bin" "$loop_clock"
+LOOP_CLOCK=$loop_clock
+LOOP_REAL_DATE=$(command -v date)
+# The stub republishes a plan by overwriting this file, so it is a copy: $PLAN is a fixture the cases above and
+# below still read.
+LOOP_PLAN=$loop_plan
+export LOOP_CLOCK LOOP_REAL_DATE LOOP_PLAN
+cat > "$loop_bin/sleep" <<'SLEEP'
+#!/bin/sh
+n=$(cat "$LOOP_CLOCK/passes" 2>/dev/null) || n=0
+n=$((n + 1))
+printf '%s\n' "$n" > "$LOOP_CLOCK/passes"
+printf '%s\n' "$(( $(cat "$LOOP_CLOCK/now") + 2 ))" > "$LOOP_CLOCK/now"
+# A different plan published mid-backoff: the controller saying something new must not wait it out.
+if [ "$n" = 2 ] && [ -n "${LOOP_NEW_PLAN:-}" ]; then cp "$LOOP_NEW_PLAN" "$LOOP_PLAN"; fi
+[ "$n" -lt "${LOOP_PASSES:-1}" ] || kill -TERM "$PPID" 2>/dev/null
+exit 0
+SLEEP
+cat > "$loop_bin/date" <<'DATE'
+#!/bin/sh
+if [ "${1:-}" = +%s ]; then cat "$LOOP_CLOCK/now"; exit 0; fi
+exec "$LOOP_REAL_DATE" "$@"
+DATE
+cat > "$loop_bin/wifi" <<'WIFI'
+#!/bin/sh
+echo "wifi $*" >> "$UCI_DB.log"
+n=$(cat "$LOOP_CLOCK/wifi-calls" 2>/dev/null) || n=0
+n=$((n + 1))
+printf '%s\n' "$n" > "$LOOP_CLOCK/wifi-calls"
+if [ "$n" -le "${WIFI_FAIL_FIRST:-0}" ]; then exit 1; fi
+WIFI
+chmod +x "$loop_bin/sleep" "$loop_bin/date" "$loop_bin/wifi"
+loop_reset() {
+	printf '0\n' > "$loop_clock/passes"
+	printf '1000\n' > "$loop_clock/now"
+	rm -f "$loop_clock/wifi-calls"
+}
+
+# wifi fails once and works from the second attempt on: the same plan has to be applied again, not remembered as done.
+seed_db
+loop_reset
+cp "$PLAN" "$loop_plan"
+LOOP_PASSES=20 WIFI_FAIL_FIRST=1 PATH="$loop_bin:$PATH" sh "$WLAN_SYNC" "$loop_plan" >"$T/out" 2>&1
+check "retry: the reload was attempted twice" 2 "$(grep -c '^wifi reload$' "$LOG")"
+check "retry: the second attempt succeeded" ok "$(status_val result)"
+check "retry: nothing owed at the end" 0 "$(status_val owed)"
+check "retry: the profile is on the config" zte-agent-2g "$(val default_radio0.ssid)"
+
+# A reload that keeps failing is retried on the backoff, not every pass: each attempt re-reads every radio, so
+# hammering it would keep dropping clients on bands whose settings never moved. 40 passes span two backoffs.
+seed_db
+loop_reset
+cp "$PLAN" "$loop_plan"
+LOOP_PASSES=40 WIFI_FAIL_FIRST=99 PATH="$loop_bin:$PATH" sh "$WLAN_SYNC" "$loop_plan" >"$T/out" 2>&1
+check "backoff: 40 passes are three attempts, not 40" 3 "$(grep -c '^wifi reload$' "$LOG")"
+check "backoff: still error" error "$(status_val result)"
+check "backoff: still owed" 1 "$(status_val owed)"
+
+# A new plan during the backoff is applied at once. The stub publishes plan2 on the second pass, while the first
+# plan is still waiting out its 30 s; the disabled 2.4 GHz row must reach the config without that wait.
+seed_db
+loop_reset
+cp "$PLAN" "$loop_plan"
+LOOP_PASSES=6 WIFI_FAIL_FIRST=99 LOOP_NEW_PLAN=$T/plan2 PATH="$loop_bin:$PATH" sh "$WLAN_SYNC" "$loop_plan" >"$T/out" 2>&1
+check "new plan: applied during the backoff" 1 "$(val default_radio0.disabled)"
+check "new plan: the 5 GHz row went open" none "$(val default_radio1.encryption)"
+check "new plan: two attempts, one per plan" 2 "$(grep -c '^wifi reload$' "$LOG")"
+
+# --- status publication across the sandbox boundary -------------------------------------------------------
+# Only shared dir is sandbox-visible. Its host parent is on the same filesystem but cannot be renamed into
+# by the sandbox, even though both processes have the same UID. Keep all fixtures inside the test's own root.
+STATUS_TEST_ROOT=$T/status-host
+STATUS_TEST_SHARED="$STATUS_TEST_ROOT/shared dir"
+STATUS_TEST_MKTEMP=$(command -v mktemp)
+STATUS_TEST_MV=$(command -v mv)
+export STATUS_TEST_ROOT STATUS_TEST_SHARED STATUS_TEST_MKTEMP STATUS_TEST_MV
+status_bin=$T/status-bin
+status_script=$(cd "$(dirname "$WLAN_SYNC")" && pwd)/$(basename "$WLAN_SYNC")
+status_plan=$STATUS_TEST_SHARED/plan
+status_file=$STATUS_TEST_SHARED/wlan-sync.status
+mkdir -p "$STATUS_TEST_SHARED" "$status_bin" "$STATUS_TEST_ROOT/victim-dir"
+printf 'rows=0\n' > "$status_plan"
+printf 'protected file\n' > "$STATUS_TEST_ROOT/victim"
+printf 'protected directory\n' > "$STATUS_TEST_ROOT/victim-dir/keep"
+cat > "$status_bin/mktemp" <<'MKTEMP'
+#!/bin/sh
+[ "${STATUS_TEST_FAIL:-}" = mktemp ] && exit 1
+tmp=$("$STATUS_TEST_MKTEMP" "$@") || exit 1
+dir=$(cd "$(dirname "$tmp")" && pwd) || exit 1
+printf '%s\n' "$dir/${tmp##*/}" > "$STATUS_TEST_ROOT/temp-path"
+printf '%s\n' "$dir" > "$STATUS_TEST_ROOT/temp-dir"
+# Deterministically win the same-UID race before the caller can reopen a shared temporary file.
+case "$dir/" in
+"$STATUS_TEST_SHARED/"*)
+	rm -f "$tmp"
+	ln -s "$STATUS_TEST_ROOT/victim" "$tmp" || exit 1
+	;;
+esac
+printf '%s\n' "$tmp"
+MKTEMP
+cat > "$status_bin/mv" <<'MV'
+#!/bin/sh
+: > "$STATUS_TEST_ROOT/mv-called"
+[ "${STATUS_TEST_FAIL:-}" = mv ] && exit 1
+exec "$STATUS_TEST_MV" "$@"
+MV
+chmod +x "$status_bin/mktemp" "$status_bin/mv"
+status_run() (
+	rm -f "$STATUS_TEST_ROOT/temp-path" "$STATUS_TEST_ROOT/temp-dir" "$STATUS_TEST_ROOT/mv-called"
+	cd "${1:-$STATUS_TEST_ROOT}" || exit 1
+	PATH="$status_bin:$PATH" sh -c '
+		if [ "${STATUS_TEST_FAIL:-}" = write ]; then
+			printf() {
+				command printf "$@" || return
+				case "$1" in epoch=*) return 1 ;; esac
+			}
+		fi
+		script=$1; shift
+		. "$script"
+	' sh "$status_script" "${2:-$status_plan}" --once >"$T/out" 2>&1
+)
+status_temp_gone() {
+	check "$1: temp in host parent" "$STATUS_TEST_ROOT" "$(cat "$STATUS_TEST_ROOT/temp-dir" 2>/dev/null)"
+	status_tmp=$(cat "$STATUS_TEST_ROOT/temp-path" 2>/dev/null)
+	check "$1: temp removed" yes "$([ -n "$status_tmp" ] && [ ! -e "$status_tmp" ] && [ ! -L "$status_tmp" ] && echo yes)"
+}
+status_regular() { [ -f "$status_file" ] && [ ! -L "$status_file" ] && echo yes; }
+
+# Verify the race stub actually replaces a shared temp, rather than merely claiming that it would.
+status_probe=$(PATH="$status_bin:$PATH" mktemp "$STATUS_TEST_SHARED/probe.XXXXXX")
+check "status race stub: shared temp swapped" yes "$([ -L "$status_probe" ] && echo yes)"
+rm -f "$status_probe"
+
+seed_db
+ln -s "$STATUS_TEST_ROOT/victim" "$status_file.tmp"
+status_run
+check "status: fixed .tmp symlink target untouched" "protected file" "$(cat "$STATUS_TEST_ROOT/victim")"
+check "status: fixed .tmp symlink unused" yes "$([ -L "$status_file.tmp" ] && echo yes)"
+check "status: publishes a regular file" yes "$(status_regular)"
+check "status: publishes result" result=ok "$(grep '^result=' "$status_file")"
+check "status: private or read-only permissions" "$status_file" \
+	"$(find "$status_file" -type f \( -perm 0600 -o -perm 0644 \))"
+status_temp_gone "status publish"
+
+for target in victim victim-dir; do
+	rm -f "$status_file"
+	ln -s "$STATUS_TEST_ROOT/$target" "$status_file"
+	status_run
+	check "status symlink to $target: replaced with regular file" yes "$(status_regular)"
+	check "status symlink to $target: result" result=ok "$(grep '^result=' "$status_file" 2>/dev/null)"
+	check "status symlink to $target: file target untouched" "protected file" "$(cat "$STATUS_TEST_ROOT/victim")"
+	check "status symlink to $target: directory content untouched" "protected directory" "$(cat "$STATUS_TEST_ROOT/victim-dir/keep")"
+	check "status symlink to $target: no file moved into directory" 1 \
+		"$(find "$STATUS_TEST_ROOT/victim-dir" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
+	status_temp_gone "status symlink to $target"
+done
+
+# Both forms of relative PLAN must still publish beside it and create the temp one directory above it.
+for relative in nested basename; do
+	printf 'stale status\n' > "$status_file"
+	if [ "$relative" = nested ]; then
+		status_run "$STATUS_TEST_ROOT" 'shared dir/plan'
+	else
+		status_run "$STATUS_TEST_SHARED" plan
+	fi
+	check "status relative $relative: repeated write" result=ok "$(grep '^result=' "$status_file")"
+	check "status relative $relative: regular file" yes "$(status_regular)"
+	status_temp_gone "status relative $relative"
+done
+
+# A real directory is not a destination to traverse, even when empty. A failed rename must remove the temp.
+rm -f "$status_file"
+mkdir "$status_file"
+: > "$LOG"
+status_run
+check "status directory: preserved" yes "$([ -d "$status_file" ] && echo yes)"
+check "status directory: no file moved inside" 0 "$(find "$status_file" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
+check "status directory: failure logged" yes "$(has 'cannot write .*wlan-sync.status')"
+status_temp_gone "status directory"
+# Remove test contents too if an unsafe implementation moved a file inside, so later cases still execute.
+rm -rf "$status_file"
+
+# Inject write, rename and allocation failures without relying on permissions (the runner may be root).
+printf 'last good status\n' > "$status_file"
+for failure in write mv mktemp; do
+	: > "$LOG"
+	STATUS_TEST_FAIL=$failure status_run
+	check "status $failure failure: previous status kept" "last good status" "$(cat "$status_file")"
+	check "status $failure failure: logged" yes "$(has 'cannot write .*wlan-sync.status')"
+	if [ "$failure" != mktemp ]; then
+		status_temp_gone "status $failure failure"
+	else
+		check "status mktemp failure: no temp allocated" no "$([ -e "$STATUS_TEST_ROOT/temp-path" ] && echo yes || echo no)"
+	fi
+	if [ "$failure" != mv ]; then
+		check "status $failure failure: no rename attempted" no "$([ -e "$STATUS_TEST_ROOT/mv-called" ] && echo yes || echo no)"
+	fi
+done
+check "status race: shared-file replacement never reached victim" "protected file" "$(cat "$STATUS_TEST_ROOT/victim")"
 
 # --- the installed wpad variant --------------------------------------------------------------------------
 # The backhaul options this script writes (`multi_ap` on either end, and the `wds` that opens 4-address mode on a

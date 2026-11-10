@@ -42,6 +42,8 @@ int actions_configure(struct action_table *table, long now, const struct action_
 
     if (!table || (count && !intents))
         return -1;
+    if (count > ACTION_MAX)
+        return -1;
     table->now = now;
     /* A rule that is no longer wanted still has to be undone on the agent, so bans are marked for lifting and
      * only removed after the undo has gone out. Everything else that vanished is forgotten right here. */
@@ -59,7 +61,9 @@ int actions_configure(struct action_table *table, long now, const struct action_
             table->entry[i].lift = 1;
             table->entry[i].state = ACTION_PENDING;
             table->entry[i].expires = 0;
-            table->entry[i].next = now;
+            if (!table->entry[i].releasing)
+                table->entry[i].next = now;
+            table->entry[i].releasing = 1;
             i++;
         } else if (entry->kind == ACTION_KIND_BAN) {
             i++; /* already waiting for its undo to go out */
@@ -80,6 +84,7 @@ int actions_configure(struct action_table *table, long now, const struct action_
             if (entry->kind == ACTION_KIND_BAN && entry->lift) {
                 /* The rule came back before its undo went out: cancel the undo, and send the block again. */
                 entry->lift = 0;
+                entry->releasing = 0;
                 entry->state = ACTION_PENDING;
                 entry->next = now;
                 entry->minutes = intents[i].minutes;
@@ -89,13 +94,21 @@ int actions_configure(struct action_table *table, long now, const struct action_
                  * user saying "block it again, for this long". */
                 entry->minutes = intents[i].minutes;
                 entry->expires = intents[i].minutes ? now + (long)intents[i].minutes * 60 : 0;
+                entry->releasing = 0;
                 entry->state = ACTION_PENDING;
                 entry->next = now;
             }
             continue;
         }
-        if (table->count >= ACTION_MAX)
-            return -1;
+        if (table->count >= ACTION_MAX) {
+            /* No room yet, which is not a refusal: a ban whose rule was removed keeps its entry until its undo
+             * has been sent, so replacing one of eight rules used to overflow the table here. Returning -1 made
+             * the caller skip actions_tick() -- the only thing that sends the undo and frees the entry -- so
+             * every later pass failed the same way and no client action ever went out again. Defer the intent
+             * instead: the daemon hands the same list in once a second, and the next pass inserts it once the
+             * release has drained. */
+            continue;
+        }
         entry = &table->entry[table->count++];
         memset(entry, 0, sizeof(*entry));
         memcpy(entry->mac, intents[i].mac, 6);
@@ -129,60 +142,66 @@ unsigned int actions_tick(struct action_table *table, long now, struct action_du
     if (!table || !out)
         return 0;
     table->now = now;
-    for (i = 0; i < table->count;) {
+    for (i = 0; i < table->count; i++) {
         struct action_entry *entry = &table->entry[i];
 
         if (entry->kind == ACTION_KIND_BAN) {
-            if (entry->lift) {
-                /* The user removed the rule: say so on the agent, then forget it. */
-                emit(out, &used, max, entry, 1);
-                drop(table, i);
+            if (entry->state == ACTION_EXPIRED)
                 continue;
+            if (!entry->releasing && entry->expires && now >= entry->expires) {
+                /* Expiry bypasses the block refresh once, but must not bypass the allow retry timer. */
+                entry->releasing = 1;
+                entry->state = ACTION_PENDING;
+                entry->next = now;
             }
-            if (entry->state == ACTION_EXPIRED) {
-                i++;
-                continue;
-            }
-            if (entry->expires && now >= entry->expires) {
-                /* Time is up: say so on the agent and keep the row as "expired" instead of dropping it. Dropping
-                 * would let the next config pass (one second later) create it again from the same unchanged rule,
-                 * and the client would be blocked, released and blocked again for ever. */
-                emit(out, &used, max, entry, 1);
-                entry->state = ACTION_EXPIRED;
-                entry->expires = 0;
-                entry->next = 0;
-                i++;
-                continue;
-            }
-            if (entry->state == ACTION_PENDING || now >= entry->next) {
-                emit(out, &used, max, entry, 0);
-                entry->state = ACTION_SENT;
+            if (now >= entry->next && used < max) {
+                emit(out, &used, max, entry, entry->releasing);
+                entry->state = ACTION_PENDING;
                 entry->attempts++;
-                entry->next = now + ACTION_BAN_REFRESH;
+                entry->next = now + ACTION_KICK_RETRY;
             }
-            i++;
             continue;
         }
 
+        if (entry->state == ACTION_DONE || entry->state == ACTION_FAILED)
+            continue;
         /* A kick that has run out of time without an answer is reported as failed instead of retried forever. */
-        if (entry->state == ACTION_SENT && now >= entry->expires) {
+        if (now >= entry->expires) {
             entry->state = ACTION_FAILED;
-            i++;
             continue;
         }
-        if (entry->state == ACTION_DONE || entry->state == ACTION_FAILED) {
-            i++;
-            continue;
-        }
-        if (now >= entry->next && entry->attempts < ACTION_KICK_TRIES) {
+        if (now >= entry->next && entry->attempts < ACTION_KICK_TRIES && used < max) {
             emit(out, &used, max, entry, 0);
-            entry->state = ACTION_SENT;
+            entry->state = ACTION_PENDING;
             entry->attempts++;
             entry->next = now + ACTION_KICK_RETRY;
         }
-        i++;
     }
     return used;
+}
+
+void actions_send_result(struct action_table *table, const struct action_due *due, int ok)
+{
+    struct action_entry *entry;
+
+    if (!table || !due)
+        return;
+    entry = find(table, due->mac, due->kind);
+    if (!entry || entry->state != ACTION_PENDING || entry->releasing != due->allow || !ok)
+        return;
+    if (entry->kind == ACTION_KIND_BAN && due->allow) {
+        if (entry->lift) {
+            drop(table, (unsigned int)(entry - table->entry));
+        } else {
+            entry->state = ACTION_EXPIRED;
+            entry->expires = 0;
+            entry->next = 0;
+        }
+        return;
+    }
+    entry->state = ACTION_SENT;
+    if (entry->kind == ACTION_KIND_BAN)
+        entry->next = table->now + ACTION_BAN_REFRESH;
 }
 
 void actions_observe(struct action_table *table, const uint8_t mac[6], int ok)
