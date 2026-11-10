@@ -1,18 +1,24 @@
-/* Host test of the agent synchroniser's pure part: the plan text the host-side wlan-sync parses, and the
- * change detector that decides whether a plan has to be written at all. The database side is exercised on the
- * lab router (db-engine-probe --agent-startup), not here: agent_sync_read() needs the vendor shared-memory engine, so
- * the four vendor symbols it uses are stubbed and only agent_sync_format()/agent_sync_changed() are driven.
+/* Host test of the agent synchroniser: the plan text the host-side wlan-sync parses, the change detector that
+ * decides whether a plan has to be written at all, and the write itself. The database side is exercised on the
+ * lab router (docs/LAB.md section 3.1), not here: agent_sync_read() needs the vendor shared-memory engine, so
+ * the five vendor symbols it uses are stubbed. With those stubs no row is readable, which is what lets
+ * agent_sync_poll() run all the way to plan_write() with an empty plan.
  */
+#define _GNU_SOURCE
 #include "agent-sync.h"
+#include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static unsigned int failures;
 #define CHECK(cond) do { \
     if (!(cond)) { printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #cond); failures++; } \
 } while (0)
 
-/* Link stubs: never reached by the two functions under test. */
+/* Link stubs: the reader walks them and finds no readable row, so the poll publishes an empty plan. */
 int dbAPIGetView(const char *view, const char *instance, void *data)
 {
     (void)view; (void)instance; (void)data;
@@ -83,6 +89,78 @@ static int count_lines(const char *text, const char *prefix)
         at = (size_t)(end - text) + 1;
     }
     return n;
+}
+
+static int file_text(const char *path, char *out, size_t capacity)
+{
+    FILE *f = fopen(path, "r");
+    size_t n;
+    if (!f)
+        return -1;
+    n = fread(out, 1, capacity - 1, f);
+    out[n] = 0;
+    fclose(f);
+    return 0;
+}
+
+/* The temp name is fixed ("<path>.tmp") and its directory is the one host path the sandbox may write, and the
+ * sandbox runs as this same UID. A symlink planted there must not steer the write: the plan carries passphrases. */
+static void plan_write_tests(void)
+{
+    char root[80], path[128], temp[128], victim[128], escaped[128], text[512];
+    struct stat st;
+    int fd;
+
+    snprintf(root, sizeof(root), "/tmp/zte-agentsync-%ld-XXXXXX", (long)getpid());
+    if (!mkdtemp(root)) {
+        fprintf(stderr, "agent-sync-codec: cannot make a temporary directory\n");
+        failures++;
+        return;
+    }
+    snprintf(path, sizeof(path), "%s/wlan-plan", root);
+    snprintf(temp, sizeof(temp), "%s.tmp", path);
+    snprintf(victim, sizeof(victim), "%s/victim", root);
+    snprintf(escaped, sizeof(escaped), "%s/escaped", root);
+
+    agent_sync_reset();
+    CHECK(agent_sync_poll(path) == 1);
+    CHECK(stat(path, &st) == 0);
+    CHECK(S_ISREG(st.st_mode));
+    CHECK((st.st_mode & 0777) == 0600);
+    CHECK(lstat(temp, &st) != 0);
+    CHECK(file_text(path, text, sizeof(text)) == 0);
+    CHECK(strstr(text, "\nrows=0\n") != NULL);
+
+    /* An existing file behind the temp name: refused, and neither it nor the published plan is touched. */
+    fd = open(victim, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        CHECK(write(fd, "untouched\n", 10) == 10);
+        (void)close(fd);
+    }
+    CHECK(symlink(victim, temp) == 0);
+    agent_sync_reset();
+    CHECK(agent_sync_poll(path) == -1);
+    CHECK(lstat(temp, &st) == 0);
+    CHECK(S_ISLNK(st.st_mode));
+    CHECK(file_text(victim, text, sizeof(text)) == 0);
+    CHECK(!strcmp(text, "untouched\n"));
+    CHECK(file_text(path, text, sizeof(text)) == 0);
+    CHECK(strstr(text, "\nrows=0\n") != NULL);
+    (void)unlink(temp);
+
+    /* A name that does not exist yet: without O_NOFOLLOW, O_CREAT would make it and put the plan there. */
+    CHECK(symlink(escaped, temp) == 0);
+    agent_sync_reset();
+    CHECK(agent_sync_poll(path) == -1);
+    CHECK(stat(escaped, &st) != 0);
+    CHECK(lstat(temp, &st) == 0);
+    CHECK(S_ISLNK(st.st_mode));
+
+    (void)unlink(temp);
+    (void)unlink(victim);
+    (void)unlink(path);
+    (void)rmdir(root);
 }
 
 int main(void)
@@ -171,6 +249,8 @@ int main(void)
     /* a different number of rows is a change even when the first ones agree */
     CHECK(agent_sync_changed(before, 1, rows, 0) == 1);
     CHECK(agent_sync_changed(before, 0, rows, 1) == 1);
+
+    plan_write_tests();
 
     if (failures) {
         printf("agent-sync-codec: %u assertion(s) failed\n", failures);

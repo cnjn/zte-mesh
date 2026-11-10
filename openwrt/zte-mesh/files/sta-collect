@@ -1,0 +1,190 @@
+#!/bin/sh
+# Measure how many stations sit on this router's own access points, for the AP Metric answer.
+#
+#   sta-collect [FILE] [SECONDS] [--once]
+#
+# A controller asks an agent for an AP Metric (CMDU 0x800b; its TLV 0x93 lists the BSSIDs it wants to know about) and
+# the agent answers with one TLV 0x94 per BSS: BSSID, channel utilisation, station count, presence bitmap. On a
+# factory router that count comes from the Wi-Fi driver through cspd. The sandbox has neither, so the vendor agent
+# inside it receives the query and stays silent -- which is what a user sees as an empty station column for every
+# OpenWrt child router.
+#
+# The numbers can only be taken here, outside the sandbox: the radios live in the host's /sys, and ns-run builds the
+# daemon a root with no /proc and no /sys. So this script writes /run/zte-mesh/ap-sta -- an `epoch=<unix time>` line
+# and then one `<bssid> <count>` line per access point -- and the responder library inside the sandbox reads that file
+# to build its answer. That directory is bind-mounted into the private root at the same path, which is how the Wi-Fi
+# plan already travels the other way round (agent-sync.c publishes it there, openwrt/zte-mesh/files/wlan-sync applies
+# it).
+#
+# The access points come from netifd, filtered to mode=ap, and that filter is the whole job: a client interface --
+# the backhaul station a child builds toward its controller -- has a stations directory of its own, and counting it
+# would report the controller as one of this router's terminals.
+#
+# netifd's reply also carries the Wi-Fi key, so nothing read here is kept or logged: only an interface name and a
+# number leave this script.
+#
+# A board with no radios, a radio that is down and a missing debugfs all produce an empty table, which is what the
+# responder needs in order to say nothing rather than to answer with counts it never measured.
+#
+# One switch for this loop alone: a $DIR/collect-pause file stops the writes, and deleting it starts them again. The
+# table is left where it is, so what the controller sees is an ageing table -- the responder stops answering from a
+# table older than its freshness window, and the station column falls back. That is the input PLAN H-15 ⑤⑥ needs
+# ("the collector stops, does the node go silent?"), and the procd way of stopping this instance only looks equivalent:
+# measured 2026-11-05, `ubus call service delete` stops it, but bringing it back means /etc/init.d/zte-mesh start, and
+# that replaces the controller daemon too -- the child drops out of the topology for a few seconds, so the reading you
+# get is a restart's, not the collector's.
+
+# Two positional values and a switch, in any order: a path never looks like a number, so the first argument with a
+# non-digit in it is the file and the first all-digit one is the interval.
+FILE=""
+INTERVAL=""
+ONCE=""
+for argument in "$@"; do
+	case "$argument" in
+	--once) ONCE=1 ;;
+	*[!0-9]*) [ -z "$FILE" ] && FILE=$argument ;;
+	*) [ -z "$INTERVAL" ] && INTERVAL=$argument ;;
+	esac
+done
+[ -n "$FILE" ] || FILE=/run/zte-mesh/ap-sta
+[ -n "$INTERVAL" ] || INTERVAL=5
+DIR=${FILE%/*}
+# the stop/switch for this loop alone, beside the table it stops writing (see the note above); its path is derived, so
+# a test that names a table under a temporary root gets its own flag file.
+PAUSE=$DIR/collect-pause
+DEBUG=${ZTE_MESH_MAC80211_DEBUG:-/sys/kernel/debug/ieee80211}
+
+log() { logger -t zte-mesh -p daemon.warn "$*"; }
+
+# The three commands this script reads through, and the one tree it counts in, come from the environment. On a router
+# they are the ones the image has; in tests/test_sta_collect.sh the fixtures answer from a table, so the judgement --
+# which interface is an access point, which directory is a station -- is what gets asserted rather than the tools.
+UBUS=${ZTE_MESH_UBUS:-$(command -v ubus)}
+JSONFILTER=${ZTE_MESH_JSONFILTER:-$(command -v jsonfilter)}
+CLOCK=${ZTE_MESH_CLOCK:-date}
+NET=${ZTE_MESH_NET:-/sys/class/net}
+
+# ap_ifaces -> one interface name per line: the access points netifd has up.
+ap_ifaces() {
+	local line rest
+	# This image's jsonfilter has no predicate syntax, so every interface object is printed whole (one per line)
+	# and picked apart here. Its spacing is jsonfilter's own, so it is removed first rather than matched on.
+	"$UBUS" call network.wireless status 2>/dev/null |
+		"$JSONFILTER" -e '@.*.interfaces[*]' 2>/dev/null |
+		while read -r line; do
+			line=$(printf '%s' "$line" | tr -d ' ')
+			case "$line" in *'"mode":"ap"'*) ;; *) continue ;; esac
+			case "$line" in *'"ifname":"'*) ;; *) continue ;; esac
+			rest=${line#*'"ifname":"'}
+			printf '%s\n' "${rest%%\"*}"
+		done
+}
+
+# sta_count IFNAME -> the stations mac80211 lists for that interface, or 1 when it lists none at all.
+#
+# debugfs is the counter because it is the one that is always there: an ax3600 with the stock ImmortalWrt image has
+# no iw, no hostapd_cli and no wpa_cli, and a directory listing needs no package and no daemon to be talking.
+#
+# An absent stations directory is not a measured zero: it means this kernel says nothing about that interface, and a
+# row of zeroes would be quoted back to the controller as a fact. The empty directory is the measurement, and 0 is
+# right for it.
+sta_count() {
+	local base dir seen="" n=0
+	for base in "$DEBUG"/phy*/"netdev:$1"/stations; do
+		[ -d "$base" ] || continue
+		seen=1
+		for dir in "$base"/*/; do
+			[ -d "$dir" ] || continue
+			n=$((n + 1))
+		done
+		break
+	done
+	[ -n "$seen" ] || return 1
+	printf '%s' "$n"
+}
+
+# collect -> the table, rewritten whole, and the number of rows in AP_COUNT.
+#
+# The responder reads this while a query is being answered, so a half-written file would be a half-reported mesh:
+# build it in a temporary name and move it over the old one, which is atomic within a directory.
+#
+# The epoch is why the file is not just a list of numbers: a collector that died, or one whose tools went missing,
+# leaves its last table sitting there and the responder would go on quoting it for ever. A row is only worth
+# answering with while the file behind it is fresh.
+collect() {
+	local tmp="$DIR/.ap-sta.$$" ifn bssid sta
+	AP_COUNT=0
+	( umask 077; : > "$tmp" ) || return 1
+	{
+		printf 'epoch=%s\n' "$("$CLOCK" +%s)"
+		for ifn in $(ap_ifaces); do
+			bssid=$(cat "$NET/$ifn/address" 2>/dev/null)
+			[ -n "$bssid" ] || continue
+			sta=$(sta_count "$ifn") || continue
+			printf '%s %s\n' "$bssid" "$sta"
+			AP_COUNT=$((AP_COUNT + 1))
+		done
+	} > "$tmp"
+	if mv -f "$tmp" "$FILE"; then
+		return 0
+	fi
+	rm -f "$tmp"
+	return 1
+}
+
+missing=""
+# -x and not -n: ZTE_MESH_UBUS can name a file that is not there, and a name that cannot be exec'd is the same hole
+# in the image as a command that was never installed.
+[ -x "$UBUS" ] || missing="ubus"
+[ -x "$JSONFILTER" ] || missing="$missing${missing:+, }jsonfilter"
+
+started=""
+paused=""
+run_once() {
+	if [ -n "$missing" ] || [ ! -d "$DIR" ]; then
+		local reason=$missing
+		[ -d "$DIR" ] || reason="$reason${reason:+, }$DIR"
+		# ubus, jsonfilter and /run/zte-mesh are all there on any router that runs this service, so this branch is
+		# the board where one of them is gone. Exiting would hand procd a respawn loop; wait it out, saying why once.
+		[ -n "$started" ] || {
+			started=1
+			log "no $reason: no access point counts for $FILE"
+		}
+		return 1
+	fi
+	# Paused is not a fault and not a new measurement: say the stop once, keep the last table, and say nothing until
+	# it moves again. Clearing `started` here is what makes the next collect log its line again -- the two transitions
+	# are the witnesses of the experiment, so a reader can see when the numbers stopped being refreshed.
+	if [ -e "$PAUSE" ]; then
+		[ -n "$paused" ] || {
+			paused=1
+			started=
+			log "paused by $PAUSE: leaving $FILE as it is"
+		}
+		return 0
+	fi
+	paused=""
+	if collect; then
+		[ -n "$started" ] || {
+			started=1
+			log "collecting $AP_COUNT access point(s) into $FILE"
+		}
+		return 0
+	fi
+	log "cannot write $FILE: the AP Metric answer stays empty"
+	return 1
+}
+
+if [ -n "$ONCE" ]; then
+	run_once
+	exit $?
+fi
+
+while :; do
+	run_once
+	if [ -n "$missing" ]; then
+		sleep 60
+	else
+		sleep "$INTERVAL"
+	fi
+done

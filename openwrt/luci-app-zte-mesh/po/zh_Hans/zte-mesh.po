@@ -9,7 +9,7 @@ msgid "ZTE Mesh"
 msgstr "中兴组网"
 
 msgid "The main router: this router is the mesh controller and also broadcasts the Wi-Fi profile below, so it and its child routers put the same network on the air."
-msgstr "主路由：本机既是组网主控，也自己广播下面这套 Wi-Fi，于是它和子路由在空中是同一个网络。"
+msgstr "主路由：本机既是组网主控，也自己广播下面这套 Wi-Fi，于是它和子路由广播的是同一个网络。"
 
 msgid "A controller without Wi-Fi of its own: it manages the child routers and gives them the Wi-Fi profile below. This router's own radios are left alone."
 msgstr "本身不带无线的控制器：只管理子路由并把下面这套 Wi-Fi 下发给它们，本机无线保持原样不动。"
@@ -137,14 +137,17 @@ msgstr "漫游与频段引导"
 msgid "Device role"
 msgstr "设备角色"
 
-msgid "Controller only"
-msgstr "仅主控"
-
-msgid "Controller only: this router manages the child routers and gives them the Wi-Fi profile, but its own radios are left exactly as they are. That is the shape of most wired OpenWrt boxes at the head of a mesh, so it is the default. Main router: the same controller that also broadcasts the profile itself -- pick this when the box has Wi-Fi and should put the network on the air too. Child router: this router is a mesh agent, it hands nothing out and the controller gives it the Wi-Fi name, key and security. A child starts from the wireless network this router already broadcasts until the controller sends its own, so nothing has to be filled in here: the Wi-Fi, roaming and extra-network settings are hidden while the child role is selected. On the two roles that apply a profile here, a radio device that was switched off is switched on when the band is enabled, because a disabled radio puts nothing on the air; a radio switched off afterwards stays off until a different profile arrives. Changing the role restarts the service and reloads this page, and the child routers drop out of the topology for a short while."
-msgstr "仅主控：本机管理子路由、把 Wi-Fi 档案下发给它们，自己的射频原样不动。这是有线 OpenWrt 盒子做组网头端时最常见的形态，所以是默认值。主路由：同一个主控，但自己也广播这套档案——盒子带无线、并且应该把网络发到空中时选它。子路由：本机是 mesh 代理，不下发任何东西，由主控给出 Wi-Fi 名称、密码与加密方式。子路由启动时先用本机正在广播的无线网络，直到主控下发自己的配置，所以这里不需要填任何东西：选中子路由后，Wi-Fi、漫游与额外网络设置都会隐藏。在会把档案应用到本机的这两个角色上，某个频段启用时原先关着的射频设备会被打开——射频关着就等于什么都没发射；此后被手动关掉的射频会一直关着，直到来了不同的档案。改角色会重启服务并重新加载本页，子路由器会短暂掉出拓扑。"
+msgid "Controller: this router runs the mesh -- it answers the child routers, hands out the Wi-Fi profile and decides about roaming and steering. Child router: this router is a mesh agent, it hands nothing out and the controller gives it the Wi-Fi name, key and security. A child starts from the wireless network this router already broadcasts until the controller sends its own, so nothing has to be filled in here: the Wi-Fi, roaming and extra-network settings are hidden while the child role is selected. Whether a controller also broadcasts this router's own Wi-Fi is the choice below. Changing the role restarts the service and reloads this page, and the child routers drop out of the topology for a short while."
+msgstr "主控：本机运行整个 mesh——回应子路由、下发 Wi-Fi 配置、决定漫游与引导。子路由：本机是 mesh 代理，不下发任何东西，由主控给出 Wi-Fi 名称、密码与加密方式。子路由启动时先用本机正在广播的无线网络，直到主控下发自己的配置，所以这里不需要填任何东西：选中子路由后，Wi-Fi、漫游与额外网络设置都会隐藏。主控是否也广播本机自己的 Wi-Fi，是下面那个开关。改角色会重启服务并重新加载本页，子路由器会短暂掉出拓扑。"
 
 msgid "Main router"
 msgstr "主路由"
+
+msgid "Also broadcast here"
+msgstr "本机也广播"
+
+msgid "On: this controller puts the Wi-Fi profile below on its own radios as well as handing it to the child routers, so it and they broadcast the same network -- the main router of the factory page. Off: the profile goes to the child routers only and this router's own radios are left exactly as they are, which is the shape of most wired OpenWrt boxes at the head of a mesh, so it is the default. On a router that does apply a profile here, a radio device that was switched off is switched on when the band is enabled, because a disabled radio puts nothing on the air; a radio switched off afterwards stays off until a different profile arrives."
+msgstr "开：这个主控除了把下面的 Wi-Fi 配置下发给子路由，也把它放在自己的射频上，于是本机与子路由广播同一个网络——就是出厂页面里的主路由。关：配置只下发给子路由，本机的射频原样不动；这是有线 OpenWrt 盒子做组网头端时最常见的形态，所以是默认值。会在本机应用这套配置的路由器上，某个频段启用时原先关着的射频设备会被打开——射频关着就等于什么都没发射；此后被手动关掉的射频会一直关着，直到来了不同的配置。"
 
 msgid "Child router"
 msgstr "子路由"
@@ -153,28 +156,37 @@ msgid "Backhaul to the controller"
 msgstr "回控制器的方式"
 
 msgid "Off (main SSIDs only)"
-msgstr "关闭（只应用主 SSID)"
+msgstr "关闭（只应用主 SSID）"
 
 msgid "Multi-AP (4-address)"
-msgstr "Multi-AP(4 地址）"
+msgstr "Multi-AP（4 地址）"
 
-msgid "How the child role reaches the controller over the radio. Off: only the main SSIDs are applied, as before. Multi-AP: the hidden backhaul network the controller sends becomes its own BSS marked as a Multi-AP backhaul, and the main SSIDs are marked as fronthaul, so the mesh control traffic crosses the radio as 4-address Ethernet. Requires a hostapd built with Multi-AP support (the full wpad, not wpad-basic); nothing is created until the controller has sent a backhaul network."
-msgstr "子路由通过无线回连控制器的方式。关闭：只应用主 SSID，与之前一致。Multi-AP：控制器下发的隐藏回程网络会成为独立的 BSS 并标记为 Multi-AP 回程，主 SSID 标记为前传，组网控制报文因此能以 4 地址以太网帧穿过无线。需要编译了 Multi-AP 支持的 hostapd（完整 wpad，不是 wpad-basic)；控制器没有下发回程网络之前不会创建任何东西。"
+msgid "Switching this restarts the mesh service (the child routers drop out of the topology for up to a minute)."
+msgstr "切换会重启组网服务（子路由器最多一分钟内掉出拓扑）。"
+
+msgid "Backhaul BSS for the child routers"
+msgstr "给子路由的回程网络"
+
+msgid "How this router reaches the controller over the radio. Off: only the main SSIDs are applied, as before. Multi-AP: the backhaul network the controller sends becomes a client interface (mode sta, marked as a Multi-AP backhaul station, with 4-address mode on and the bridge of that band), so the mesh control traffic crosses the radio instead of the cable. Requires a hostapd built with Multi-AP support (the full wpad, not wpad-basic); nothing is created until the controller has sent a backhaul network."
+msgstr "本机如何通过无线连回控制器。关闭：只应用主 SSID，与之前一致。Multi-AP：控制器下发的回程网络会变成一个客户端接口（mode sta、标记为 Multi-AP 回程站、打开 4 地址并挂到该频段的桥上），组网控制报文因此走无线而不是网线。需要编译了 Multi-AP 支持的 hostapd（完整 wpad，不是 wpad-basic）；控制器没有下发回程网络之前不会创建任何东西。"
+
+msgid "Whether this router puts the backhaul network of its profile on the air. Off: only the main SSIDs are applied, as before. Multi-AP: the hidden backhaul network becomes its own BSS (multi_ap=2) and the main SSIDs are marked as fronthaul, so a child that joins it reaches this router as 4-address Ethernet over the radio. Requires a hostapd built with Multi-AP support (the full wpad, not wpad-basic); nothing is created until the profile carries a backhaul network."
+msgstr "本机是否广播配置里的回程网络。关闭：只应用主 SSID，与之前一致。Multi-AP：隐藏的回程网络成为独立的 BSS（multi_ap=2），主 SSID 标记为前传，子路由连上它之后以 4 地址以太网帧穿过无线到达本机。需要编译了 Multi-AP 支持的 hostapd（完整 wpad，不是 wpad-basic）；配置里没有回程网络时不会创建任何东西。"
 
 msgid "This router is a mesh child: the controller manages it and gives it the Wi-Fi name, password and security."
 msgstr "本机是 mesh 子路由：由主控管理，Wi-Fi 名称、密码与加密方式都由主控下发。"
 
-msgid "Self-organizing network"
-msgstr "自组网"
+msgid "MESH compatible"
+msgstr "MESH 兼容"
 
-msgid "On (ZTE enhanced)"
-msgstr "开（中兴增强模式）"
+msgid "Off (ZTE enhanced)"
+msgstr "关（中兴增强模式）"
 
-msgid "Off (ZTE compatible)"
-msgstr "关（中兴兼容模式）"
+msgid "On (ZTE compatible)"
+msgstr "开（中兴兼容模式）"
 
-msgid "The factory MESH switch. On (ZTE enhanced): only ZTE child routers with the same market code are accepted. Off (ZTE compatible, default): any child router is accepted. Switching restarts the mesh daemon (the child routers drop out of the topology for up to a minute)."
-msgstr "原厂的 MESH 开关。开（中兴增强模式）：只接受市场码相同的中兴子路由器。关（中兴兼容模式，默认）：接受任何子路由器。切换会重启组网守护进程（子路由器最多一分钟内掉出拓扑）。"
+msgid "The factory MESH switch. On (ZTE compatible, default): any child router is accepted. Off (ZTE enhanced): only ZTE child routers with the same market code are accepted. Switching restarts the mesh daemon (the child routers drop out of the topology for up to a minute)."
+msgstr "原厂的 MESH 开关。开（中兴兼容模式，默认）：接受任何子路由器。关（中兴增强模式）：只接受市场码相同的中兴子路由器。切换会重启组网守护进程（子路由器最多一分钟内掉出拓扑）。"
 
 msgid "Wi-Fi 7 MLO"
 msgstr "Wi-Fi 7 MLO"
@@ -219,7 +231,7 @@ msgid "%s channel"
 msgstr "%s 信道"
 
 msgid "%s transmit power (dBm, EIRP)"
-msgstr "%s 发射功率（dBm,EIRP)"
+msgstr "%s 发射功率（dBm，EIRP）"
 
 msgid "%s MAC filter policy"
 msgstr "%s MAC 过滤策略"
@@ -258,13 +270,13 @@ msgid "Extra Wi-Fi networks"
 msgstr "额外的 Wi-Fi 网络"
 
 msgid "Guest, spare and hidden backhaul networks of the child routers. The slots of one band must be 1, 2, 3 in order without a gap: removing slot 1 while slot 2 exists is refused. Adding or removing a slot makes the child routers drop out of the topology for up to a minute; switching one on or off does not."
-msgstr "子路由器的访客、备用和隐藏回程网络。同一频段的槽位必须按 1、2、3 连续，不能有空档：槽位 2 还在时去掉槽位 1 会被拒绝。增加或去掉槽位会让子路由器最多一分钟内掉出拓扑；开关一个槽位不会。"
+msgstr "子路由器的访客、备用和隐藏回程网络。同一频段的网络序号必须按 1、2、3 连续，不能有空档：还有 2 号时去掉 1 号会被拒绝。增加或去掉一路会让子路由器最多一分钟内掉出拓扑；只开关其中一路不会。"
 
 msgid "Band"
 msgstr "频段"
 
 msgid "Slot"
-msgstr "槽位"
+msgstr "网络序号"
 
 msgid "1 (guest)"
 msgstr "1（访客）"
@@ -550,3 +562,99 @@ msgstr "失败"
 
 msgid "%d s ago"
 msgstr "%d 秒前"
+
+msgid "Controller address, last byte"
+msgstr "控制器地址末字节"
+
+msgid "Two hex digits, as in e3."
+msgstr "两位十六进制，例如 e3。"
+
+msgid "The address this router presents as a mesh controller is 02:00:00:00:19:<this byte>. Empty: the last byte of the LAN bridge MAC, which already differs between two boxes. Change it only when they still collide, for example because the same image was cloned onto both. Only this byte can be changed: the first five are the shape a ZTE child accepts. Currently %s."
+msgstr "本机作为组网控制器对外使用的地址是 02:00:00:00:19:<这个字节>。留空时取 LAN 网桥 MAC 的最后一个字节，两台设备本来就不会相同。只有两台设备仍然冲突时才需要改（例如同一个镜像被克隆到了两台机器上）。只有这个字节可以改：前五个字节是中兴子路由能够接受的固定格式。当前为 %s。"
+
+msgid "Host name"
+msgstr "主机名"
+
+msgid "Extra SSIDs on this router"
+msgstr "本机也启用额外 SSID"
+
+msgid "On (guest, spare and hidden backhaul too)"
+msgstr "开（含访客、备用和隐藏回程）"
+
+msgid "Whether the extra SSID slots are applied to this router as well. Off: only the main SSIDs are applied, as before. On: every enabled slot becomes its own network on the band it belongs to, and a slot that stops arriving is removed again. An extra slot shares the bridge of its band's main network: this image has no VLAN separation yet, so a guest slot is not isolated from the main one."
+msgstr "是否把额外 SSID 也应用到本机。关：只应用主 SSID，与之前完全一致。开：每个启用的额外网络在所属频段上成为独立网络；控制器不再下发的会被删除。额外网络与其频段的主网络共用同一个网桥：本镜像还没有做 VLAN 隔离，所以访客网络并没有和主网络隔开。"
+
+msgid "2.4 GHz wireless device"
+msgstr "2.4 GHz 射频设备"
+
+msgid "5 GHz wireless device"
+msgstr "5 GHz 射频设备"
+
+msgid "Which wireless device carries this band. Leave it alone unless the service log says it cannot tell the two apart: a band with one device needs no answer, and a band with several uses the one that is not switched off. The value is a wireless device name of the Wi-Fi settings, such as radio1, and it has to be a device of this band -- a name that is not one is ignored, and the mesh is left off that radio."
+msgstr "这个频段由哪块射频设备承载。除非服务日志说它分不清，否则不用填：一个频段只有一块设备时不需要选，有多块时用的是没被关闭的那块。取值是无线设置里的射频设备名，例如 radio1，而且必须是这个频段的设备——不是的话会被忽略，组网就不会上到那块射频。"
+
+msgid "A wireless device name: letters, digits and underscores, like radio1."
+msgstr "射频设备名：字母、数字和下划线，例如 radio1。"
+
+msgid "Link"
+msgstr "链路"
+
+msgid "Direct"
+msgstr "直连"
+
+msgid "Relayed"
+msgstr "经中继"
+
+msgid "%d BSS reported by the router"
+msgstr "路由器上报 %d 个 BSS"
+
+msgid "BSS detail"
+msgstr "BSS 明细"
+
+msgid "Blocked devices stay off for (minutes)"
+msgstr "被封禁设备保持禁止的时长（分钟）"
+
+msgid "0 to 1440 minutes, 0 = until the entry is removed (the default). Applies to every entry of the list below, which is blocked for that long after the rule was first sent; the time is not extended by later saves."
+msgstr "0 到 1440 分钟，0 = 直到删除这条记录（默认）。对下面列表里的所有记录生效，从规则第一次下发开始计时；之后再次保存不会延长这个时间。"
+
+msgid "Blocked and kicked devices"
+msgstr "封禁与踢除设备"
+
+msgid "Up to 8 devices. \"Block\" keeps a device off the Wi-Fi until the time below runs out or the entry is removed; the controller repeats the rule so a child router that reboots does not forget it. \"Kick once\" asks the device to move to the better access point and gives up after a few tries. Both need the child routers to support it; the factory default leaves it off, so a device that does not move is not necessarily an error."
+msgstr "最多 8 台设备。「封禁」让设备在设定时间到期或删除记录之前一直上不了 Wi-Fi；控制器会定时重发规则，子路由重启后不会忘记。「踢一次」请设备换到更好的无线接入点，重试几次后放弃。两项都要子路由支持；出厂默认是关的，所以设备没有动不代表出错。"
+
+msgid "Action"
+msgstr "动作"
+
+msgid "Block"
+msgstr "封禁"
+
+msgid "Kick once"
+msgstr "踢一次"
+
+msgid "Device actions"
+msgstr "设备动作"
+
+msgid "Blocked"
+msgstr "已封禁"
+
+msgid "Kicked"
+msgstr "已踢除"
+
+msgid "done"
+msgstr "已成功"
+
+msgid "the router refused or did not answer"
+msgstr "子路由拒绝或没有回应"
+
+msgid "queued"
+msgstr "排队中"
+
+msgid "sent"
+msgstr "已下发"
+
+msgid "%d min left"
+msgstr "剩余 %d 分钟"
+
+msgid "ran out"
+msgstr "已到期"

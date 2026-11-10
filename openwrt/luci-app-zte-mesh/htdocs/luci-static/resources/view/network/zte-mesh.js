@@ -117,7 +117,7 @@ return view.extend({
 		}
 
 		var child = info.role === 'slave';
-		var local = info.role === 'main';   /* controller that also puts the profile on the air (rpcd reports "auto" as this) */
+		var local = info.local === true;   /* the controller that also puts the profile on the air; rpcd reads both UCI options */
 		var running = info.running && state && state.running && !stale;
 		row(child ? _('Child router') : local ? _('Main router') : _('Controller'), running
 			? badge(_('Running'), '#46a546')
@@ -129,13 +129,35 @@ return view.extend({
 
 		if (state && state.running) {
 			row(_('Controller address (AL MAC)'), state.al_mac || '-');
+			/* This router's own two names, the ones the system knows. A router whose board name cannot be read
+			 * says "router", which is also what a child that reports nothing is shown as. */
+			if (state.self) {
+				row(_('Model'), state.self.model || 'router');
+				row(_('Host name'), state.self.name || 'router');
+			}
 			if (!child) {
-				row(_('Self-organizing network'), uci.get('zte_mesh', 'main', 'mesh_v2') === '1'
-					? _('On (ZTE enhanced)') : _('Off (ZTE compatible)'));
+				row(_('MESH compatible'), uci.get('zte_mesh', 'main', 'mesh_compatible') === '0'
+					? _('Off (ZTE enhanced)') : _('On (ZTE compatible)'));
 				row(_('Wi-Fi updates sent'), String(state.config_applied));
 			}
 			row(_('Wired port'), info.attached ? badge(_('Attached to the LAN bridge'), '#46a546')
 			                                   : badge(_('Not attached'), '#b94a48'));
+			/* What the controller has been asked to do to individual devices, as it stands now. A kick the child
+			 * router answered reads "done", one that ran out of tries reads "did not work", and a block counts
+			 * down. It is the only feedback there is: the child routers do not report a client list. */
+			if (state.clients && state.clients.length) {
+				var text = [];
+				for (var i = 0; i < state.clients.length; i++) {
+					var c = state.clients[i];
+					var how = c.state === 'done' ? _('done')
+						: c.state === 'failed' ? _('the router refused or did not answer')
+						: c.state === 'expired' ? _('ran out')      /* a timed block that is over */
+						: c.state === 'pending' ? _('queued') : _('sent');
+					var left = c.left > 0 ? ' · ' + _('%d min left').format(Math.ceil(c.left / 60)) : '';
+					text.push(c.mac + ': ' + (c.action === 'ban' ? _('Blocked') : _('Kicked')) + ', ' + how + left);
+				}
+				row(_('Device actions'), text.join('; '));
+			}
 		}
 
 		/* Both roles that put a profile into /etc/config/wireless report it: a child gets the profile from the
@@ -213,6 +235,8 @@ return view.extend({
 				E('th', { 'class': 'th' }, _('Type')),
 				E('th', { 'class': 'th' }, _('Light')),
 				E('th', { 'class': 'th' }, _('Clients')),
+				E('th', { 'class': 'th' }, _('BSS detail')),
+				E('th', { 'class': 'th' }, _('Link')),
 				E('th', { 'class': 'th' }, _('State')),
 				E('th', { 'class': 'th' }, _('Actions'))
 			])
@@ -229,6 +253,13 @@ return view.extend({
 		nodes.forEach(function(node) {
 			var ip = lookupAddress(hints, node.mac);
 			var title = aliases[normMac(node.mac)] || node.name || node.model || node.mac;
+			/* The station count comes from the AP Metrics the child sends; the BSS count from its Topology Response.
+			 * Both are -1 (shown as '-') when the child has not reported them, which is not the same as zero.
+			 * Where the frames split that count per BSS, the rows get a column of their own - one total cannot say
+			 * which radio is busy - and a BSS with nobody associated is a zero line there, not a missing one.
+			 * The controller sorted and capped them; re-sorting here would disagree with the total next door. */
+			var detail = node.bss_detail || [];
+			var shown = node.bss >= 0 ? _('%d BSS reported by the router').format(node.bss) : '';
 			table.appendChild(E('tr', { 'class': 'tr' }, [
 				E('td', { 'class': 'td' }, title),
 				E('td', { 'class': 'td' }, node.model || '-'),
@@ -239,7 +270,18 @@ return view.extend({
 				E('td', { 'class': 'td' }, node.software || '-'),
 				E('td', { 'class': 'td' }, node.zte ? 'ZTE' : _('Standard')),
 				E('td', { 'class': 'td' }, node.light === 1 ? _('On') : (node.light === 0 ? _('Off') : '-')),
-				E('td', { 'class': 'td' }, (node.online && node.stations >= 0) ? String(node.stations) : '-'),
+				E('td', { 'class': 'td', 'title': shown },
+					(node.online && node.stations >= 0) ? String(node.stations) : '-'),
+				/* One line per BSS the child reported, so a reader can see which radio holds the clients. A node whose
+				 * frames never split the count has nothing here: '-' is "not reported", not "nobody associated". */
+				E('td', { 'class': 'td' }, detail.length ? E('div', { 'class': 'small' },
+					detail.map(function(b) {
+						return E('div', { 'title': b.age >= 0 ? _('%d s ago').format(b.age) : '' },
+							b.bssid + ' ' + b.stations);
+					})) : '-'),
+				/* Reached over its own link or through another node: the 1905 header's relay bit, nothing inferred. */
+				E('td', { 'class': 'td', 'title': (node.metrics_age >= 0 ? _('%d s ago').format(node.metrics_age) : '') },
+					node.hops === 1 ? _('Direct') : (node.hops === 2 ? _('Relayed') : '-')),
 				E('td', { 'class': 'td' }, node.online ? badge(_('Online'), '#46a546') : badge(_('Offline'), '#999')),
 				E('td', { 'class': 'td' }, (node.online && node.zte) ? self.renderNodeActions(node, title) : '-')
 			]));
@@ -247,7 +289,7 @@ return view.extend({
 
 		if (!nodes.length)
 			table.appendChild(E('tr', { 'class': 'tr placeholder' }, [
-				E('td', { 'class': 'td', 'colspan': 10 },
+				E('td', { 'class': 'td', 'colspan': 12 },
 					E('em', _('No child routers have been discovered yet.')))
 			]));
 
@@ -276,9 +318,12 @@ return view.extend({
 		 * uci.get(). data[2] is only awaited for that side effect. */
 		var role = uci.get('zte_mesh', 'main', 'mesh_role') || 'master';
 		var child = (role === 'slave');
-		/* Main router: the controller that also broadcasts. "auto" is the name this role had before it was split into
-		 * three, and it still means the same thing, so a configuration written then is not shown as something else. */
-		var local = (role === 'main' || role === 'auto');
+		/* Two options, two axes: mesh_role says controller or child, apply_local says a controller also broadcasts.
+		 * `main` and `auto` are the old spelling of the broadcasting controller and still mean apply_local=1, so a
+		 * configuration written before the split is shown as what it does rather than as something else. */
+		var legacy = (role === 'main' || role === 'auto');
+		var apply = uci.get('zte_mesh', 'main', 'apply_local');
+		var local = !child && (apply == null ? legacy : apply === '1');
 
 		var m = new form.Map('zte_mesh', _('ZTE Mesh'), child
 			? _('This router is a mesh child: the controller manages it and gives it the Wi-Fi name, password and security.')
@@ -305,32 +350,104 @@ return view.extend({
 		o.rmempty = false;
 		o.description = _('The bridge the child routers are cabled to (up to 15 characters, default br-lan).');
 
+		/* The controller identity a ZTE child matches on. Only the last byte is open: the first five bytes are the
+		 * shape the child's admission check expects, so a free-form address would simply be refused. The byte exists
+		 * for the one case a derivation cannot solve -- two boxes with the same LAN MAC (a cloned image). */
+		if (!child) {
+		var alNow = (info.state && info.state.al_mac) || '';
+		o = s.taboption('general', form.Value, 'al_last', _('Controller address, last byte'));
+		o.datatype = 'and(minlength(2),maxlength(2))';
+		o.placeholder = alNow ? alNow.slice(-2) : '06';
+		o.optional = true;
+		o.validate = function(section_id, value) {
+			if (value == null || value === '')
+				return true;
+			return /^[0-9a-fA-F]{2}$/.test(value) ? true : _('Two hex digits, as in e3.');
+		};
+		o.description = _('The address this router presents as a mesh controller is 02:00:00:00:19:<this byte>. Empty: the last byte of the LAN bridge MAC, which already differs between two boxes. Change it only when they still collide, for example because the same image was cloned onto both. Only this byte can be changed: the first five are the shape a ZTE child accepts. Currently %s.').format(alNow || '02:00:00:00:19:--');
+		}
+
 		o = s.taboption('general', form.ListValue, 'mesh_role', _('Device role'));
-		o.value('master', _('Controller only'));
-		o.value('main', _('Main router'));
+		o.value('master', _('Controller'));
 		o.value('slave', _('Child router'));
 		o.default = 'master';
 		o.optional = true;
-		o.description = _('Controller only: this router manages the child routers and gives them the Wi-Fi profile, but its own radios are left exactly as they are. That is the shape of most wired OpenWrt boxes at the head of a mesh, so it is the default. Main router: the same controller that also broadcasts the profile itself -- pick this when the box has Wi-Fi and should put the network on the air too. Child router: this router is a mesh agent, it hands nothing out and the controller gives it the Wi-Fi name, key and security. A child starts from the wireless network this router already broadcasts until the controller sends its own, so nothing has to be filled in here: the Wi-Fi, roaming and extra-network settings are hidden while the child role is selected. On the two roles that apply a profile here, a radio device that was switched off is switched on when the band is enabled, because a disabled radio puts nothing on the air; a radio switched off afterwards stays off until a different profile arrives. Changing the role restarts the service and reloads this page, and the child routers drop out of the topology for a short while.');
+		o.description = _('Controller: this router runs the mesh -- it answers the child routers, hands out the Wi-Fi profile and decides about roaming and steering. Child router: this router is a mesh agent, it hands nothing out and the controller gives it the Wi-Fi name, key and security. A child starts from the wireless network this router already broadcasts until the controller sends its own, so nothing has to be filled in here: the Wi-Fi, roaming and extra-network settings are hidden while the child role is selected. Whether a controller also broadcasts this router\'s own Wi-Fi is the choice below. Changing the role restarts the service and reloads this page, and the child routers drop out of the topology for a short while.');
 
-		/* Only a child has a controller to reach over the radio. */
-		if (child) {
-		o = s.taboption('general', form.ListValue, 'backhaul', _('Backhaul to the controller'));
+		/* The second axis, and the reason the old third role name is gone: being the controller and being the Wi-Fi of
+		 * this box are two decisions, and a box can be either, both or one. Not offered on a child, whose radios are
+		 * the controller's to configure. The default follows `main`/`auto`, the old spelling of on. */
+		if (!child) {
+		o = s.taboption('general', form.Flag, 'apply_local', _('Also broadcast here'));
+		o.default = legacy ? '1' : '0';
+		o.rmempty = false;
+		o.description = _('On: this controller puts the Wi-Fi profile below on its own radios as well as handing it to the child routers, so it and they broadcast the same network -- the main router of the factory page. Off: the profile goes to the child routers only and this router\'s own radios are left exactly as they are, which is the shape of most wired OpenWrt boxes at the head of a mesh, so it is the default. On a router that does apply a profile here, a radio device that was switched off is switched on when the band is enabled, because a disabled radio puts nothing on the air; a radio switched off afterwards stays off until a different profile arrives.');
+		}
+
+		/* The backhaul is a link with two ends, and which end this router sits on is the role's business: a child
+		 * reaches the controller as a client, a broadcasting controller puts the backhaul BSS on its own air.
+		 * A controller that leaves its own radios alone (apply_local off) builds neither, so the field there would
+		 * only invite the wrong expectation -- same rule as the extra SSIDs below. */
+		if (child || local) {
+		o = s.taboption('general', form.ListValue, 'backhaul',
+			child ? _('Backhaul to the controller') : _('Backhaul BSS for the child routers'));
 		o.value('off', _('Off (main SSIDs only)'));
 		o.value('multi_ap', _('Multi-AP (4-address)'));
 		o.default = 'off';
 		o.optional = true;
-		o.description = _('How the child role reaches the controller over the radio. Off: only the main SSIDs are applied, as before. Multi-AP: the hidden backhaul network the controller sends becomes its own BSS marked as a Multi-AP backhaul, and the main SSIDs are marked as fronthaul, so the mesh control traffic crosses the radio as 4-address Ethernet. Requires a hostapd built with Multi-AP support (the full wpad, not wpad-basic); nothing is created until the controller has sent a backhaul network.');
+		/* One description per end, and the restart warning once: it is the same consequence either way, and the signature
+		 * only carries the mode where an applier actually runs (a controller that touches no radio restarts for nothing). */
+		o.description = (child
+			? _('How this router reaches the controller over the radio. Off: only the main SSIDs are applied, as before. Multi-AP: the backhaul network the controller sends becomes a client interface (mode sta, marked as a Multi-AP backhaul station, with 4-address mode on and the bridge of that band), so the mesh control traffic crosses the radio instead of the cable. Requires a hostapd built with Multi-AP support (the full wpad, not wpad-basic); nothing is created until the controller has sent a backhaul network.')
+			: _('Whether this router puts the backhaul network of its profile on the air. Off: only the main SSIDs are applied, as before. Multi-AP: the hidden backhaul network becomes its own BSS (multi_ap=2) and the main SSIDs are marked as fronthaul, so a child that joins it reaches this router as 4-address Ethernet over the radio. Requires a hostapd built with Multi-AP support (the full wpad, not wpad-basic); nothing is created until the profile carries a backhaul network.'))
+			+ ' ' + _('Switching this restarts the mesh service (the child routers drop out of the topology for up to a minute).');
 
+		}
+
+		/* Extra SSIDs, on the two cases that apply a profile to this router: on a child they are the slots the controller
+		 * sends, on a broadcasting controller the ones configured below. A controller that leaves its own radios alone
+		 * hands them out and never puts them on its own air, so the field would only invite the wrong expectation there. */
+		if (child || local) {
+		o = s.taboption('general', form.ListValue, 'extra_slots', _('Extra SSIDs on this router'));
+		o.value('0', _('Off (main SSIDs only)'));
+		o.value('1', _('On (guest, spare and hidden backhaul too)'));
+		o.default = '0';
+		o.optional = true;
+		o.description = _('Whether the extra SSID slots are applied to this router as well. Off: only the main SSIDs are applied, as before. On: every enabled slot becomes its own network on the band it belongs to, and a slot that stops arriving is removed again. An extra slot shares the bridge of its band\'s main network: this image has no VLAN separation yet, so a guest slot is not isolated from the main one.');
+		}
+
+		/* Which device of a band the applier writes. A board can carry two on one band (an ax3600 has an unused PCIe
+		 * 5 GHz card next to the SoC radio), and the only way wlan-sync tells the user so is a log line naming these
+		 * two options -- an option the log points at with no field on the page is the same dead end as a switch that
+		 * restarts nothing. */
+		if (child || local) {
+		var pinDesc = _('Which wireless device carries this band. Leave it alone unless the service log says it cannot tell the two apart: a band with one device needs no answer, and a band with several uses the one that is not switched off. The value is a wireless device name of the Wi-Fi settings, such as radio1, and it has to be a device of this band -- a name that is not one is ignored, and the mesh is left off that radio.')
+			+ ' ' + _('Switching this restarts the mesh service (the child routers drop out of the topology for up to a minute).');
+		var pinName = function(section_id, value) {
+			if (value == null || value === '')
+				return true;
+			return /^[A-Za-z0-9_]+$/.test(value) ? true : _('A wireless device name: letters, digits and underscores, like radio1.');
+		};
+		o = s.taboption('general', form.Value, 'wifi_2g', _('2.4 GHz wireless device'));
+		o.optional = true;
+		o.placeholder = 'radio0';
+		o.validate = pinName;
+		o.description = pinDesc;
+
+		o = s.taboption('general', form.Value, 'wifi_5g', _('5 GHz wireless device'));
+		o.optional = true;
+		o.placeholder = 'radio1';
+		o.validate = pinName;   /* the same shape, and one message to translate */
+		o.description = pinDesc;
 		}
 
 		/* Controller side: what this router pushes to its child routers. Not rendered on a child, where the service runs
 		 * with these features off (a child has no agents of its own) and changing a value only invites misconfiguration. */
 		if (!child) {
-		o = s.taboption('general', form.Flag, 'mesh_v2', _('Self-organizing network'));
-		o.default = '0';
+		o = s.taboption('general', form.Flag, 'mesh_compatible', _('MESH compatible'));
+		o.default = '1';
 		o.rmempty = false;
-		o.description = _('The factory MESH switch. On (ZTE enhanced): only ZTE child routers with the same market code are accepted. Off (ZTE compatible, default): any child router is accepted. Switching restarts the mesh daemon (the child routers drop out of the topology for up to a minute).');
+		o.description = _('The factory MESH switch. On (ZTE compatible, default): any child router is accepted. Off (ZTE enhanced): only ZTE child routers with the same market code are accepted. Switching restarts the mesh daemon (the child routers drop out of the topology for up to a minute).');
 
 		o = s.taboption('general', form.Flag, 'mlo_enable', _('Wi-Fi 7 MLO'));
 		o.optional = true;
@@ -473,6 +590,11 @@ return view.extend({
 		o.optional = true;
 		o.default = '0';
 		o.description = _('Kick devices that stay on a weak signal (factory default: off).');
+
+		o = s.taboption('policy', form.Value, 'ban_minutes', _('Blocked devices stay off for (minutes)'));
+		o.datatype = 'range(0,1440)';
+		o.optional = true;
+		o.description = _('0 to 1440 minutes, 0 = until the entry is removed (the default). Applies to every entry of the list below, which is blocked for that long after the rule was first sent; the time is not extended by later saves.');
 
 		var b = m.section(ReportingGridSection, 'zte_mesh_bss', _('Extra Wi-Fi networks'),
 			_('Guest, spare and hidden backhaul networks of the child routers. The slots of one band must be 1, 2, 3 in order without a gap: removing slot 1 while slot 2 exists is refused. Adding or removing a slot makes the child routers drop out of the topology for up to a minute; switching one on or off does not.'));
@@ -634,6 +756,26 @@ return view.extend({
 		o.value('2', _('Extra network 2'));
 		o.value('3', _('Extra network 3'));
 		o.optional = true;
+
+		/* Client actions are sent as they are: the state machine in the controller decides how often, and it keeps one
+		 * row per address, so the same device twice is refused by the init script rather than silently merged. */
+		var c = m.section(ReportingGridSection, 'zte_mesh_client', _('Blocked and kicked devices'),
+			_('Up to 8 devices. "Block" keeps a device off the Wi-Fi until the time below runs out or the entry is removed; the controller repeats the rule so a child router that reboots does not forget it. "Kick once" asks the device to move to the better access point and gives up after a few tries. Both need the child routers to support it; the factory default leaves it off, so a device that does not move is not necessarily an error.'));
+		c.addremove = true;
+		c.anonymous = true;
+		c.nodescriptions = true;
+
+		o = c.option(form.Value, 'mac', _('MAC address'));
+		o.datatype = 'macaddr';
+		o.rmempty = false;
+		o.placeholder = 'aa:bb:cc:dd:ee:ff';
+		o.description = _('The address the device uses now: phones often use a private MAC per network.');
+
+		o = c.option(form.ListValue, 'action', _('Action'));
+		o.value('ban', _('Block'));
+		o.value('kick', _('Kick once'));
+		o.default = 'ban';
+		o.rmempty = false;
 
 		}
 

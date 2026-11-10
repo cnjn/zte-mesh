@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../controller-packet.h"
+#include "../src/controller-packet.h"
 static uint8_t frame[1601], saved[1601];
 static const uint8_t controller[6] = {2, 0, 0, 0, 0x19, 6};
 static const uint8_t peer[6] = {2, 0, 0, 0, 0x19, 0x0a};

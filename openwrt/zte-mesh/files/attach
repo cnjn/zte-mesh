@@ -1,22 +1,105 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# The controller's sandbox hands one end of its private wire to this
-# namespace as "lab-peer". Rename it and keep it in the LAN bridge. Every
-# sandbox start creates a fresh wire, so this has to run for the whole life
-# of the service.
+# Keeps the controller's wire in the LAN bridge, and brings the wire back when it
+# is lost.
+#
+# The sandbox creates a veth pair and keeps one end (veth-lab) in its private
+# network namespace; the far end arrives here as lab-peer, which this loop renames
+# to zmesh0 and enslaves to the bridge. Every sandbox start builds a fresh wire,
+# so the rename half runs for the whole life of the service.
+#
+# The other half exists because a veth pair dies with either end. Anything that
+# removes zmesh0 in this namespace -- a stray `ip link del`, the pre-start cleanup
+# of a second `start` while the first controller is still up, a bridge torn down by
+# a network reload -- takes the sandbox end with it and leaves a controller that
+# keeps reporting itself as running with no path to the child routers, which is what
+# a user sees as a wired port that went unattached and stayed that way until the
+# service was restarted.
+#
+# Nothing can rebuild it from inside: the sandbox has no /proc, no /sys, no ip and
+# no CAP_NET_ADMIN (ns-run.c keeps CAP_NET_RAW only), and a rebuilt interface would
+# not help anyway -- the daemon bound its AF_PACKET socket to the old ifindex and
+# controller-route.c rewrites br0 to veth-lab at bind time only, so the new index is
+# never looked up. The one clean recovery is a new sandbox. So after the wire has
+# been gone for GRACE ticks this loop signals the process that owns the private
+# namespace; ns-run kills its group and exits, procd respawns the instance, and the
+# fresh sandbox's wire is picked up by the rename above. That is the restart an
+# operator performs by hand today, made automatic.
+#
+# $2 is unused: the rebuilt wire belongs to the sandbox, which sets its own addresses.
 
 BR=${1:-br-lan}
 PORT=zmesh0
+# ~20 s of missing wire before anything is restarted: a sandbox that is starting
+# normally builds its wire within a second or two of unsharing, and the restart
+# costs the mesh a few seconds, so a transient must never trigger one.
+GRACE=20
+# ~60 s of quiet after a restart. One lost wire is one restart; if the wire keeps
+# disappearing for another reason, the page says so instead of flapping.
+COOL=60
 
-while :; do
-	if [ -d "/sys/class/net/lab-peer" ]; then
-		ip link set dev lab-peer name "$PORT" 2>/dev/null
-	fi
-	if [ -d "/sys/class/net/$PORT" ] && [ ! -e "/sys/class/net/$BR/brif/$PORT" ]; then
+miss=0
+cool=0
+
+link() { [ -d "/sys/class/net/$1" ]; }
+
+# The process running in a private network namespace whose command line is the
+# controller. Only reached once the wire is already missing, so the steady state of
+# this loop is two directory tests per second.
+sandbox_pid() {
+	local here dir pid
+	here=$(readlink /proc/self/ns/net 2>/dev/null)
+	[ -n "$here" ] || return 1
+	for dir in /proc/[0-9]*; do
+		[ -r "$dir/cmdline" ] || continue
+		[ "$(readlink "$dir/ns/net" 2>/dev/null)" = "$here" ] && continue
+		tr '\0' ' ' < "$dir/cmdline" 2>/dev/null |
+			grep -q '/bin/db-engine-probe' || continue
+		pid=${dir#/proc/}
+		[ "$pid" != "$$" ] || continue
+		echo "$pid"
+		return 0
+	done
+	return 1
+}
+
+attach_once() {
+	link lab-peer && ! link "$PORT" && ip link set dev lab-peer name "$PORT" 2>/dev/null
+	if link "$PORT" && [ ! -e "/sys/class/net/$BR/brif/$PORT" ]; then
 		ip link set dev "$PORT" master "$BR" 2>/dev/null &&
 			ip link set dev "$PORT" up 2>/dev/null &&
 			logger -t zte-mesh "attached $PORT to $BR"
+	fi
+}
+
+heal() {
+	# A pair that still exists is attach_once's job; restarting a working
+	# controller because its port is unenslaved would be worse than the bug.
+	if link "$PORT" || link lab-peer; then
+		miss=0
+		return
+	fi
+	miss=$((miss + 1))
+	[ "$miss" -ge "$GRACE" ] || return
+	# No sandbox to restart means procd is already handling it (start, stop, or a
+	# wire that was never built because the veth module is missing).
+	pid=$(sandbox_pid) || {
+		miss=0
+		return
+	}
+	logger -t zte-mesh "no $PORT for $GRACE s while the controller runs in $pid: restarting it to rebuild the wire"
+	kill "$pid" 2>/dev/null
+	miss=0
+	cool=$COOL
+}
+
+while :; do
+	attach_once
+	if [ "$cool" -gt 0 ]; then
+		cool=$((cool - 1))
+	else
+		heal
 	fi
 	sleep 1
 done

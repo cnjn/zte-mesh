@@ -11,6 +11,10 @@ __pycache__/
 /evidence/
 *.pcap
 /dist/
-# CI artifacts unpacked locally (build-lab-tools.yml) and assistant scratch
+
+# local lab credentials and machine-local notes: never commit (docs/DEVELOPMENT.md section 1 has the ledger, .local/lab-env.md the passwords)
+/.local/
+
+# ARM32 host tools built by build-lab-tools.yml: published as the lab-tools artifact and unpacked
+# here for openwrt/repack-runtime.py --replace; the artifact is the record, not the tree
 /prebuilt/
-.workbuddy/
