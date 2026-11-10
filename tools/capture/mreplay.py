@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """mreplay.py: run the shim's Controller service on the (mainline OpenWrt) router against the REAL child and capture the cold join,
-for comparison with the vendor controller's cold join (see REPLAY_PLAN.md). Run it on the mac (python3.9 is enough).
+for comparison with the vendor controller's cold join (see docs/research/REPLAY_RESULTS.md). Run it on the mac (python3.9 is enough).
 
 Everything on the router lives in tmpfs (/tmp/zte-mesh-svc, /run/zte-mesh, /tmp/zmc) and is removed again; nothing is installed.
 The sandbox wire is attached to the LAN bridge, so the real daemon transmits real IEEE 1905 frames: it can reconfigure real mesh nodes.

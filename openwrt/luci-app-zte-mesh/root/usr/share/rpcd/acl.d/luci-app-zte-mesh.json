@@ -4,7 +4,8 @@
 		"read": {
 			"ubus": {
 				"luci.zte-mesh": [
-					"status"
+					"status",
+					"devices"
 				],
 				"luci-rpc": [
 					"getHostHints"

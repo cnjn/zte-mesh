@@ -7,8 +7,8 @@ from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[1]
 ARTIFACTS = Path(sys.argv.pop(1)) if len(sys.argv) > 1 else SOURCE / "out"
-sys.path.insert(0, str(SOURCE))
-spec = importlib.util.spec_from_file_location("startup_schema", SOURCE / "startup-schema.py")
+sys.path.insert(0, str(SOURCE / "tools" / "dev"))
+spec = importlib.util.spec_from_file_location("startup_schema", SOURCE / "tools" / "dev" / "startup-schema.py")
 startup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(startup)
 
@@ -64,7 +64,7 @@ class StartupMetadata(unittest.TestCase):
             self.assertEqual(at, table["size"])
 
     def test_generated_registry(self):
-        self.assertEqual(startup.declaration(self.tables), (SOURCE / "startup-views.inc").read_text())
+        self.assertEqual(startup.declaration(self.tables), (SOURCE / "src" / "startup-views.inc").read_text())
 
 
 if __name__ == "__main__":
