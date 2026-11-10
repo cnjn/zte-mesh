@@ -30,13 +30,13 @@ ARCHIVE = REPO / "openwrt/zte-mesh/zte-mesh-runtime.tar.gz"
 
 
 def text(path):
-    return (REPO / path).read_text()
+    return (REPO / path).read_text(encoding="utf-8")
 
 # member name in the archive -> the file it must be a copy of
 SOURCES = {
-    "ns-run.c": REPO / "ns-run.c",
-    "controller-net.c": REPO / "controller-net.c",
-    "enroller.c": REPO / "enroller.c",
+    "ns-run.c": REPO / "src" / "ns-run.c",
+    "controller-net.c": REPO / "src" / "controller-net.c",
+    "enroller.c": REPO / "src" / "enroller.c",
 }
 
 failures = []
@@ -94,42 +94,58 @@ def main():
     # the cheapest proof the copy is not that one: both are absent from it and present in a build
     # made from these sources (config-reject from controller-service.c, wlan-plan from agent-sync.c).
     probe = blobs.get("root/bin/db-engine-probe", b"")
-    for marker in (b"config-reject", b"wlan-plan"):
+    for marker in (b"config-reject", b"wlan-plan",
+                   b"bss_detail",        # the per-BSS rows state.json prints since the 逐路 batch
+                   b"ap_metric_query"):  # the controller asks for those counts itself since the 终端数 batch
         check(f"db-engine-probe in the archive carries {marker.decode()}", marker in probe,
-              "the packed copy predates the current sources; rebuild db-engine-probe with "
-              "build-lab-tools.yml (lab-tools artifact) and repack with openwrt/repack-runtime.py --replace")
+              "the packed copy predates the current sources; rebuild prebuilt/db-engine-probe with "
+              "build-lab-tools.yml and repack with openwrt/repack-runtime.py --replace")
 
-    # The compiled halves are machine code, so they cannot ride in an arch:all apk: on the
-    # x86_64 lab box an aarch64 ns-run would not exec at all. zte-mesh is arch:all (scripts
-    # plus the runtime tarball, which is data), and ns-run / mesh-search have their own
-    # arch-tagged package. package-pack.mk reads one global PKGARCH per Makefile, so two
-    # architectures genuinely require two package directories -- this is the guard against
-    # quietly moving a binary back and breaking the lab box again.
+    # Same hazard on the preload side, and this one is easy to hit: three batches of controller-peer.c /
+    # controller-1905.c changes went out with the archive untouched, because nothing on the host looked at
+    # the packed .so. A stale copy is not merely old numbers - the write path and the read path are in
+    # different binaries, so a service that sums per-BSS files with a trace library that never writes them
+    # falls back to the digest every second and the page silently keeps the behaviour of the previous batch.
+    # The marker is the file name format only the per-BSS write builds.
+    trace = blobs.get("root/lib/libzte_controller_trace.so", b"")
+    marker = b".%02x:%02x:%02x:%02x:%02x:%02x.sta"
+    check("libzte_controller_trace.so in the archive carries the per-BSS file name", marker in trace,
+          "the packed library predates controller-peer.c's write_bss(); rebuild the ARM32 shim and repack "
+          "with openwrt/repack-runtime.py --replace root/lib/libzte_controller_trace.so=...")
+    # The same library is where the AP Metric Query is answered now, so one packed .so carries both halves of
+    # the terminal count: the writer of the per-BSS files and the reader of /run/zte-mesh/ap-sta.
+    check("libzte_controller_trace.so in the archive answers an AP Metric Query", b"ap_metrics_answer" in trace,
+          "the packed library predates agent-ap-metrics.c; the child stays silent and the master reads "
+          "stations=-1 for a node that has the counts")
+
+    # The launcher is machine code, and an ELF names one architecture -- but it no longer rides in a second
+    # package for that reason. zte-mesh is arch:all and ships one build per CPU under arch/<cpu>/ next to a
+    # shell entry that picks the directory matching `uname -m`, so the architecture question is answered at
+    # run time by that script instead of at install time by the solver. package-pack.mk reads one global
+    # PKGARCH per Makefile, which is exactly why the apk cannot name a CPU *and* carry three builds; the
+    # guard below is that the payload it needs is really installed by the same Makefile as the scripts.
     makefile = text("openwrt/zte-mesh/Makefile")
     check("zte-mesh is architecture independent", "PKGARCH:=all" in makefile,
-          "the package still claims a board arch; the x86_64 lab box cannot install it")
-    check("zte-mesh ships no compiled launcher",
-          "/usr/libexec/zte-mesh/ns-run" not in makefile
-          and "/usr/libexec/zte-mesh/mesh-search" not in makefile,
-          "a binary built by $(TARGET_CC) cannot be installed by an arch:all package")
+          "the package names a board arch; the x86_64 lab box cannot install it")
+    check("zte-mesh builds the launcher out of the unpacked tarball",
+          "launcher-arches.sh" in makefile
+          and "sh $(ZTE_MESH_LAUNCHER_BUILD) $(PKG_BUILD_DIR)" in makefile,
+          "the code that gets compiled has to be the code that ships: one unpack of the runtime tarball feeds both")
     check("zte-mesh overrides Build/Compile", "define Build/Compile" in makefile,
           "undefined, it falls back to Build/Compile/Default, which runs $(MAKE) in the build "
           "directory -- there is no makefile there, only the unpacked tarball")
+    check("zte-mesh installs the entry script under both names",
+          "./files/launcher-dispatch $(1)/usr/libexec/zte-mesh/ns-run" in makefile
+          and "/usr/libexec/zte-mesh/mesh-search" in makefile)
+    check("zte-mesh installs the per-CPU builds",
+          "$(PKG_BUILD_DIR)/arch $(1)/usr/libexec/zte-mesh/" in makefile,
+          "an entry script without arch/ answers 'no build for this machine' on every CPU")
+    check("zte-mesh still ships the runtime tarball", "zte-mesh-runtime.tar.gz" in makefile)
+    check("no package directory is named zte-mesh-launcher",
+          not (REPO / "openwrt/zte-mesh-launcher").exists(),
+          "the split was merged away; a leftover Makefile would build an apk whose files belong to zte-mesh too")
 
-    launcher = text("openwrt/zte-mesh-launcher/Makefile")
-    check("the launcher builds ns-run from the archive sources",
-          "$(PKG_BUILD_DIR)/ns-run.c" in launcher and "$(PKG_BUILD_DIR)/controller-net.c" in launcher)
-    check("the launcher builds mesh-search from the archive sources",
-          "$(PKG_BUILD_DIR)/enroller.c" in launcher)
-    check("the launcher installs both binaries",
-          "/usr/libexec/zte-mesh/ns-run" in launcher
-          and "/usr/libexec/zte-mesh/mesh-search" in launcher)
-    check("the launcher is arch-tagged", "PKGARCH:=aarch64_cortex-a53" in launcher)
-    check("the launcher takes the sources from the sibling runtime tarball",
-          "../zte-mesh/zte-mesh-runtime.tar.gz" in launcher,
-          "the sources must not be duplicated; they travel inside the tarball (see C5)")
-
-    init = (REPO / "openwrt/zte-mesh/files/zte-mesh.init").read_text()
+    init = (REPO / "openwrt/zte-mesh/files/zte-mesh.init").read_text(encoding="utf-8")
     check("the init script starts the search helper", "MESH_SEARCH" in init and "procd_open_instance search" in init)
 
     print(f"\n{len(failures)} failure(s)")

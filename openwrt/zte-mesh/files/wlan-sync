@@ -15,9 +15,16 @@
 # is the step the factory image leaves to cspd and its driver layer. A controller-only router has no plan and no
 # instance of this script -- its own radios are not its business.
 #
-# Only the main BSS of each band is applied (slot 0). The extra SSID slots (1..3) are reported and skipped: the
-# factory daemon drives them through its own driver interface, and inventing hostapd sections for them here
-# would give the router a second, competing source of truth.
+# Only the main BSS of each band is applied (slot 0) unless `zte_mesh.main.extra_slots` is on: then the extra
+# SSID slots (1 = guest, 2 = spare, 3 = hidden backhaul) the plan carries become their own wifi-iface sections
+# (`zte_extra_<band>_<slot>`), and the sections of slots the plan no longer carries are removed. The default is
+# off, for the same reason the backhaul mode is: a slot the controller marks enabled puts another SSID on the
+# air, which changes what a passer-by sees on a network that was working. Off is also the old behaviour exactly
+# -- the rows are reported and skipped, nothing is written.
+#
+# An extra slot gets the network of its band's main BSS. That is what "the network the controller hands out"
+# means without VLAN support: the guest slot shares the LAN with the main SSID instead of being isolated, which
+# is a limitation of this image and not of the profile (see the VLAN item in docs/FEATURE_STATUS.md, section D5).
 #
 # The one exception is the backhaul BSS. With `zte_mesh.main.backhaul=multi_ap` the plan rows whose
 # MapAccessAttr carries bit 6 (value 64, the factory marks the hidden backhaul BSS that way) become their own
@@ -26,9 +33,20 @@
 # needs to cross the radio as a plain Ethernet frame. 802.11s is deliberately not used here -- its data
 # frames carry a mesh header, so 1905.1 frames cannot traverse it.
 #
+# Which end of that row this router sits on is the role's business, not the row's. `zte_mesh.main.mesh_role=slave`
+# means this router is the client: the row becomes a `zte_backhaul_sta_<band>` interface with `mode=sta`,
+# `multi_ap=1` (netifd copies that into wpa_supplicant's `multi_ap_backhaul_sta=1`, which is what lets the
+# association happen at all with a hidden backhaul SSID) and `wds=1`. The last one is the 4-address switch: in
+# this image's netifd, `4addr` is set from `wds` and nothing else, and the interface is only added to the bridge
+# when `wds` is on -- `multi_ap` by itself leaves a backhaul client that is associated but carries no traffic.
+# Any other role means this router is the master, so the row becomes the `zte_backhaul_<band>` BSS above. A
+# router that changes role gives back the sections of the side it left.
+#
 # The default is `off`: the script then behaves exactly as before and touches no multi_ap option at all. A
 # backhaul row is only applied when the plan actually carries it; the SSID and key come from the controller's
-# M2, never from a name this script invents.
+# M2, never from a name this script invents. A row with no name, or that says it is secured but carries no key,
+# is reported and skipped -- half a backhaul is worse than none, because the page would show a network that was
+# never going to work.
 #
 # Nothing is applied that the plan does not change: the script compares every value first and only commits and
 # reloads when at least one differs.
@@ -60,6 +78,54 @@ backhaul_mode() {
 	local value
 	value=$(uci -q get zte_mesh.main.backhaul 2>/dev/null)
 	case "$value" in multi_ap) echo multi_ap ;; *) echo off ;; esac
+}
+
+# backhaul_side -> which end of the backhaul this router is: "sta" for a child that reaches the controller over
+# the radio, "ap" for a master that puts the backhaul BSS on the air. The role is the only input: the plan row is
+# the same row either way, because the controller publishes its own profile as the plan of a broadcasting master
+# and the child's plan is built from that controller's M2.
+backhaul_side() {
+	local value
+	value=$(uci -q get zte_mesh.main.mesh_role 2>/dev/null)
+	case "$value" in slave) echo sta ;; *) echo ap ;; esac
+}
+
+# wpad_variant -> the name of the installed hostapd/wpad package, empty when neither database can be read. Both are
+# checked because this tree builds apk images while older ones use opkg; WPAD_DB names a single file instead (tests).
+wpad_variant() {
+	local db name
+	for db in "${WPAD_DB:-}" /lib/apk/db/installed /usr/lib/opkg/status; do
+		[ -n "$db" ] && [ -f "$db" ] || continue
+		name=$(sed -n -e 's/^Package: *//p' -e 's/^P://p' "$db" 2>/dev/null | grep -E '^(wpad|hostapd)' | head -n 1)
+		[ -n "$name" ] && { printf '%s\n' "$name"; return 0; }
+	done
+	return 0
+}
+
+# wpad_warning -> why the backhaul cannot work with the installed package, or nothing when it can. The options this
+# script writes for a backhaul (`multi_ap` on the BSS or on the client, and the 4-address data path `wds` opens there)
+# exist only in the full wpad build: the -basic variants that fit a small image accept the option and put nothing on
+# the air. Saying so once per apply beats a status file that reports success while the backhaul never appears.
+wpad_warning() {
+	local variant
+	[ "$(backhaul_mode)" = multi_ap ] || return 1
+	variant=$(wpad_variant)
+	case "$variant" in
+	*-basic*) printf 'backhaul needs the full wpad, %s has no Multi-AP support' "$variant"; return 0 ;;
+	esac
+	return 1
+}
+
+# extra_slots_mode -> "on" or "off". Anything unexpected is off, like the backhaul mode: a typo must not put
+# extra SSIDs on the air by accident.
+extra_slots_mode() {
+	local value
+
+	value=$(uci -q get zte_mesh.main.extra_slots 2>/dev/null)
+	case "$value" in
+	1|[Tt][Rr][Uu][Ee]|on|yes|enabled) echo on ;;
+	*) echo off ;;
+	esac
 }
 
 # encryption NAME -> the UCI encryption of a factory BeaconType
@@ -178,6 +244,19 @@ set_opt() {
 	return 0
 }
 
+# set_flag SECTION OPTION VALUE -> set_opt for an option whose absence already answers 0 (`disabled`, `hidden`).
+# Writing the 0 a config does not spell out changes nothing about the network, but it does mark the plan as applied,
+# and an applied plan commits and reloads every radio on this router. On a child that is a drop for clients on the
+# band whose settings did not move, so the comparison is against what the flag means, not how it is spelled.
+set_flag() {
+	local current
+	current=$(uci_true "$(uci -q get "wireless.$1.$2" 2>/dev/null)")
+	[ "$current" = "$3" ] && return 1
+	uci -q set "wireless.$1.$2=$3"
+	changed
+	return 0
+}
+
 # apply_key SECTION ENCRYPTION KEY -> write the key where this image keeps it
 apply_key() {
 	local iface="$1" enc="$2" key="$3"
@@ -228,14 +307,140 @@ apply_backhaul() {
 	return 0
 }
 
-# clear_backhaul -> undo what multi_ap mode wrote, once the mode is no longer multi_ap
-clear_backhaul() {
-	local section band device iface
-	for section in $(uci -q show wireless | sed -n "s/^wireless\.\(zte_backhaul_[^.=]*\)=wifi-iface$/\1/p"); do
+# apply_backhaul_sta BAND SSID KEY ENABLED BEACON -> associate this router to the controller's backhaul BSS. The
+# name and the key are the controller's, taken from the plan row that carried MapAccessAttr bit 6; the interface
+# joins whatever the controller published, never a name this script makes up.
+apply_backhaul_sta() {
+	local band="$1" ssid="$2" key="$3" enabled="$4" beacon="$5"
+	# `network` starts empty on purpose: a radio with no main BSS never assigns one, and this script runs under
+	# `set -u`, where a bare `local network` is still an unset parameter -- the read below would abort the apply.
+	local device iface main network="" enc
+	device=$(radio_section_of "$band") || { log "no usable $band radio; the backhaul client is left alone"; return 1; }
+	enc=$(encryption_of "${beacon:-3}") || { log "backhaul client on $band: unknown security mode ${beacon:-?}; left alone"; return 1; }
+	[ "$enabled" = 1 ] && enable_radio "$device" "$band"
+	iface=zte_backhaul_sta_$band
+	if [ "$(uci -q get "wireless.$iface" 2>/dev/null)" != wifi-iface ]; then
+		uci -q set "wireless.$iface=wifi-iface"
+		changed
+	fi
+	set_opt "$iface" device "$device"
+	set_opt "$iface" mode sta
+	# multi_ap 1 on a client is how this image says "backhaul STA": netifd copies it into the supplicant's
+	# multi_ap_backhaul_sta, which is what lets the association land on a backhaul BSS instead of being refused
+	# by it. A plain STA would only join a fronthaul network, and the controller's backhaul SSID is hidden.
+	set_opt "$iface" multi_ap 1
+	# wds is the 4-address switch: this image sets `4addr` from wds and only bridges an interface that has it,
+	# so without this line the child associates, reports success and no 1905 frame ever crosses the radio.
+	set_opt "$iface" wds 1
+	set_opt "$iface" ssid "$ssid"
+	set_opt "$iface" encryption "$enc"
+	set_opt "$iface" disabled "$([ "$enabled" = 1 ] && echo 0 || echo 1)"
+	# On the bridge the band's own networks are on, which is where the controller expects the child to appear.
+	# Without a network there is nothing to bridge: this image only hands a sta interface to the bridge when it
+	# has one, so the client associates and still cannot carry the 1905 frames. A band used purely as backhaul
+	# (no main BSS in the plan) is that case, so say it instead of leaving a link that looks fine.
+	main=$(ap_iface_of "$device")
+	if [ -n "$main" ]; then
+		network=$(uci -q get "wireless.$main.network" 2>/dev/null)
+		[ -n "$network" ] && set_opt "$iface" network "$network"
+	fi
+	[ -n "$network" ] ||
+		log "backhaul client on $band: no network to join (this radio carries no main BSS); it will not be bridged"
+	apply_key "$iface" "$enc" "$key"
+	log "backhaul client on $band ($device.$iface): joins a name of ${#ssid} characters, security $enc, enabled $enabled, multi_ap 1 with 4-address on"
+	return 0
+}
+
+# apply_extra BAND SLOT SSID KEY HIDDEN BEACON -> create or update the extra SSID of one (band, slot). The name
+# and the key are the controller's, from the plan row of that slot; the section is this script's (`zte_extra_*`),
+# so a slot that disappears from the plan can be removed again without touching anything else.
+apply_extra() {
+	local band="$1" slot="$2" ssid="$3" key="$4" hidden="$5" beacon="$6"
+	local device iface main network enc
+	iface=zte_extra_${band}_$slot
+	device=$(radio_section_of "$band") || { log "no usable $band radio; slot $slot left alone"; return 1; }
+	enc=$(encryption_of "${beacon:-3}") || { log "slot $slot on $band: unknown security mode ${beacon:-?}; left alone"; return 1; }
+	enable_radio "$device" "$band"
+	if [ "$(uci -q get "wireless.$iface" 2>/dev/null)" != wifi-iface ]; then
+		uci -q set "wireless.$iface=wifi-iface"
+		changed
+	fi
+	set_opt "$iface" device "$device"
+	set_opt "$iface" mode ap
+	set_opt "$iface" ssid "$ssid"
+	set_opt "$iface" encryption "$enc"
+	set_opt "$iface" disabled 0
+	[ -n "$hidden" ] && set_opt "$iface" hidden "$hidden"
+	# Same bridge as the main SSID of that radio: the profile carries no VLAN, so a guest slot shares the LAN
+	# instead of being separated from it. Saying so once per apply is cheaper than someone debugging it later.
+	main=$(ap_iface_of "$device")
+	network=$(uci -q get "wireless.$main.network" 2>/dev/null)
+	[ -n "$network" ] && set_opt "$iface" network "$network"
+	apply_key "$iface" "$enc" "$key"
+	log "slot $slot on $band ($device.$iface): name set to ${#ssid} characters, security $enc, network ${network:-none} (no VLAN separation)"
+	return 0
+}
+
+# remove_extra BAND SLOT -> drop the section of one slot, if this script made one
+remove_extra() {
+	local iface="zte_extra_${1}_$2"
+	[ "$(uci -q get "wireless.$iface" 2>/dev/null)" = wifi-iface ] || return 0
+	uci -q delete "wireless.$iface"
+	changed
+	log "slot $2 on $1 is off in the plan; removed $iface"
+	return 0
+}
+
+# prune_extras SEEN -> drop `zte_extra_*` sections whose slot the plan no longer carries at all. SEEN is the list
+# of section suffixes ("2g_1") the current plan mentioned, so a slot that is merely disabled keeps being reported
+# by its row instead of being pruned here.
+prune_extras() {
+	local seen="$1" section rest
+	for section in $(uci -q show wireless | sed -n 's/^wireless\.\(zte_extra_[^.=]*\)=wifi-iface$/\1/p'); do
+		rest=${section#zte_extra_}
+		case " $seen " in *" $rest "*) continue ;; esac
 		uci -q delete "wireless.$section"
 		changed
-		log "backhaul mode is off; removed $section"
+		log "the plan no longer carries slot ${rest#*_} of ${rest%%_*}; removed $section"
 	done
+}
+
+# clear_extras -> remove every extra slot this script created, once the mode is off
+clear_extras() {
+	local section removed=0
+	for section in $(uci -q show wireless | sed -n 's/^wireless\.\(zte_extra_[^.=]*\)=wifi-iface$/\1/p'); do
+		uci -q delete "wireless.$section"
+		changed
+		removed=$((removed + 1))
+	done
+	[ "$removed" = 0 ] || log "extra slot mode is off; removed $removed zte_extra_* section(s)"
+	return 0
+}
+
+# clear_backhaul [SIDE] -> undo what multi_ap mode wrote. With no argument (the mode is off) every section this
+# script owns goes, including the fronthaul flag on the main BSSs. With a side, only the sections of the *other*
+# side go: a router that stops being a child must not keep a backhaul client it will never point at anything, and
+# one that becomes a child must not keep advertising a backhaul BSS of its own next to the controller's.
+clear_backhaul() {
+	local keep="${1:-}" section band device iface
+	for section in $(uci -q show wireless | sed -n 's/^wireless\.\(zte_backhaul[a-z0-9_]*\)=wifi-iface$/\1/p'); do
+		case "$section" in
+		zte_backhaul_sta_*)
+			[ "$keep" = sta ] && continue
+			;;
+		*)
+			[ "$keep" = ap ] && continue
+			;;
+		esac
+		uci -q delete "wireless.$section"
+		changed
+		if [ -n "$keep" ]; then
+			log "$keep role runs the other end of the backhaul; removed $section"
+		else
+			log "backhaul mode is off; removed $section"
+		fi
+	done
+	[ -n "$keep" ] && return 0
 	# The fronthaul flag is ours as well, but only the value this script writes (1) is reverted: a 2 or a 3
 	# was put there by someone else, and deleting it would be this script overruling them.
 	for band in 2g 5g; do
@@ -250,11 +455,20 @@ clear_backhaul() {
 
 apply_plan() {
 	local plan="$1" rows=0 index radio slot ssid key enabled hidden beacon access
-	local iface device band enc is_backhaul
+	local iface device band enc is_backhaul bh_enc
 	# Re-read on every pass: editing the UCI option takes effect on the next published plan, no restart.
 	BACKHAUL=$(backhaul_mode)
+	SIDE=$(backhaul_side)
+	EXTRA=$(extra_slots_mode)
+	SEEN_EXTRAS=""
 	CHANGED=0
-	[ "$BACKHAUL" = multi_ap ] || clear_backhaul
+	if [ "$BACKHAUL" = multi_ap ]; then
+		# the sections of the end this router is not on go; the ones it is on stay until the plan says otherwise
+		clear_backhaul "$SIDE"
+	else
+		clear_backhaul
+	fi
+	[ "$EXTRA" = on ] || clear_extras
 	rows=$(sed -n 's/^rows=//p' "$plan" | head -n 1)
 	case "$rows" in ''|*[!0-9]*) log "plan has no row count"; return 1 ;; esac
 	[ "$rows" -gt 0 ] || return 0
@@ -283,12 +497,44 @@ apply_plan() {
 				continue
 			fi
 			[ -n "$ssid" ] || { log "radio $radio: backhaul row has no name in the plan; left alone"; continue; }
-			apply_backhaul "$band" "$ssid" "$key" "${enabled:-0}" "$hidden" "${beacon:-3}"
+			# A row that says it is secured and carries no key is refused at either end: the BSS would go on the
+			# air open, the client would fail to associate, and in both cases the page would report a backhaul
+			# that does not exist.
+			bh_enc=$(encryption_of "${beacon:-3}") || bh_enc=
+			if [ -n "$bh_enc" ] && [ "$bh_enc" != none ] && [ -z "$key" ]; then
+				log "radio $radio: backhaul row says $bh_enc but the plan carries no key; not applied"
+				continue
+			fi
+			if [ "$SIDE" = sta ]; then
+				apply_backhaul_sta "$band" "$ssid" "$key" "${enabled:-0}" "${beacon:-3}"
+			else
+				apply_backhaul "$band" "$ssid" "$key" "${enabled:-0}" "$hidden" "${beacon:-3}"
+			fi
 			mark_band "$band"
 			continue
 		fi
 		if [ "${slot:-0}" != 0 ]; then
-			log "slot $slot of radio $radio is not applied here (factory driver interface)"
+			if [ "$EXTRA" != on ]; then
+				log "slot $slot of radio $radio is not applied (zte_mesh.main.extra_slots is off)"
+				continue
+			fi
+			case "$slot" in
+			1|2|3) ;;
+			*) log "slot $slot of radio $radio is out of range (1..3); left alone"; continue ;;
+			esac
+			# Seen as soon as the plan names it, even if it cannot be applied: pruning is about the plan
+			# dropping a slot, not about this router failing to build one.
+			SEEN_EXTRAS="$SEEN_EXTRAS ${band}_$slot"
+			if [ -z "$ssid" ]; then
+				log "slot $slot of radio $radio has no name in the plan; left alone"
+				continue
+			fi
+			if [ "${enabled:-0}" = 1 ]; then
+				apply_extra "$band" "$slot" "$ssid" "$key" "$hidden" "${beacon:-3}"
+			else
+				remove_extra "$band" "$slot"
+			fi
+			mark_band "$band"
 			continue
 		fi
 		[ -n "$ssid" ] || { log "radio $radio has no name in the plan; left alone"; continue; }
@@ -296,9 +542,9 @@ apply_plan() {
 		device=$(radio_section_of "$band") || { log "no usable $band radio; left alone"; continue; }
 		iface=$(ap_iface_of "$device") || { log "no AP interface on $device ($band); left alone"; continue; }
 		[ "$enabled" = 1 ] && enable_radio "$device" "$band"
-		set_opt "$iface" disabled "$([ "$enabled" = 1 ] && echo 0 || echo 1)"
+		set_flag "$iface" disabled "$([ "$enabled" = 1 ] && echo 0 || echo 1)"
 		set_opt "$iface" ssid "$ssid"
-		[ -n "$hidden" ] && set_opt "$iface" hidden "$hidden"
+		[ -n "$hidden" ] && set_flag "$iface" hidden "$hidden"
 		set_opt "$iface" encryption "$enc"
 		# The main BSS is the fronthaul half of a Multi-AP pair; without the flag a matching backhaul STA
 		# would not know this BSS carries the Multi-AP element.
@@ -307,6 +553,9 @@ apply_plan() {
 		log "radio $radio ($band, $device.$iface): name set to ${#ssid} characters, security $enc, enabled $enabled"
 		mark_band "$band"
 	done
+	# A slot this run did not see is gone from the plan: its section must go too, or the child keeps
+	# broadcasting a network the controller has stopped handing out.
+	[ "$EXTRA" = on ] && prune_extras "$SEEN_EXTRAS"
 	key=""
 	return 0
 }
@@ -341,9 +590,12 @@ write_status() {
 }
 
 apply_and_reload() {
+	local warning
 	APPLIED=""
 	TOUCHED=0
 	apply_plan "$1" || { write_status error "the plan could not be applied"; return 1; }
+	warning=$(wpad_warning) || warning=""
+	[ -n "$warning" ] && log "$warning"
 	if [ "$CHANGED" = 1 ]; then
 		uci commit wireless || { log "uci commit failed"; write_status error "uci commit failed"; return 1; }
 		# wifi reload re-reads every radio; a full restart is not needed and would drop the backhaul.
@@ -354,7 +606,7 @@ apply_and_reload() {
 	else
 		log "plan applied nothing new"
 	fi
-	write_status ok
+	write_status ok "$warning"
 	return 0
 }
 

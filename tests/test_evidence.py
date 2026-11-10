@@ -1,8 +1,11 @@
 import struct
+import sys
 import tempfile
 import unittest
 import zlib
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "dev"))
 
 from jffs2 import EvidenceError, crc32, extract_file
 from prepare import checked, resolve_library
