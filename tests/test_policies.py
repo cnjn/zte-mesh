@@ -5,15 +5,15 @@ import unittest
 from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SOURCE))
+sys.path.insert(0, str(SOURCE / "tools" / "dev"))
 from schema import (CONSTRUCTORS, POLICY_TABLES, constructor_data, policy_registry,
                     policy_constructor_fields, verify_policy_constructor,
                     verify_policy_registration, emit_policy_definitions)
 
 ARTIFACTS = Path(sys.argv[1]) if len(sys.argv) == 2 else SOURCE / "out"
 CSPD = ARTIFACTS / "analysis/cspd"
-MASTER = (SOURCE / "multiap_master.def").read_text()
-DOMAIN = (SOURCE / "multiap_domain.def").read_text()
+MASTER = (SOURCE / "src" / "multiap_master.def").read_text()
+DOMAIN = (SOURCE / "src" / "multiap_domain.def").read_text()
 
 
 class PolicyLayoutTests(unittest.TestCase):
