@@ -146,6 +146,39 @@ static int admit(const uint8_t *mac)
     return 1;
 }
 
+/* "<MAC>.seen": when this node last sent us a complete frame, whatever the frame said. A child that answers no
+ * metrics query still has a firmware heartbeat, and the page needs that to tell "this node went quiet" from "this
+ * node never talked". Rewritten at most every SEEN_SECONDS per MAC: the heartbeat arrives a few times a second on
+ * the lab link, and one file per five seconds per node is enough to answer "how old is it" without churning the
+ * tmpfs. */
+#define SEEN_SECONDS 5
+
+static void note_seen(const uint8_t *mac)
+{
+    static struct { uint8_t mac[6]; time_t at; } recent[PEERS_KNOWN];
+    static unsigned int count;
+    time_t now = time(NULL);
+    unsigned int k;
+    char text[24];
+    int n;
+    for (k = 0; k < count; k++)
+        if (!memcmp(recent[k].mac, mac, 6))
+            break;
+    if (k == count) {
+        if (count >= PEERS_KNOWN)
+            return;
+        memcpy(recent[count].mac, mac, 6);
+        recent[count].at = 0;
+        count++;
+    }
+    if (now - recent[k].at < SEEN_SECONDS)
+        return;
+    recent[k].at = now;
+    n = snprintf(text, sizeof(text), "epoch=%ld\n", (long)now);
+    if (n > 0)
+        (void)write_peer(mac, "seen", text, (size_t)n);
+}
+
 int controller_peer_note(const uint8_t *frame, size_t bytes)
 {
     struct cmdu_header header;
@@ -163,6 +196,13 @@ int controller_peer_note(const uint8_t *frame, size_t bytes)
     if (bytes < CONTROLLER_1905_HEADER || !cmdu_decode(frame, bytes, &header) ||
         !header.last_fragment || header.fragment)
         return 0;
+
+    /* Any complete frame proves the sender is alive, even one that carries nothing the page shows. The firmware's
+     * own heartbeat (CMDU 0x0004 on the lab link) is what a child that never answers a metrics query leaves behind,
+     * and the service turns that silence into an offline row. It is not a file this function reports: the return
+     * value still counts only what the page reads. */
+    if (admit(frame + 6))
+        note_seen(frame + 6);
 
     /* The answers to a client action: a BTM report (0x8015) says whether the client accepted, and a Steering
      * Completed (0x8017) says it left. Both name the client, which is what the action table keys on, so the file is
@@ -259,6 +299,39 @@ int controller_peer_note(const uint8_t *frame, size_t bytes)
         }
     }
     return written;
+}
+
+/* When this node last sent us a complete frame, from "<dir>/<mac>.seen". The content is checked like a BSS entry
+ * ("epoch=<digits>") because anyone on the LAN can write into that directory; the age is the file's mtime, which is
+ * this side's clock. 1 = there, 0 = never seen (or the file is not one this side wrote). */
+int controller_peer_seen(const char *mac, long *age)
+{
+    char path[96], text[24];
+    struct stat info;
+    ssize_t bytes;
+    time_t now = time(NULL);
+    int fd;
+    if (!mac || snprintf(path, sizeof(path), "%s/%s.seen", peers_dir(), mac) >= (int)sizeof(path))
+        return 0;
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return 0;
+    if (fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_size < 7 || info.st_size >= (off_t)sizeof(text)) {
+        (void)close(fd);
+        return 0;
+    }
+    bytes = read(fd, text, sizeof(text) - 1);
+    (void)close(fd);
+    if (bytes < 7)
+        return 0;
+    text[bytes] = 0;
+    if (memcmp(text, "epoch=", 6) || text[6] < '0' || text[6] > '9')
+        return 0;
+    if (age) {
+        long elapsed = (long)(now - info.st_mtime);
+        *age = elapsed > 0 ? elapsed : 0;
+    }
+    return 1;
 }
 
 /* The one number in "<dir>/<mac>.<bssid>.sta", or -1: the text this side wrote, checked rather than trusted,

@@ -589,6 +589,50 @@ static void frames_that_write_nothing(void)
     CHECK(controller_peer_note(frame, 0) == 0);
 }
 
+static void seen_marks_any_frame(void)
+{
+    uint8_t frame[CONTROLLER_1905_MAX_BYTES];
+    const uint8_t quiet[6] = {2, 0, 0, 0, 0x19, 0x77};
+    char mac[18], path[300], first[32], second[32];
+    struct timespec when[2];
+    long age = -1;
+    size_t at;
+
+    /* Nothing heard yet: the reader says so. A row the daemon knows about is not online on that alone. */
+    mac_text_of(quiet, mac);
+    CHECK(peer_absent(quiet, "seen"));
+    CHECK(controller_peer_seen(mac, &age) == 0);
+
+    /* The status chatter writes nothing the page shows, but it does prove the sender is there - the only liveness a
+     * child that answers no metrics query ever gives. */
+    at = put_tlv(frame, frame_open(frame, quiet, 0x0004, 300), CONTROLLER_TLV_AL_MAC, quiet, 6);
+    CHECK(controller_peer_note(frame, put_eom(frame, at)) == 0);
+    CHECK(controller_peer_seen(mac, &age) == 1 && age == 0);
+    peer_text(quiet, "seen", first, sizeof(first));
+
+    /* The same child again inside the throttle window reuses the timestamp instead of rewriting the file. */
+    at = put_tlv(frame, frame_open(frame, quiet, 0x0004, 301), CONTROLLER_TLV_AL_MAC, quiet, 6);
+    CHECK(controller_peer_note(frame, put_eom(frame, at)) == 0);
+    peer_text(quiet, "seen", second, sizeof(second));
+    CHECK(!strcmp(first, second));
+
+    /* An hour of silence reads as an hour: the age is the file's mtime, and the caller decides when that is enough
+     * to call the row offline. */
+    when[0].tv_sec = time(NULL) - 3600;
+    when[0].tv_nsec = 0;
+    when[1] = when[0];
+    snprintf(path, sizeof(path), "%s/%s.seen", peers, mac);
+    CHECK(!utimensat(AT_FDCWD, path, when, 0));
+    CHECK(controller_peer_seen(mac, &age) == 1 && age >= 3500);
+
+    /* A file somebody else dropped into the world-writable directory is not liveness. It is removed again so the
+     * budget case below still counts only MACs this side admitted. */
+    CHECK(write_stray("02:00:00:00:00:19:78.seen", "alive\n") == 1);
+    CHECK(controller_peer_seen("02:00:00:00:00:19:78", &age) == 0);
+    snprintf(path, sizeof(path), "%s/02:00:00:00:00:19:78.seen", peers);
+    CHECK(!unlink(path));
+}
+
 static void flood_budget(void)
 {
     uint8_t frame[CONTROLLER_1905_MAX_BYTES];
@@ -663,6 +707,7 @@ int main(void)
     actions_follow_the_client();
     version_is_another_file();
     frames_that_write_nothing();
+    seen_marks_any_frame();
     flood_budget();
     cleanup();
 

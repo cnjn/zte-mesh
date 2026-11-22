@@ -60,6 +60,12 @@ struct peer_bss_load {
     struct peer_bss_entry detail[CONTROLLER_AP_BSS_MAX];
 };
 
+/* How long ago this node sent us any complete 1905 frame it was admitted for - the page's only own evidence that
+ * a row the daemon still calls active is actually there. `<MAC>.seen` is rewritten at most every few seconds, so
+ * a child that only chatters is as alive as one that answers. 1 = the file is there and readable, *age gets its
+ * age in seconds; 0 = this node never sent us a frame since the directory was last emptied. */
+int controller_peer_seen(const char *mac, long *age);
+
 /* 1 = at least one `<MAC>.<BSSID>.sta` is there and younger than max_age seconds (0 = no limit), 0 = this node has
  * no per-BSS entries at all, which is not the same as its stations being zero.
  *

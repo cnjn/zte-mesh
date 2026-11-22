@@ -804,6 +804,12 @@ struct mlo_push { char mac[18]; time_t since, next; int sent; unsigned int attem
 #define AP_METRIC_PEERS 8U
 #define AP_METRIC_SETTLE 15
 #define AP_METRIC_INTERVAL 10
+
+/* How quiet a node has to be before the page calls it offline, even when the daemon's own database still says its
+ * row is active. Three missed rounds of the factory's 30 s topology frame (and three of the query above), so a node
+ * that changes its AL or sends one late frame is not flickered offline. */
+#define NODE_SILENT_SECONDS 90
+
 struct ap_metric_query { char mac[18]; time_t since, next; };
 
 static void al_mac(char out[18])
@@ -919,7 +925,8 @@ static int write_state(const struct service_state *state)
         const char *model = nodes[i].model, *name = nodes[i].name;
         char reported[72]; /* one line from peers/<mac>.software: a version is at most 64 bytes */
         const char *software = nodes[i].software;
-        if (!strcmp(nodes[i].mac, mac)) {
+        int self_here = !strcmp(nodes[i].mac, mac);
+        if (self_here) {
             model = self_model;
             name = self_name;
         } else {
@@ -946,8 +953,14 @@ static int write_state(const struct service_state *state)
             /* Everything below comes from the frames the daemon received from this node (controller-trace.c writes
              * them, controller-1905.c decodes them). A value of -1 means the node has not reported it, which is not
              * the same as zero: a node that reports no BSS is different from one this router never heard from. */
-            long light_age = -1, metrics_age = -1;
+            long light_age = -1, metrics_age = -1, seen_age = -1;
             struct peer_bss_load counted = {0};
+            int seen = controller_peer_seen(nodes[i].mac, &seen_age);
+            /* The Active column is the daemon's opinion, and the daemon keeps a row active until its own offline
+             * timer runs out. The page's "online" is that opinion AND this side having heard the node recently: a
+             * child quiet for NODE_SILENT_SECONDS reads offline here while its row still says active. Ourselves are
+             * the exception - no frame ever comes from this router's own address. */
+            int online = nodes[i].active && (self_here || (seen && seen_age <= NODE_SILENT_SECONDS));
             int light = read_peer(nodes[i].mac, "light", "light", 0, &light_age);
             int stations = read_peer(nodes[i].mac, "metrics", "stations", 30, &metrics_age);
             int bss = read_peer(nodes[i].mac, "metrics", "bss", 30, NULL);
@@ -965,10 +978,10 @@ static int write_state(const struct service_state *state)
                 metrics_age = counted.age;
             }
             used += (size_t)snprintf(json + used, sizeof(json) - used,
-                                     "%s,\"zte\":%s,\"online\":%s,\"light\":%d,\"light_age\":%ld,\"stations\":%d,"
-                                     "\"bss\":%d,\"hops\":%d,\"metrics_age\":%ld,\"bss_detail\":[",
-                                     quoted, nodes[i].zte ? "true" : "false", nodes[i].active ? "true" : "false", light, light_age,
-                                     stations, bss, hops, metrics_age);
+                                     "%s,\"zte\":%s,\"online\":%s,\"seen_age\":%ld,\"light\":%d,\"light_age\":%ld,"
+                                     "\"stations\":%d,\"bss\":%d,\"hops\":%d,\"metrics_age\":%ld,\"bss_detail\":[",
+                                     quoted, nodes[i].zte ? "true" : "false", online ? "true" : "false", seen_age, light,
+                                     light_age, stations, bss, hops, metrics_age);
             /* One row per BSS that reported, so the page can tell a busy 5G from an idle radio with one guest. The
              * BSSID is this node's own file name, and the count of a BSS with nobody on it is a zero - which is why
              * an empty list means "the frames never split", not "no station anywhere". */
@@ -1294,9 +1307,13 @@ static void mlo_reconcile(const struct service_config *cfg, struct mlo_push push
 static void ap_metrics_reconcile(struct ap_metric_query peers[AP_METRIC_PEERS], time_t now)
 {
     struct controller_node nodes[MAX_NODES];
-    unsigned int count, i, j, k, octets[6];
+    unsigned int count, i, j, k, offset, octets[6];
     char self[18];
     int online, asked = 0;
+    /* Where the last query went. One query per tick, and restarting the scan at row zero every time would starve
+     * every other node behind a row that is still marked active but long gone: its query is sent, the call stops,
+     * and the next tick begins at the same row again. */
+    static unsigned int cursor;
     al_mac(self);
     count = topology_ready() ? controller_read_nodes(nodes, MAX_NODES) : 0;
     for (k = 0; k < AP_METRIC_PEERS; k++) {
@@ -1310,9 +1327,10 @@ static void ap_metrics_reconcile(struct ap_metric_query peers[AP_METRIC_PEERS], 
         if (!online)
             peers[k].mac[0] = 0;
     }
-    for (i = 0; i < count && !asked; i++) {
+    for (offset = 0; offset < count && !asked; offset++) {
         uint8_t mac[6];
         int status;
+        i = (cursor + offset) % count;
         if (!nodes[i].active || !strcmp(nodes[i].mac, self))
             continue;
         if (sscanf(nodes[i].mac, "%x:%x:%x:%x:%x:%x", &octets[0], &octets[1], &octets[2],
@@ -1340,6 +1358,7 @@ static void ap_metrics_reconcile(struct ap_metric_query peers[AP_METRIC_PEERS], 
         printf("ZTE_MESH_SERVICE ap_metric_query mac=%s status=%d epoch=%ld\n", nodes[i].mac, status, (long)time(NULL));
         fflush(NULL);
         asked = 1;
+        cursor = (i + 1) % count;
     }
 }
 
