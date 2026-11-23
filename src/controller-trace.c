@@ -53,6 +53,34 @@ static void emit_line(const char *line, size_t len)
     }
     emit(line, len);
 }
+
+/* One line per minute per distinct text. A view the private DB does not carry fails on
+ * every Renew, so the identical sentence arrived once per read and was most of what a
+ * reader saw; the same words twice are not a second fact. The window keeps a persistent
+ * fault visible without letting it fill the ring on its own. */
+static int first_in_window(const char *text)
+{
+    enum { SLOTS = 16, WINDOW = 60 };
+    static struct { unsigned hash; long window; } seen[SLOTS];
+    static unsigned next;
+    struct timespec monotonic;
+    unsigned i, hash = 2166136261u;
+    long window;
+    if (clock_gettime(CLOCK_MONOTONIC, &monotonic))
+        monotonic.tv_sec = 0;
+    window = monotonic.tv_sec / WINDOW;
+    while (*text)
+        hash = (hash ^ (unsigned char)*text++) * 16777619u;
+    if (!hash)
+        hash = 1; /* an empty slot is hash 0 */
+    for (i = 0; i < SLOTS; i++)
+        if (seen[i].hash == hash && seen[i].window == window)
+            return 0;
+    seen[next].hash = hash;
+    seen[next].window = window;
+    next = (next + 1) % SLOTS;
+    return 1;
+}
 /* The firehose switch: a flag file in the one directory the sandbox leaves writable. */
 static int verbose_enabled(void)
 {
@@ -264,10 +292,19 @@ EXPORT int dbAPIGetView(const char *view, const char *instance, void *data)
         }
         message("ZTE_CONTROLLER_TRACE bss_config get_status=%d tag=%u enabled=%u body_logged=0\n", result, tag, enabled);
     }
-    if (view && (!strcmp(view, "IPInterface") || !strcmp(view, "MultiAPDomain")))
-        message("ZTE_CONTROLLER_TRACE db_get view=%s instance=%.36s status=%d\n", view, instance ? instance : "", result);
-    else if (result || (view && !strcmp(view, "P1905ComCfg")))
-        message("ZTE_CONTROLLER_TRACE db_get view=%.36s status=%d\n", view ? view : "", result);
+    if (view && result) {
+        /* Only a failed read is actionable here. A success is the steady state: every
+         * Renew asks again, and those lines were three quarters of the view noise in a
+         * three-minute window. Keyed by view and status so a changed error still shows. */
+        char key[48];
+        snprintf(key, sizeof(key), "%.36s:%d", view, result);
+        if (first_in_window(key)) {
+            if (!strcmp(view, "IPInterface") || !strcmp(view, "MultiAPDomain"))
+                message("ZTE_CONTROLLER_TRACE db_get view=%s instance=%.36s status=%d\n", view, instance ? instance : "", result);
+            else
+                message("ZTE_CONTROLLER_TRACE db_get view=%.36s status=%d\n", view, result);
+        }
+    }
     errno = saved; return result;
 }
 EXPORT int bind(int fd, const struct sockaddr *address, socklen_t length)
@@ -379,7 +416,10 @@ EXPORT int vsnprintf(char *buffer, size_t size, const char *format, va_list ap)
         for (i = 0; i < sizeof(text) - 1 && format[i]; i++)
             text[i] = (unsigned char)format[i] >= 32 && (unsigned char)format[i] <= 126 ? format[i] : ' ';
         text[i] = 0;
-        message("ZTE_CONTROLLER_TRACE vendor_log_format=%s\n", text);
+        /* The keeping filter above lets every "failed" through, and the daemon repeats
+         * that one on each read; keep the sentence, drop the repetition. */
+        if (first_in_window(text))
+            message("ZTE_CONTROLLER_TRACE vendor_log_format=%s\n", text);
     }
     errno = saved; return result;
 }
