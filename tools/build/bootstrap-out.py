@@ -37,7 +37,7 @@ from collections import deque
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / "tools" / "dev"))
 
 from prepare import LIBOSS_PUB_SHA256, MULTIAPD_SHA256  # noqa: E402
 from vendor_elf import ELF, audit  # noqa: E402

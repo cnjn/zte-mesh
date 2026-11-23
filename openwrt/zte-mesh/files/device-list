@@ -1,0 +1,227 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# device-list -- one JSON object on stdout: the devices this router can see itself.
+#
+#   device-list
+#
+#   {"epoch":1794187974,"devices":[{"mac":"00:01:f3:96:43:cf","ip":"192.168.1.162","name":"DESKTOP-JSJGOJL",
+#     "ssid":"","iface":"","lease_end":1794221941,"sources":"lease neigh","node":false,"via":""}]}
+#
+# Three local tables and nothing else: the DHCP leases this router wrote (/tmp/dhcp.leases), the neighbours the
+# kernel knows (`ip neigh` -- a device with a static address never gets a lease), and the stations associated to
+# this router's own access points (the mac80211 debugfs tree sta-collect counts in). The controller cannot supply
+# this list by itself: it learns a station count per BSS from AP Metrics (0x94) and nothing about which stations
+# those are, so what it cannot say comes in as a child's own report, below.
+#
+# What a child router did report is filed by the controller's peer codec as peers/<its AL MAC>.assoc - the clients
+# on that child's access points, with the SSID of each. Those rows are merged in too, and `via` names the child
+# they came from: a phone on a child's radio is a wireless device of this mesh, not a wired one of this router,
+# even though the only tables here that know its address are the lease and the neighbour table. A report older
+# than ASSOC_AGE is a child that stopped answering, and its rows are dropped rather than shown as if they were now.
+#
+# The tables are merged by MAC, and the answer says which tables saw the device, because they age differently: a
+# lease outlives the device by up to its lease time and a neighbour entry lives as long as the kernel keeps talking
+# to the address. The live address is preferred over the lease's: a device that moved to a new address is in the
+# neighbour table under the new one while its old lease is still on file.
+#
+# The access points come from netifd filtered to mode=ap, for the same reason sta-collect filters: a client
+# interface (the backhaul station a child builds toward its controller) has a stations directory of its own, and
+# listing those would report the controller as a device of this router.
+#
+# netifd's reply carries the Wi-Fi key. Only the interface name, the SSID and the station directory names leave
+# this script; nothing is written to disk and nothing is logged.
+#
+# A board with no radios, no debugfs, no leases and an empty neighbour table answers with an empty list -- that is
+# the measured answer, not a failure, and the page says so.
+#
+# Every external command comes from the environment, so tests can answer from fixtures (tests/test_devices.sh):
+# ZTE_MESH_LEASE, ZTE_MESH_BRIDGE_IF, ZTE_MESH_MAC80211_DEBUG, ZTE_MESH_RUNDIR, ZTE_MESH_IP, ZTE_MESH_UBUS,
+# ZTE_MESH_JSONFILTER, ZTE_MESH_CLOCK.
+
+TAB=$(printf '\t')
+LEASES=${ZTE_MESH_LEASE:-/tmp/dhcp.leases}
+DEBUG=${ZTE_MESH_MAC80211_DEBUG:-/sys/kernel/debug/ieee80211}
+RUNDIR=${ZTE_MESH_RUNDIR:-/run/zte-mesh}
+STATE=$RUNDIR/state.json
+PEERS=$RUNDIR/peers
+# Six controller query intervals, the same freshness the station counts get: a node that stopped answering has
+# nothing to say about who is on its radios any more.
+ASSOC_AGE=30
+IP=${ZTE_MESH_IP:-$(command -v ip)}
+UBUS=${ZTE_MESH_UBUS:-$(command -v ubus)}
+JSONFILTER=${ZTE_MESH_JSONFILTER:-$(command -v jsonfilter)}
+CLOCK=${ZTE_MESH_CLOCK:-date}
+
+# The bridge the neighbour table is asked about. The bridge name is a configuration value (`zte_mesh.main.bridge`),
+# so it is read rather than assumed; an image without uci falls back to the default name.
+BRIDGE=${ZTE_MESH_BRIDGE_IF:-}
+if [ -z "$BRIDGE" ] && command -v uci >/dev/null 2>&1; then
+	BRIDGE=$(uci -q get zte_mesh.main.bridge 2>/dev/null)
+fi
+[ -n "$BRIDGE" ] || BRIDGE=br-lan
+
+# leases -> L <mac> <ip> <host name> <lease end>; the fifth field of /tmp/dhcp.leases is the client id and not used.
+leases() {
+	[ -r "$LEASES" ] || return 0
+	awk '
+	{
+		mac = tolower($2); ip = $3; name = $4; end = $1
+		if (mac !~ /^[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]$/) next
+		if (ip !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) ip = ""
+		if (name == "*") name = ""
+		if (end !~ /^[0-9]+$/) end = "0"
+		printf "L\t%s\t%s\t%s\t%s\n", mac, ip, name, end
+	}' "$LEASES"
+}
+
+# neighbours -> N <mac> <ip>; FAILED and INCOMPLETE are the kernel saying it does not have an address for that
+# device, which is not a device.
+neighbours() {
+	command -v "$IP" >/dev/null 2>&1 || return 0
+	"$IP" -4 neigh show dev "$BRIDGE" 2>/dev/null | awk '
+	{
+		ip = $1; mac = ""; state = $NF
+		for (i = 2; i < NF; i++)
+			if ($i == "lladdr") mac = tolower($(i + 1))
+		if (mac == "" || state == "FAILED" || state == "INCOMPLETE") next
+		if (ip !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) next
+		printf "N\t%s\t%s\n", mac, ip
+	}'
+}
+
+# ap_ifaces -> <ifname> <ssid> per access point netifd has up. This image's jsonfilter has no predicate syntax, so
+# every interface object is printed whole (one per line) and picked apart here. The spacing inside that line is
+# jsonfilter's own, so the mode test runs on a copy with the spaces removed while the SSID is taken from the line
+# as it is -- an SSID may contain spaces and must not lose them.
+ap_ifaces() {
+	command -v "$UBUS" >/dev/null 2>&1 && command -v "$JSONFILTER" >/dev/null 2>&1 || return 0
+	"$UBUS" call network.wireless status 2>/dev/null |
+		"$JSONFILTER" -e '@.*.interfaces[*]' 2>/dev/null |
+		while IFS= read -r line; do
+			compact=$(printf '%s' "$line" | tr -d ' ')
+			case "$compact" in *'"mode":"ap"'*) ;; *) continue ;; esac
+			ifn=$(printf '%s' "$line" | sed -n 's/.*"ifname": *"\([^"]*\)".*/\1/p')
+			[ -n "$ifn" ] || continue
+			ssid=$(printf '%s' "$line" | sed -n 's/.*"ssid": *"\([^"]*\)".*/\1/p')
+			printf '%s\t%s\n' "$ifn" "$ssid"
+		done
+}
+
+# stations -> W <mac> <ifname> <ssid>; an absent stations directory is not "no stations", it is this kernel saying
+# nothing about that interface, and the loop moves on rather than inventing a row.
+stations() {
+	[ -d "$DEBUG" ] || return 0
+	ap_ifaces | while IFS="$TAB" read -r ifn ssid; do
+		for base in "$DEBUG"/phy*/"netdev:$ifn"/stations; do
+			[ -d "$base" ] || continue
+			for dir in "$base"/*/; do
+				[ -d "$dir" ] || continue
+				sta=${dir%/}; sta=${sta##*/}
+				case "$sta" in
+				*:*) printf 'W\t%s\t%s\t%s\n' "$sta" "$ifn" "$ssid" ;;
+				esac
+			done
+			break
+		done
+	done
+}
+
+# node_macs -> the AL MACs the controller has in its topology, one per line. They are routers, not devices, and the
+# page marks them as such; a child's backhaul station MAC is not the same address, so a child may still show up as
+# a station of its own controller.
+node_macs() {
+	[ -s "$STATE" ] && command -v "$JSONFILTER" >/dev/null 2>&1 || return 0
+	"$JSONFILTER" -i "$STATE" -e '@.nodes[*].mac' 2>/dev/null | tr 'A-F' 'a-f'
+}
+
+# assoc_clients -> A <mac> <ssid> <node> <epoch>: what a child router said is associated to its own access points.
+# The file name is that child's AL MAC and the stamp is when its report arrived here; a row whose file name is not
+# a MAC, whose stamp does not parse, or whose stamp is older than ASSOC_AGE is not a report this page can stand
+# behind. The SSID comes from the child because this router has no table that knows which radio of another router
+# a device is on.
+assoc_clients() {
+	[ -d "$PEERS" ] || return 0
+	[ "$now" -gt 0 ] || return 0
+	for file in "$PEERS"/*.assoc; do
+		[ -f "$file" ] || continue
+		node=${file##*/}
+		node=${node%.assoc}
+		case "$node" in
+		[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+		*) continue ;;
+		esac
+		epoch=$(sed -n '1s/^epoch=//p' "$file" 2>/dev/null)
+		case "$epoch" in ''|*[!0-9]*) continue ;; esac
+		age=$((now - epoch))
+		[ "$age" -ge 0 ] && [ "$age" -le "$ASSOC_AGE" ] || continue
+		tail -n +2 "$file" | awk -F"$TAB" -v node="$node" -v epoch="$epoch" '
+		$1 ~ /^[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]$/ {
+			ssid = (NF >= 3) ? $3 : ""
+			printf "A\t%s\t%s\t%s\t%s\n", $1, ssid, node, epoch
+		}'
+	done
+}
+
+now=$("$CLOCK" +%s 2>/dev/null)
+case "$now" in ''|*[!0-9]*) now=0 ;; esac
+nodes=$(node_macs | tr '\n' ' ')
+
+# The three tables are merged by MAC, sorted so a reader gets the same order every time, then printed as JSON.
+# A host name and an SSID are arbitrary bytes a client or an administrator chose: quotes and backslashes are dropped
+# here so they cannot end a JSON string early (an SSID in UTF-8 is passed through untouched).
+{
+	leases
+	neighbours
+	stations
+	assoc_clients
+} | awk -F"$TAB" '
+{
+	kind = $1; mac = tolower($2)
+	if (kind == "L") { le_ip[mac] = $3; le_name[mac] = $4; le_end[mac] = $5; hit[mac] = hit[mac] "L" }
+	else if (kind == "N") { nb_ip[mac] = $3; hit[mac] = hit[mac] "N" }
+	else if (kind == "W") { w_ifn[mac] = $3; w_ssid[mac] = $4; hit[mac] = hit[mac] "W" }
+	else if (kind == "A") {
+		# Two children can both list a device for a moment while it roams; the report that arrived last wins,
+		# and the node name breaks a tie so the same pair of reports does not flip between page refreshes.
+		if (!(mac in a_epoch) || $5 + 0 > a_epoch[mac] || ($5 + 0 == a_epoch[mac] && $4 < a_node[mac])) {
+			a_ssid[mac] = $3; a_node[mac] = $4; a_epoch[mac] = $5 + 0
+		}
+		hit[mac] = hit[mac] "A"
+	}
+	seen[mac] = 1
+}
+END {
+	for (mac in seen) {
+		ip = nb_ip[mac]
+		if (ip == "") ip = le_ip[mac]
+		printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", mac, ip, le_name[mac], le_end[mac], w_ifn[mac], w_ssid[mac], hit[mac], a_ssid[mac], a_node[mac]
+	}
+}' | LC_ALL=C sort | awk -F"$TAB" -v epoch="$now" -v nodes="$nodes" '
+BEGIN {
+	printf "{\"epoch\":%s,\"devices\":[", epoch
+	sep = ""
+}
+{
+	mac = $1; ip = $2; name = $3; end = $4; ifn = $5; ssid = $6; hit = $7; via = ""
+	gsub(/["\\\\]/, "", name); gsub(/["\\\\]/, "", ssid)
+	gsub(/[^0-9a-fA-F:.]/, "", ip)
+	if (ip == "") ip = "-"
+	gsub(/[^0-9A-Za-z_.:@-]/, "", ifn)
+	if (end !~ /^[0-9]+/) end = "0"
+	# A device associated to this router is on this router, whatever a child said a moment earlier: this side
+	# has the station in front of it, and `via` is for the ones no table here can place.
+	if (hit !~ /W/ && hit ~ /A/) { ssid = $8; via = $9 }
+	gsub(/[^0-9a-f:]/, "", via)
+	sources = ""
+	if (hit ~ /L/) sources = "lease"
+	if (hit ~ /N/) sources = sources (sources == "" ? "" : " ") "neigh"
+	if (hit ~ /W/) sources = sources (sources == "" ? "" : " ") "wlan"
+	if (hit ~ /A/) sources = sources (sources == "" ? "" : " ") "assoc"
+	isnode = "false"
+	if (" " nodes " " ~ " " mac " ") isnode = "true"
+	printf "%s{\"mac\":\"%s\",\"ip\":\"%s\",\"name\":\"%s\",\"ssid\":\"%s\",\"iface\":\"%s\",\"lease_end\":%s,\"sources\":\"%s\",\"node\":%s,\"via\":\"%s\"}", sep, mac, ip, name, ssid, ifn, end, sources, isnode, via
+	sep = ","
+}
+END { printf "]}\n" }
+'

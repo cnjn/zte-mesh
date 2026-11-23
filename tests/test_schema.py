@@ -5,11 +5,11 @@ import unittest
 from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SOURCE))
+sys.path.insert(0, str(SOURCE / "tools" / "dev"))
 from schema import Image, CSPD_SHA256, registry, recover_constructor, verify_constructor, verify_lengths
 
 ARTIFACTS = Path(sys.argv[1]) if len(sys.argv) == 2 else SOURCE / "out"
-DEFINITION = (SOURCE / "multiap_cfg.def").read_text()
+DEFINITION = (SOURCE / "src" / "multiap_cfg.def").read_text()
 
 
 class RegistryTests(unittest.TestCase):

@@ -1,8 +1,10 @@
 # 原厂控制器能向子路由下发什么配置（全景，含 Z506 的实际支持）
 
+> **存档：** 这份是查证资料，不再随功能改动更新。功能状态以 [FEATURE_STATUS](FEATURE_STATUS.md) 为准，排期与上机待办以 [PLAN](PLAN.md) 为准。
+
 来源：SR1010 的 `multiapd` 与 `libcmapi`/`libmultiapcmapi`/`libieee1905cmapi` 静态分析，对照测试子路由 Z506
-（V1.0.0.2B2.8000）自己的 `multiapd`，再加真机抓包。逆向细节见 [FINDINGS.md](FINDINGS.md)，配置语法与验证见
-[REAL_CHILD.md](REAL_CHILD.md)。可信度：**[真机]** 抓包或子路由读回验证过；**[代码]** 读到发送/接收路径但没在真机跑；
+（V1.0.0.2B2.8000）自己的 `multiapd`，再加上机抓包。逆向细节见 [FINDINGS.md](FINDINGS.md)，配置语法与验证见
+[REAL_CHILD.md](REAL_CHILD.md)。可信度：**[原厂路由器]** 抓包或子路由读回验证过；**[代码]** 读到发送/接收路径但没在上机跑；
 **[名称]** 只看到函数名或字符串。
 
 > **最重要的一点：两边固件差很多。** SR1010 的 `multiapd`（988 KB，2393 个函数）带大量新功能；Z506 的
@@ -25,13 +27,13 @@
 
 | 配置项 | 内容 | Z506 | 状态 |
 |---|---|---|---|
-| WSC M2 | SSID、认证方式（Open/Shared/WPA/WPA2-PSK/混合）、加密（无/WEP/TKIP/AES）、密钥；每频段、每 BSS 槽位 | 有 | **[真机]** 主 SSID 与密钥；访客等槽位的名称、密码、开关 |
-| Multi-AP 扩展子元素 | 每 BSS 的类型：Tear Down（关闭）、Fronthaul、Backhaul | 有 | **[真机]** |
-| Renew | 让已入网的子路由重新跑自动配置 | 有 | **[真机]** 改配置后约 4 秒重启无线并应用 |
+| WSC M2 | SSID、认证方式（Open/Shared/WPA/WPA2-PSK/混合）、加密（无/WEP/TKIP/AES）、密钥；每频段、每 BSS 序号 | 有 | **[原厂路由器]** 主 SSID 与密钥；访客等序号的名称、密码、开关 |
+| Multi-AP 扩展子元素 | 每 BSS 的类型：Tear Down（关闭）、Fronthaul、Backhaul | 有 | **[原厂路由器]** |
+| Renew | 让已入网的子路由重新跑自动配置 | 有 | **[原厂路由器]** 改配置后约 4 秒重启无线并应用 |
 | Backhaul BSS Config TLV | 回程 BSS 的凭据 | 无接收代码 | [代码] |
-| ZTE vendor：频段配置（FreqBand） | 只有三个子 TLV：`0x07` BeaconInterval（每频段，毫秒，4 字节大端）、`0x19` MaxHop、`0x55` STA 绑定支持标志；**没有 Fragment、TxPower、带宽、信道**。Z506 只处理 `0x07`、`0x19`（`0x55` 报 `unknown sub type`） | 有（`0x07`、`0x19`） | **[真机]** 2.4G 改 120 后 `WLANBase` 读回 120，5G 不变；改回读回 100 |
-| ZTE vendor：SSID 配置 | 按槽位序号：SSID 使能、ACL 策略。其余子类型（访客标志、VAP 隔离、隐藏 SSID 等）报 `unknown sub type` 并忽略 | 部分 | **[真机]** 只应用"使能 + ACL 策略" |
-| ZTE vendor：ACL 列表 | 每频段完整 MAC 名单（名称/MAC/策略），子路由删除多余、新增缺的 | 有 | **[真机]** 已下发（`acl.N.*`），`AclCfg` 表与驱动读回，一加被拒；`allow`（数值 2）来自子路由代码，未在真机试 |
+| ZTE vendor：频段配置（FreqBand） | 只有三个子 TLV：`0x07` BeaconInterval（每频段，毫秒，4 字节大端）、`0x19` MaxHop、`0x55` STA 绑定支持标志；**没有 Fragment、TxPower、带宽、信道**。Z506 只处理 `0x07`、`0x19`（`0x55` 报 `unknown sub type`） | 有（`0x07`、`0x19`） | **[原厂路由器]** 2.4G 改 120 后 `WLANBase` 读回 120，5G 不变；改回读回 100 |
+| ZTE vendor：SSID 配置 | 按网络序号：SSID 使能、ACL 策略。其余子类型（访客标志、VAP 隔离、隐藏 SSID 等）报 `unknown sub type` 并忽略 | 部分 | **[原厂路由器]** 只应用"使能 + ACL 策略" |
+| ZTE vendor：ACL 列表 | 每频段完整 MAC 名单（名称/MAC/策略），子路由删除多余、新增缺的 | 有 | **[原厂路由器]** 已下发（`acl.N.*`），`AclCfg` 表与驱动读回，一加被拒；`allow`（数值 2）来自子路由代码，未在中兴原厂路由器试 |
 | ZTE vendor：STA 绑定 | 把某终端绑定到某频段/AP（`CmMultiApSetStaBind`） | **无** | [代码]（仅 SR 侧） |
 | 哪些 vendor 消息启用 | `P1905AcdVenderCfg`（`CmMultiAPSetAcdVendorCfg`）决定启用清单 | — | [名称] |
 | M2 里的 ACD vendor TLV、默认 802.1Q、流量分离、Profile-2 能力 | VLAN / 多 profile 相关 | **无** | [代码]（仅 SR 侧） |
@@ -42,10 +44,10 @@
 
 | TLV | 内容 | Z506 | 状态 |
 |---|---|---|---|
-| Metric Reporting Policy（`0x8a`） | AP 指标上报间隔；每无线电的 STA RSSI 上报阈值、滞回、信道利用率阈值、流量统计/链路指标标志 | 有 | **[真机]** 子路由 `rssithr` 随之变化（0 与 -110） |
+| Metric Reporting Policy（`0x8a`） | AP 指标上报间隔；每无线电的 STA RSSI 上报阈值、滞回、信道利用率阈值、流量统计/链路指标标志 | 有 | **[原厂路由器]** 子路由 `rssithr` 随之变化（0 与 -110） |
 | Steering Policy（`0x89`） | 禁止引导的终端名单；每无线电的引导策略、利用率阈值、RCPI 引导阈值 | 有 | [代码] 抓包里没出现（控制器没有该无线电信息时不发） |
 | Unsuccessful Association Policy、Channel Scan Reporting Policy、Traffic Separation / 默认 802.1Q | 关联失败上报、扫描上报、VLAN 隔离 | **无** | [代码] |
-| ZTE vendor 策略 TLV | 见 B.1 | **无解析代码** | **[真机]** 已发送，子路由丢弃 |
+| ZTE vendor 策略 TLV | 见 B.1 | **无解析代码** | **[原厂路由器]** 已发送，子路由丢弃 |
 
 ### B.1 ZTE vendor 策略子 TLV（只有 SR 侧有 Insert，**Z506 没有 Extract**）
 
@@ -69,13 +71,13 @@
 | 封锁/放行终端 | Client Association Control Request；`CmMultiAPAddBsFilter` 等 | 有 | [代码] |
 | 踢终端 | `CmMultiApSetStaDisassociate` | 经 BTM/断开 | [名称] |
 | 信道扫描、CAC、VBSS、无线电命令 | `CmMultiAPChannelScan`、`CmMultiAPSendCAC`、VBSS 系列、`VendorRadioCommand` | **无** | [代码]（仅 SR 侧） |
-| 终端/邻居/未关联终端/Beacon 指标测量 | 各 Query CMDU | 有 | [代码]；AP 指标查询 **[真机]** 周期性有应答 |
+| 终端/邻居/未关联终端/Beacon 指标测量 | 各 Query CMDU | 有 | [代码]；AP 指标查询 **[原厂路由器]** 周期性有应答 |
 | 高层数据透传 | Ctrl/Agent Higher Layer Data | 有 | [代码] |
 
 ## E. 查询（只读）
 
 AP 能力、信道偏好、客户端能力、AP 指标、关联终端链路指标、拓扑、链路指标、设备信息/清单：Z506 都有接收代码。
-**[真机]** 拓扑、链路指标、AP 指标有应答；AP 能力、信道偏好、客户端能力查询在入网初期被子路由丢弃（它还不认识控制器），
+**[原厂路由器]** 拓扑、链路指标、AP 指标有应答；AP 能力、信道偏好、客户端能力查询在入网初期被子路由丢弃（它还不认识控制器），
 之后控制器不再重发。
 
 ## F. 控制器本机的管理面（CM 接口 → 数据库 → 事件）
@@ -98,27 +100,30 @@ AP 能力、信道偏好、客户端能力、AP 指标、关联终端链路指�
 | 维护 | `CmMultiAPWlanRenew(Notify)`、`CmMapRestartWithDBReset`、`CmMultiApTopoDelOfflineDev` | 通道 A、重启 |
 | WLAN 级（libcmapi） | `CmWLANSetDualBandSync(Only)`、`CmWLANSetBandSteer`、`CmWLANSetMlo(En)`、`CmSetRoaming` | 本机 WLAN 配置（子路由 Web 上那些开关） |
 
-## G. 对本项目的含义：Z506 上控制器真正能管的
+## G. Z506 上控制器真正能管的
 
-| 能管 | 说明 | 本项目 |
-|---|---|---|
-| 主 SSID、密码、开关；多 BSS（访客等）的名称、密码、开关 | M2 | 已实现，**[真机]** |
-| 每无线电的 BeaconInterval（20 到 1000 ms） | vendor FreqBand | 已实现（`radioN.beacon_interval`），可热更新，**[真机]** |
-| MaxHop | vendor FreqBand | 固定下发 2（与子路由原值一致），无配置项 |
-| 控制器的 `CurHop` | Higher Layer Response 的厂商 TLV（子类型 `0x43`） | 启动时写 2；**[真机]** 子路由读到 2（原先 -2，见 FINDINGS 第 7 节） |
-| 自组网 V2（控制器自己的 `P1905ComCfg.Enable`） | 本机准入检查，不下发 | `mesh.v2=0\|1`，**默认 0**；**[真机]** 两种取值都正常；改动 = 重启守护进程（子节点掉出拓扑 8 到 58 秒再入网）；`PolicyConfigReq` 的 `60[2]` 首字节跟着变（`0101`/`0001`），子节点没采用 |
-| 控制器自己的角色（主路由 / 自适应） | `MultiAPCfg.Mode`/`SetRoleEnable`，不下发 | `mesh.role=master\|auto`：auto 热更新 = 守护进程重启两次；**[真机]**；Slave 侧不支持 |
-| 子路由的角色（自适应→Slave） | 子路由自己的选举，控制器只需响应 | **[真机]** 选举能被接受；触发由子路由 `cspd` 负责（FINDINGS 第 3 节） |
-| Fragment 门限 | **没有任何下发通道** | — |
-| 每 BSS 的 ACL 策略（0 关闭、1 拦截、2 仅放行）与名单 | vendor SSID/ACL | 已实现（`acl.N.mac/name/radio/bss`、`radioN.acl_policy`），**[真机]** 表与驱动读回、一加被踢并拒绝重连；`allow` 与 5G 读回未验证 |
-| 终端上报阈值（Metric Reporting Policy） | `0x8003` | 已按子路由原值 -110，**[真机]** 读回 |
-| 引导策略（Steering Policy） | `0x8003` | 未提供配置项 |
-| 信道、发射功率 | `0x8006` | 已实现（`radioN.channel`、`tx_power`），**[真机]** 两频段验证并还原 |
-| 引导/封锁/踢终端 | `0x8014` 等 | 未提供 |
-| 重启子节点、指示灯开关 | 隧道 VendorSpecific（内层 TLV `0x20`/`0x21`） | 已实现（服务节点动作、rpcd、LuCI 按钮），**[真机]** |
-| 访客限时、Wi-Fi 定时关闭 | 控制器本机定时改槽位开关 + Renew | 已实现（`access_minutes`、`timer.*`），**[真机]** 访客范围；`scope=all` 仅实验室 |
-| Wi-Fi 5 兼容（`ForceWiFi5`） | 槽位应答 `0x46` | 已实现（`force_wifi5`），线上值正确；Z506 不认 |
-| 访客限速 | **没有下发通道**（子节点本机功能） | — |
+**这些项在本项目里做到哪一步、上机验证到什么程度，见 [FEATURE_STATUS](FEATURE_STATUS.md) 的 A 节（子节点侧见 B 节）**；
+下面只保留"控制器有没有下发通道、走哪条通道"这一层。
+
+| 能管 | 说明 |
+|---|---|
+| 主 SSID、密码、开关；多 BSS（访客等）的名称、密码、开关 | M2 |
+| 每无线电的 BeaconInterval（20 到 1000 ms） | vendor FreqBand，可热更新 |
+| MaxHop | vendor FreqBand |
+| 控制器的 `CurHop` | Higher Layer Response 的厂商 TLV（子类型 `0x43`） |
+| 自组网 V2（控制器自己的 `P1905ComCfg.Enable`） | 本机准入检查，不下发 |
+| 控制器自己的角色（主路由 / 自适应） | `MultiAPCfg.Mode`、`SetRoleEnable`，不下发；Slave 侧不支持 |
+| 子路由的角色（自适应→Slave） | 子路由自己的选举，控制器只需响应；触发由子路由 `cspd` 负责（[FINDINGS](FINDINGS.md) 第 3 节） |
+| Fragment 门限 | **没有任何下发通道** |
+| 每 BSS 的 ACL 策略（0 关闭、1 拦截、2 仅放行）与名单 | vendor SSID/ACL |
+| 终端上报阈值（Metric Reporting Policy） | `0x8003` |
+| 引导策略（Steering Policy） | `0x8003` |
+| 信道、发射功率 | `0x8006` |
+| 引导/封锁/踢终端 | `0x8014` 等 |
+| 重启子节点、指示灯开关 | 隧道 VendorSpecific（内层 TLV `0x20`/`0x21`） |
+| 访客限时、Wi-Fi 定时关闭 | 控制器本机定时改序号开关 + Renew |
+| Wi-Fi 5 兼容（`ForceWiFi5`） | 序号应答 `0x46` |
+| 访客限速 | **没有下发通道**（子节点本机功能） |
 
 **Z506 管不了的**（固件没有对应代码，不是我们没做）：漫游阈值（vendor 策略 TLV）、802.11r/BTM 踢人、VLAN 与流量分离、
 STA 绑定、信道扫描/CAC、VBSS、MLO，以及**带宽**。要用这些得换较新固件的子路由。
@@ -130,13 +135,17 @@ STA 绑定、信道扫描/CAC、VBSS、MLO，以及**带宽**。要用这些得�
 | 字段 | 作用 | Z506 | SR | 本项目 |
 |---|---|---|---|---|
 | `P1905ComCfg.Enable`（界面"自组网 V2"） | 接收方向的准入检查：关 = 谁都接受；开 = 对端必须带 ZTE 厂商 TLV、厂商一致、市场码一致 | 有 | 有 | `mesh.v2`，默认 0 |
-| `MarketConfEn`/`MarketSign` | 市场码检查与市场码 | 有 | 有 | 真机路径设 1 / `8000`（`ZTE_MESH_REAL_MARKET_SIGN`） |
+| `MarketConfEn`/`MarketSign` | 市场码检查与市场码 | 有 | 有 | 中兴原厂路由器路径设 1 / `8000`（`ZTE_MESH_REAL_MARKET_SIGN`） |
 | `EnableIsSync` | 主路由把 `Enable`、`MarketConfEn` 同步给子节点 | 无解析代码 | 有 | 不启用（0） |
 | `Policy`/`DropNum`/`DropRoam` | 对未通过对端：0 只记录、1 拒绝、2 限制（通知无线管理并随机丢 Client Steering Request） | 无 | 有 | 全 0 |
 | `A1Enable` | WPS M1 型号名带 "A1" 的产品线门槛 | 无 | 有 | 0 |
 | `MultiAPCfg.VersionMode` | 功能位掩码：bit1 = 标准行为/不发私有厂商 TLV，bit3 = Profile-2，bit7 = Wi-Fi 7 MLD，bit0 = 插件 BSS/转发；子节点跟随控制器 | 默认 0 | 产品相关 | `version_mode=128`（bit1 清零 = 仍发私有 TLV，bit7 顺带开 Wi-Fi 7 TLV） |
 | `CurHop` / `MaxHop` | 控制器告诉子节点的跳数预算 | 解析并采用 | 有 | `CurHop=2`、`MaxHop=2` |
 | `Mode`/`SetRoleEnable` | 角色（自适应/Slave/Master）与自适应开关 | 有 | 有 | 控制器固定 `Mode=2`、`SetRoleEnable=1`、`EnMasterOnly=1` |
+
+> **2026-11-06 更正**：最后一行写的是不写角色键时库里保持的那组固定值。现在主控显式写
+> `Mode=2`、`SetRoleEnable=0`、`EnMasterOnly=1`（[FEATURE_STATUS](FEATURE_STATUS.md) A13），子节点那侧读到
+> `Mode=1`、`SetRoleEnable=0`、`EnMasterOnly=0`（同表 B1）。
 
 ## 方法与局限
 
