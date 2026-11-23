@@ -1,10 +1,12 @@
 name: Build APK
 
-# Builds the four zte-mesh packages (zte-mesh, zte-mesh-launcher, luci-app-zte-mesh,
-# and the auto-generated luci-i18n-zte-mesh-zh-cn) as OpenWrt .apk files inside a
+# Builds the three zte-mesh packages (zte-mesh, luci-app-zte-mesh and the
+# auto-generated luci-i18n-zte-mesh-zh-cn) as OpenWrt .apk files inside a
 # GitHub runner. The packages are compiled against the `zte/zx279133` target
 # from the cnjn/immortalwrt fork (branch `sr1010-zx279133`), which is the only
-# tree that carries that target.
+# tree that carries that target. zte-mesh carries the compiled launcher too:
+# the launcher used to be a package of its own and stopped being one when it
+# became architecture-independent (see the arch loop below).
 #
 # Two properties of that target drive the layout below:
 #
@@ -20,9 +22,11 @@ name: Build APK
 #    <dir>/immortalwrt + <dir>/linux-mainline-zte-zxslc-sr1010/linux-6.18.38.
 #
 # `make package/<pkg>/compile` walks the dependency graph in tmp/.packagedeps,
-# so every declared runtime dep of zte-mesh gets built first. Two of them are
-# pointless (or actively harmful) to build here, and a CI-only sed trims them
-# from DEPENDS before defconfig:
+# so every dep in DEPENDS gets built first. Three of zte-mesh's runtime deps are
+# pointless (or actively harmful) to build here, so a CI-only sed moves them out
+# of DEPENDS and into EXTRA_DEPENDS before defconfig. EXTRA_DEPENDS reaches the
+# apk's depends list (package-pack.mk) but never the build graph, so the board
+# still installs them while this workflow never builds them:
 #
 #  * +kmod-veth +kmod-sched-core - config-6.18 has neither CONFIG_VETH nor
 #    CONFIG_NET_SCH_INGRESS/CONFIG_NET_CLS_ACT, so on this target they can only
@@ -30,30 +34,57 @@ name: Build APK
 #    a kernel build) into the graph.
 #  * +ip-full - iproute2 comes from kernel.org and pulls iptables
 #    (PKG_BUILD_DEPENDS) from netfilter.org; both answer 403 to automated
-#    fetches often enough to waste whole runs, and neither is needed to package
-#    a script-only feed.
+#    fetches often enough to waste whole runs, and neither has to be built to
+#    produce these apks (the launcher is -static, so it links no target libc).
 #
-# The .apk therefore declares @TARGET_zte alone. The kernel package is
-# additionally neutralised rather than avoided: package/kernel/linux has an
-# EMPTY Build/Compile and its install step only copies $(LINUX_DIR)/modules.builtin
-# and strings modules.builtin.modinfo, so two empty placeholder files in the
-# kernel tree make it a zero-second no-op if it enters the graph anyway
-# (package/Makefile hardcodes `package-y += kernel/linux`).
+# The zte-mesh apk still declares all three runtime deps on this target (via
+# EXTRA_DEPENDS); it names no target either: it is PKGARCH:=all and carries one
+# static launcher build per CPU, so the same bytes install on a board this
+# workflow never built for. The kernel package is additionally neutralised
+# rather than avoided:
+# package/kernel/linux has an EMPTY Build/Compile and its install step only copies
+# $(LINUX_DIR)/modules.builtin and strings modules.builtin.modinfo, so two empty
+# placeholder files in the kernel tree make it a zero-second no-op if it enters
+# the graph anyway (package/Makefile hardcodes `package-y += kernel/linux`).
 #
-# SPEED: the cross toolchain (binutils -> gcc/initial -> musl -> gcc/final) is
-# by far the most expensive part (~30-45 min) and always produces the same
-# bytes for a given upstream commit. staging_dir + the host/toolchain build
-# trees are therefore cached, keyed on the upstream revisions only, so editing
-# our own packages never invalidates it. First run after a key change is slow;
-# later runs reach the package build in a couple of minutes.
+# SPEED: three separate costs, three separate answers.
+#   * The cross toolchain (binutils -> gcc/initial -> musl -> gcc/final) is the expensive one
+#     (~30-45 min cold) and always produces the same bytes for a given upstream commit, so
+#     staging_dir + the host/toolchain build trees are cached, keyed on the upstream revisions
+#     only -- editing our own packages never invalidates it.
+#   * Host packages come from apt, ~92 MB. That download is the runner's mirror, not ours: the
+#     identical list took 57 s at 1628 kB/s on 2026-11-05 and 37min 28s at 41.4 kB/s on
+#     2026-11-06, and that one difference is the gap between a 25-minute and a 58-minute batch.
+#     The archives are therefore cached under their own key (package list + image version), and
+#     the aarch64 host cross compiler left the list entirely -- the target toolchain builds that
+#     architecture, so those 45.1 MB were never read (see "Resolve the apt package list").
+#   * What is left is `tools/install`, which on r23 still cost 14m5s of real time with the cache
+#     restored. The step that runs it now reports its own seconds and its directory visits, so
+#     the next round can tell a stamp-driven no-op from a rebuild instead of trusting this
+#     comment. "later runs reach the package build in a couple of minutes" was not true.
 #
-# Trigger: manual only (workflow_dispatch). Pushes and pull requests used to
-# build as well, but a documentation or memory commit then cost a full 20-30
-# minute toolchain run and produced the same packages as the previous one.
-# Start it explicitly when a change to the packages is worth verifying.
+# Trigger: manual only (workflow_dispatch), and it builds only. Pushes and pull
+# requests used to build as well, but a documentation or memory commit then cost
+# a full 20-30 minute toolchain run and produced the same packages as the
+# previous one.
+#
+# This workflow does NOT publish releases any more. It used to take a
+# `release_tag` input and run `gh release create`, which made "start a build" and
+# "promise these bytes to the outside world" the same button. Development now
+# runs in batches: a batch ends with one build, the packages are installed and
+# checked on the two lab machines, and only a batch that survives that becomes a
+# release. Publishing is therefore a separate, deliberate act:
+#
+#   gh release create v0.1.0 dist/*.apk dist/SHA256SUMS.txt
+#
+# The artifact below is the per-batch output (four apks + SHA256SUMS.txt).
 
 on:
   workflow_dispatch:
+
+# Read-only on purpose: nothing here writes to the repository or to releases.
+permissions:
+  contents: read
 
 # A superseded run is worthless: cancel the old one instead of paying for two
 # full toolchain builds in parallel (and fighting over the same cache key).
@@ -62,11 +93,11 @@ concurrency:
   cancel-in-progress: true
 
 # Runtime dependencies are decided per target instead of by one blind sed: a
-# target that compiles its own kernel modules keeps +kmod-veth +kmod-sched-core,
-# so the packaged apk carries a real dependency and the board ends up with a
-# working veth pair; a target built against an external kernel tree that this
-# workflow never compiles cannot produce those kmods at all, and merely naming
-# them drags package/kernel/linux (and a kernel build) into the graph.
+# target that compiles its own kernel modules keeps +kmod-veth +kmod-sched-core
+# in DEPENDS; a target built against an external kernel tree that this workflow
+# never compiles cannot produce those kmods at all, and merely naming them in
+# DEPENDS drags package/kernel/linux (and a kernel build) into the graph. Either
+# way the apk keeps the runtime deps: trimmed ones move to EXTRA_DEPENDS.
 env:
   # zte/zx279133 points at an external kernel tree (see the header), which this
   # workflow never compiles -> kmod-* deps could only ever be empty stubs.
@@ -77,10 +108,19 @@ env:
   # (netfilter.org); both answer 403 to automated fetches often enough to waste
   # whole runs. It is a runtime-only dep, so it stays out of the build graph.
   TRIM_IP_FULL: 'true'
+  # The promise of the architecture-independent launcher is that one apk fits every
+  # machine this package claims. tools/build/launcher-arches.sh reports a missing
+  # architecture and carries on; this is what turns "armv7 was not built" from a
+  # line in a green log into a red run. It reaches the script through the make
+  # environment, which zte-mesh's Build/Compile inherits.
+  ZTE_MESH_REQUIRE_ARCHES: 'aarch64 armv7 x86_64'
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: the image moves under that alias and this job's two cache
+    # keys (the apt list below, the toolchain tree further down) both depend on what
+    # is preinstalled in it. Two recent runs were 20261025.353.1 and 20261101.360.1.
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
 
     steps:
@@ -88,6 +128,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: zte-mesh
+          # Full history: the build summary names the commits this run covers,
+          # which is how a batch is identified after the fact.
+          fetch-depth: 0
 
       - name: Lint the LuCI view
         run: |
@@ -107,14 +150,84 @@ jobs:
             echo "the role lookup no longer reads through uci.get()" >&2; exit 1; }
           echo "view ok: $(wc -c < "$JS") bytes"
 
+      - name: Resolve the apt package list and cache key
+        id: aptlist
+        run: |
+          set -eu -o pipefail
+          # One file holds the list, so the cache key and the install read the same bytes:
+          # adding a package changes the key and costs exactly one cold run.
+          #
+          # gcc-aarch64-linux-gnu and libc6-dev-arm64-cross are gone from this list (45.1 MB
+          # of the 93.2 MB it used to fetch, 14 lib*-arm64-cross plus gcc/cpp/binutils-13).
+          # They were never called: the aarch64 launcher build comes from the target toolchain
+          # (zte-mesh's Build/Compile passes ZTE_MESH_TARGET_CC, an aarch64-openwrt-linux-musl-gcc
+          # for cortex-a53), and launcher-arches.sh only reaches for a host compiler when an
+          # architecture is NOT what $(TARGET_CC) emits. What stays is what actually runs:
+          # armv7 from the hard-float cross compiler, x86_64 from musl-gcc -- every one of these
+          # binaries carries its own libc and the glibc build is ~10x the musl one for the same
+          # code (r22: the x86_64 pair weighed 1 590 648 bytes built by the host gcc, 155 232
+          # built by musl-gcc -- the pair the owrt test machine, 15 MB free, installs for its own
+          # CPU). linux-libc-dev is here because musl-gcc compiles with -nostdinc and asks the
+          # host gcc where the kernel UAPI headers are; the host gcc needs that package itself to
+          # see <linux/if_link.h>.
+          #
+          # The cost of the removal is a future case: build this feed for a non-aarch64 target and
+          # arch/aarch64 is not in the apk. launcher-arches.sh then prints "no compiler for aarch64"
+          # and ZTE_MESH_REQUIRE_ARCHES turns that into a red run -- a missing build never ships as
+          # a silent gap.
+          cat > "$RUNNER_TEMP/apt-packages" <<'PKGS'
+          build-essential gawk unzip file wget python3
+          rsync subversion git zstd libncurses-dev
+          swig libssl-dev python3-dev lua5.1 liblua5.1-0-dev
+          meson ninja-build xz-utils
+          gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
+          linux-libc-dev musl-tools musl-dev
+          PKGS
+          { tr -s '[:space:]' '\n' < "$RUNNER_TEMP/apt-packages" | sed '/^$/d' | sort
+            echo "os=${ImageOS:-unknown}"
+            echo "image=$(cat /image_version 2>/dev/null || echo unknown)"
+          } > "$RUNNER_TEMP/apt-key"
+          echo "hash=$(sha256sum "$RUNNER_TEMP/apt-key" | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "apt cache key suffix: $(tr '\n' ' ' < "$RUNNER_TEMP/apt-key")"
+
+      - name: Restore the apt download cache
+        id: aptcache
+        uses: actions/cache/restore@v4
+        with:
+          # The mirror is the one part of this job that is not ours to control: the same ~92 MB
+          # list took 57 s at 1628 kB/s on 2026-11-05 and 37min 28s at 41.4 kB/s on 2026-11-06,
+          # and that difference alone is the gap between a 25-minute batch and a 58-minute one.
+          # Cached, a hit installs from local files and the batch-end budget stops depending on
+          # azure.archive.ubuntu.com's mood.
+          path: ${{ runner.temp }}/apt/archives
+          key: apt-${{ steps.aptlist.outputs.hash }}
+
       - name: Install host dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential gawk unzip file wget python3 \
-            rsync subversion git zstd libncurses-dev \
-            swig libssl-dev python3-dev lua5.1 liblua5.1-0-dev \
-            meson ninja-build xz-utils
+          set -eu -o pipefail
+          # archives/partial is where apt stages a download before renaming it; without it
+          # Dir::Cache::archives is rejected and every fetch goes to the default /var/cache.
+          sudo mkdir -p "$RUNNER_TEMP/apt/archives/partial"
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/apt"
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
+          tr -s '[:space:]' '\n' < "$RUNNER_TEMP/apt-packages" | sed '/^$/d' \
+            | xargs -r -x sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 \
+                 -o Dir::Cache::archives="$RUNNER_TEMP/apt/archives/" install -y --no-install-recommends
+          # apt re-owns `lock` and `partial` to the _apt user (mode 700) while it fetches, so the
+          # chown above does not survive the install: the save step then tries to read exactly
+          # those two paths and tar answers `Cannot open: Permission denied` -- measured on the
+          # ci/batch23 run, where the save failed and the key apt-f84f2aa7a576df42 therefore
+          # cannot hit next time either. Take the directory back once apt is done with it.
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/apt"
+          echo "cached debs: $(ls -1 "$RUNNER_TEMP/apt/archives"/*.deb 2>/dev/null | wc -l), $(du -sh "$RUNNER_TEMP/apt/archives" | cut -f1)"
+
+      - name: Save the apt download cache
+        if: steps.aptcache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/apt/archives
+          key: apt-${{ steps.aptlist.outputs.hash }}
 
       - name: Check out ImmortalWrt tree
         run: |
@@ -262,25 +375,26 @@ jobs:
           #    and the resulting apk carries them: without veth the launcher
           #    stops at "error=private-service-network errno=2".
           #
-          # Trimming happens in this build tree only; the source keeps the full
-          # DEPENDS so a packaged target still gets what it declares.
+          # A dep trimmed from DEPENDS is not dropped from the artifact: it moves
+          # to EXTRA_DEPENDS, which package-pack.mk merges into the apk's depends
+          # list but package-dumpinfo.mk / package-metadata.pl never read, so it
+          # stays out of the build graph. The board still gets iproute2 and the
+          # veth module at install time; this workflow just never builds them.
+          # EXTRA_DEPENDS items need a version constraint (package-pack.mk errors
+          # on an unversioned one), hence "(>=0)" - any version satisfies.
           #
-          # Must run before `make defconfig`: defconfig resolves the dependencies
-          # and would pin CONFIG_PACKAGE_kmod-veth=m, dragging the kernel package
-          # back in even though DEPENDS no longer mentions it.
-          # The runtime deps moved with the compiled binaries: zte-mesh itself is
-          # arch:all now (scripts and the runtime tarball), and everything that
-          # only a real board can satisfy -- iproute2, the veth module -- is
-          # declared by zte-mesh-launcher, which is arch-tagged. Trimming has to
-          # happen there or the apk would still drag a kernel build in.
-          MK=../../zte-mesh/openwrt/zte-mesh-launcher/Makefile
+          # Must run before `make defconfig`: defconfig resolves DEPENDS and would
+          # pin CONFIG_PACKAGE_kmod-veth=m, dragging the kernel package back in.
+          MK=../../zte-mesh/openwrt/zte-mesh/Makefile
           echo "target builds kernel modules: $TARGET_BUILDS_KERNEL_MODULES"
           echo "trim ip-full:                  $TRIM_IP_FULL"
           echo "before: $(grep -n 'DEPENDS' "$MK")"
 
+          EXTRA_DEPS=""
           if [ "$TRIM_IP_FULL" = 'true' ]; then
             sed -i -E 's/[[:space:]]*\+ip-full//g' "$MK"
-            echo "trimmed +ip-full (download-only dep, 403-prone)"
+            EXTRA_DEPS="ip-full (>=0)"
+            echo "trimmed +ip-full from the build graph; kept as a runtime dep via EXTRA_DEPENDS"
           else
             echo "kept +ip-full"
           fi
@@ -291,12 +405,17 @@ jobs:
             echo "kept +kmod-veth +kmod-sched-core: this target can build them"
           else
             sed -i -E 's/[[:space:]]*\+(kmod-veth|kmod-sched-core)//g' "$MK"
-            echo "trimmed +kmod-veth +kmod-sched-core: no in-tree kernel here"
+            EXTRA_DEPS="${EXTRA_DEPS:+$EXTRA_DEPS, }kmod-veth (>=0), kmod-sched-core (>=0)"
+            echo "trimmed +kmod-veth +kmod-sched-core from the build graph; kept as runtime deps via EXTRA_DEPENDS"
+          fi
+
+          if [ -n "$EXTRA_DEPS" ]; then
+            sed -i -E "s|^([[:space:]]*DEPENDS:=.*)$|\1\n  EXTRA_DEPENDS:=$EXTRA_DEPS|" "$MK"
           fi
           echo "after:  $(grep -n 'DEPENDS' "$MK")"
 
           if [ "$TRIM_IP_FULL" = 'true' ] && [ "$TARGET_BUILDS_KERNEL_MODULES" = 'false' ] &&
-             grep -qE '\+(kmod-veth|kmod-sched-core|ip-full)' "$MK"; then
+             grep -E '^[[:space:]]*DEPENDS:=' "$MK" | grep -qE '\+(kmod-veth|kmod-sched-core|ip-full)'; then
             echo "runtime deps were not trimmed properly in $MK" >&2
             exit 1
           fi
@@ -305,15 +424,40 @@ jobs:
       - name: Configure target
         working-directory: sr1010/immortalwrt
         run: |
+          # The feed was scanned in "Link the package feed" before .config named a
+          # target, and a target-gated package is dropped from the index there: the
+          # launcher used to declare @(TARGET_zte||TARGET_qualcommax), so the scan
+          # saw it as unavailable, never linked it, and the build died on
+          # "No rule to make target package/feeds/zte_mesh/zte-mesh-launcher/compile"
+          # after the whole toolchain had been built. defconfig then dropped
+          # CONFIG_PACKAGE_zte-mesh-launcher without saying so, because a symbol
+          # that never reached Config.in cannot be selected.
+          # The gate is gone -- that package is gone too, merged into zte-mesh, which
+          # is arch:all and installs on any machine -- but the re-scan stays: the index
+          # is still built before the target is known, and a symbol that never reaches
+          # Config.in is still silently unselectable. Re-scan now that the target is
+          # known; the metadata is cheap, the toolchain is not.
           cat >> .config <<EOF
           CONFIG_TARGET_zte=y
           CONFIG_TARGET_zte_zx279133=y
           CONFIG_PACKAGE_zte-mesh=m
-          CONFIG_PACKAGE_zte-mesh-launcher=m
           CONFIG_PACKAGE_luci-app-zte-mesh=m
           CONFIG_PACKAGE_luci-i18n-zte-mesh-zh-cn=m
           EOF
+          rm -f tmp/.packageinfo tmp/.config-package.in feeds/zte_mesh.index
+          ./scripts/feeds update zte_mesh >/dev/null
+          ./scripts/feeds install -a -p zte_mesh
           make defconfig
+
+          # Say it here rather than 20 minutes later with three words of make
+          # output: a package that is missing from the index has no make rule
+          # at all. This guard matters more now that one package carries the
+          # compiled launcher -- its DEPENDS (+ip-full, the two kmods) is what can
+          # make a symbol unselectable, and defconfig drops it without a word.
+          grep -q '^CONFIG_PACKAGE_zte-mesh=m' .config || {
+            echo "zte-mesh fell out of the package index (its DEPENDS or Makefile changed?)" >&2
+            ls package/feeds/zte_mesh/ >&2
+            exit 1; }
 
           # The translations are a *virtual* package: luci.mk turns po/zh_Hans/
           # into luci-i18n-zte-mesh-zh-cn, which owns no directory, so it can
@@ -375,10 +519,32 @@ jobs:
           # kernel-headers is part of that chain and now links the external
           # kernel tree instead of downloading a tarball kernel.org never had.
           #
-          # On a cache hit both are stamp-driven no-ops; they are still invoked
-          # so a partially restored cache is repaired rather than silently used.
-          time make -j"$(nproc)" V=s tools/install
-          time make -j"$(nproc)" V=s toolchain/install
+          # On a cache hit both are meant to be stamp-driven no-ops, and they are still invoked so
+          # a partially restored cache is repaired rather than silently used. r23's run says the
+          # first half of that sentence is not true: the step reported cache hit true and still
+          # spent 14m5s (real) of its 15.1 minutes in tools/install, over 71 000 log lines. So this
+          # step now measures itself. "Entering directory" is the proxy -- make prints it every time
+          # it walks into a package directory, so a no-op is a short list and a rebuild names the
+          # tools it redid. Both numbers go to the log AND the step summary, because the summary is
+          # not readable through the REST API and a reading nobody can fetch is not a reading.
+          run_stage() {
+            local name=$1 target=$2 log="$RUNNER_TEMP/$1.log" start rc elapsed dirs
+            start=$(date +%s)
+            set +e
+            time make -j"$(nproc)" V=s "$target" 2>&1 | tee "$log"
+            rc=${PIPESTATUS[0]}
+            set -e
+            elapsed=$(( $(date +%s) - start ))
+            dirs=$(grep -c 'Entering directory' "$log" || true)
+            {
+              echo "== $target: ${elapsed}s, exit $rc, $(wc -l < "$log") log lines, ${dirs} directory visits"
+              grep 'Entering directory' "$log" | awk -F"'" '{print $2}' | sed 's#.*/##' |
+                sort | uniq -c | sort -rn | head -8 | sed 's/^/    /'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            [ "$rc" = 0 ] || exit "$rc"
+          }
+          run_stage tools-install tools/install
+          run_stage toolchain-install toolchain/install
 
       - name: Save build cache
         # actions/cache's own save step runs as a post step guarded by
@@ -443,7 +609,7 @@ jobs:
           # intermittently answer 403 to automated fetches, and one unlucky
           # mirror sweep would otherwise abort the build long after the
           # toolchain work. iproute2 is deliberately NOT built (see the
-          # "Trim runtime deps" step), so luci-base is the only download left.
+          # "Decide runtime deps for this target" step), so luci-base is the only download left.
           prefetch() {
             for i in 1 2 3; do
               make -j"$(nproc)" "$1" >>"$LOG" 2>&1 && return 0
@@ -457,12 +623,10 @@ jobs:
           # luci-base first: luci.mk needs the host po2lmo (and the luci libs)
           # before it can build luci-app-zte-mesh and its zh-cn translations.
           build package/feeds/luci/luci-base/compile
+          # One package, both halves: the compile step unpacks the runtime tarball once and builds the
+          # launcher out of the sources that came with it, so there is no second feed directory to name
+          # here and no moment where the two halves are different versions of each other.
           build package/feeds/zte_mesh/zte-mesh/compile
-
-          # The launcher unpacks ns-run.c / controller-net.c / enroller.c out of
-          # the runtime tarball in the sibling directory, so it has to be built
-          # from the same feed checkout; there is no second copy of the sources.
-          build package/feeds/zte_mesh/zte-mesh-launcher/compile
 
           # luci-i18n-zte-mesh-zh-cn has no directory of its own to name here
           # (luci.mk derives it from po/zh_Hans/), so asking for it as a path
@@ -480,25 +644,36 @@ jobs:
           }
 
           # A green build with no artifact is the worst outcome: assert the
-          # packages are really there instead of trusting exit codes.
-          for stem in zte-mesh zte-mesh-launcher luci-app-zte-mesh luci-i18n-zte-mesh-zh-cn; do
-            test -n "$(find bin -name "$stem-*.apk" -print -quit)" || {
+          # packages are really there instead of trusting exit codes. [0-9] after the stem because a
+          # zte-mesh-launcher-*.apk from the batch before the merge would otherwise count as this
+          # batch's zte-mesh (the same trap docs/INSTALL.md §2 warns about on the router).
+          for stem in zte-mesh luci-app-zte-mesh luci-i18n-zte-mesh-zh-cn; do
+            test -n "$(find bin -name "$stem-[0-9]*.apk" -print -quit)" || {
               echo "build reported success but produced no $stem apk" >&2; exit 1; }
           done
+
           find bin -name '*.apk' | grep -E 'zte-mesh' || true
 
       - name: Locate artifacts
         id: collect
         run: |
-          # zte-mesh is PKG_FLAGS:=nonshared but PKGARCH:=all (scripts plus the
-          # runtime tarball are data), so it lands under the feed packages dir with
-          # the LuCI packages. zte-mesh-launcher carries the compiled ns-run and
-          # mesh-search and is aarch64_cortex-a53, so it lands under the target
-          # packages dir. `zte-mesh*.apk` matches both.
+          # One apk names this project's own runtime and launcher: zte-mesh is PKGARCH:=all and carries the
+          # scripts, the data tarball and the compiled ns-run / mesh-search under arch/<cpu>/ beside a shell
+          # entry script that picks one for the CPU it is standing on. It names no target, so which directory
+          # the SDK files it under is not something this step has to know -- `zte-mesh-[0-9]*.apk` under bin/
+          # finds it wherever it went, and the [0-9] keeps an older batch's launcher apk out of dist/. What the
+          # apk holds is checked after this, once the files are already uploaded.
           mkdir -p dist
-          find sr1010/immortalwrt/bin -name 'zte-mesh*.apk' -exec cp -v {} dist/ \;
+          find sr1010/immortalwrt/bin -name 'zte-mesh-[0-9]*.apk' -exec cp -v {} dist/ \;
           find sr1010/immortalwrt/bin -name 'luci-*zte-mesh*.apk' -exec cp -v {} dist/ \;
           ls -la dist
+
+      # Checksums travel with the artifact: whoever installs a batch on the lab
+      # machines can prove the apk they flashed is the one this run produced,
+      # and a release made later from these files carries the same list.
+      - name: Write checksums
+        working-directory: dist
+        run: sha256sum *.apk | tee SHA256SUMS.txt
 
       - name: Upload packages
         uses: actions/upload-artifact@v4
@@ -507,6 +682,156 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+      # This used to be the tail of "Build packages", and run 41968055835 showed
+      # why that is the wrong place: the apks built fine, the reader was
+      # wrong, and the red step came before the upload -- so a batch with good
+      # artifacts produced no artifact to install. Reading the package is its own
+      # step now and sits after the upload: a broken judgement costs a red run,
+      # not a lost batch.
+      - name: Assert the zte-mesh apk carries the launcher for three architectures
+        run: |
+          # Reading the members, not the exit code: the launcher is architecture-
+          # independent and lives inside the runtime package now, so that one apk has
+          # to carry one build per CPU *and* the vendor runtime it runs.
+          # ZTE_MESH_REQUIRE_ARCHES already fails the build if a compiler did not
+          # produce one; this fails it if the install rule does not ship what was
+          # built -- a Makefile that lost the copy would green-light an apk whose
+          # entry script answers "no build for this machine" on every CPU, including
+          # the one it was compiled on. Merging two packages into one has the mirror
+          # risk: an install rule that keeps arch/ and drops the rootfs, or the other
+          # way round, still builds and still uploads, so both halves are asked for
+          # here.
+          #
+          # The reader is the apk-tools the SDK just built for itself, not tar: a
+          # .apk is an ADBD/libadb container, so `tar -t` with every compression
+          # flag returns 2 on it -- and under `bash -e` an assignment like
+          # `members=$(tar -t ...)` aborts the whole step on the first probe,
+          # silently if stderr went to /dev/null.
+          has_member() {
+            printf '%s\n' "$members" | grep -qxF "$1"
+          }
+          MESH_APK=$(find dist -name 'zte-mesh-[0-9]*.apk' | head -1)
+          test -n "$MESH_APK" || { echo "no zte-mesh apk to read" >&2; exit 1; }
+          MESH_APK=$PWD/$MESH_APK
+          APK_TOOL=$PWD/sr1010/immortalwrt/staging_dir/host/bin/apk
+          test -x "$APK_TOOL" || { echo "$APK_TOOL is not the host apk that packaged this" >&2; exit 1; }
+          # The trimmed runtime deps must survive into the artifact's depends list: EXTRA_DEPENDS is what
+          # carries them past the build-graph trim, and a Makefile/pack regression that drops them would
+          # otherwise ship an apk that installs on a fresh board with no iproute2 and no veth module.
+          # adbdump carries them in info.depends as plain strings ("ip-full>=0", "libc"), not as objects
+          # with a name key. Run 42343102511 went red on a correct apk because the reader walked every
+          # "name" in the document and so collected the paths/files entries instead of the dependencies.
+          # Read the one field that holds them and strip the version constraint. tests/test_build_deps.sh
+          # runs this extracted reader against fixtures, including one where the three names appear only
+          # as file names -- that is the shape the broken reader accepted.
+          DEPS_JSON=$("$APK_TOOL" adbdump --format json "$MESH_APK") || {
+            echo "cannot read metadata of $MESH_APK" >&2; exit 1; }
+          printf '%s\n' "$DEPS_JSON" | python3 -c '
+          import json, re, sys
+          info = json.load(sys.stdin).get("info", {})
+          if info.get("name") != "zte-mesh":
+              sys.exit("adbdump did not describe zte-mesh: " + repr(info.get("name")))
+          deps = info.get("depends", [])
+          have = {re.split(r"[<>=!~]", d, maxsplit=1)[0] for d in deps}
+          print("apk depends: " + ", ".join(deps))
+          need = {"ip-full", "kmod-veth", "kmod-sched-core"}
+          missing = need - have
+          if missing:
+              sys.exit("apk lost runtime deps (EXTRA_DEPENDS did not reach it): " + ", ".join(sorted(missing)))
+          print("runtime deps present: " + ", ".join(sorted(need)))
+          ' || exit 1
+          MEMBERS_DIR=$(mktemp -d)
+          if ! ( cd "$MEMBERS_DIR" && "$APK_TOOL" --allow-untrusted extract "$MESH_APK" >/dev/null 2>&1 ); then
+            echo "cannot extract $MESH_APK: $(file -b "$MESH_APK")" >&2
+            rm -rf "$MEMBERS_DIR"
+            exit 1
+          fi
+          members=$(cd "$MEMBERS_DIR" && find . -type f -printf '%P\n' | sort)
+          for name in ns-run mesh-search; do
+            has_member "usr/libexec/zte-mesh/$name" || {
+              echo "$MESH_APK has no $name entry script. Its members are:" >&2
+              printf '%s\n' "$members" >&2
+              rm -rf "$MEMBERS_DIR"
+              exit 1
+            }
+          done
+          for arch in aarch64 armv7 x86_64; do
+            for name in ns-run mesh-search; do
+              has_member "usr/libexec/zte-mesh/arch/$arch/$name" || {
+                echo "$MESH_APK carries no build for $arch ($name). Its members are:" >&2
+                printf '%s\n' "$members" >&2
+                rm -rf "$MEMBERS_DIR"
+                exit 1
+              }
+            done
+          done
+          # The other half of the merge: the runtime the entry script hands over to.
+          for member in usr/lib/zte-mesh/root/bin/db-engine-probe \
+            usr/lib/zte-mesh/root/lib/libzte_controller_trace.so \
+            etc/init.d/zte-mesh usr/libexec/zte-mesh/sta-collect; do
+            has_member "$member" || {
+              echo "$MESH_APK does not carry the runtime member $member. Its members are:" >&2
+              printf '%s\n' "$members" >&2
+              rm -rf "$MEMBERS_DIR"
+              exit 1
+            }
+          done
+          # The paths alone would also be there if the install rule had copied one
+          # build three times under different names -- which is exactly what the
+          # entry script cannot see: it execs whatever is standing at the path for
+          # its own CPU. So ask the binary what it is.
+          expect_elf() {
+            if ! file -b "$MEMBERS_DIR/usr/libexec/zte-mesh/arch/$1/$2" | grep -q "$3"; then
+              echo "$MESH_APK: arch/$1/$2 is not $1 code: $(file -b "$MEMBERS_DIR/usr/libexec/zte-mesh/arch/$1/$2")" >&2
+              rm -rf "$MEMBERS_DIR"
+              exit 1
+            fi
+          }
+          expect_elf aarch64 ns-run 'ELF 64-bit.*aarch64'
+          expect_elf aarch64 mesh-search 'ELF 64-bit.*aarch64'
+          expect_elf armv7 ns-run 'ELF 32-bit.*ARM'
+          expect_elf armv7 mesh-search 'ELF 32-bit.*ARM'
+          expect_elf x86_64 ns-run 'ELF 64-bit.*x86-64'
+          expect_elf x86_64 mesh-search 'ELF 64-bit.*x86-64'
+          # Weight is the one thing the path and `file` cannot see: a build made by the host gcc
+          # instead of musl-gcc stands at the same path, is the same CPU and prints the same ELF line --
+          # it just carries glibc statically, an order of magnitude more bytes for the same code. Measured
+          # on these sources: the x86_64 pair is 79 600 + 75 632 built by musl-gcc against 735 932 + 854 716
+          # built by the host gcc (what r22 installed, 1 553 KiB on the owrt test machine), and a glibc
+          # aarch64 pair on the same machine weighs 1 408 328 against the 128 KiB the SDK's own musl
+          # toolchain ships. So the two architectures that are asked for musl get a ceiling a glibc
+          # build cannot pass, and every reading goes to the run summary. armv7 gets no ceiling: it is
+          # still the hard-float glibc cross compiler (~372 KiB a file in r22), and a number invented for
+          # it would turn a libc question into a red run for the wrong reason.
+          WEIGHTS=launcher-weights.txt
+          : > "$WEIGHTS"
+          expect_weight() { # ARCH NAME CEILING_BYTES, or "-" for none
+            bin=$MEMBERS_DIR/usr/libexec/zte-mesh/arch/$1/$2
+            bytes=$(wc -c < "$bin")
+            if [ "$3" != "-" ] && [ "$bytes" -gt "$3" ]; then
+              echo "$MESH_APK: arch/$1/$2 weighs $bytes bytes, over the $3-byte ceiling for $1." >&2
+              echo "If $1 is no longer built by musl-gcc, launcher-arches.sh said so in the build log;" >&2
+              echo "if it is, this ceiling is the promise that it still is -- move it on purpose." >&2
+              rm -rf "$MEMBERS_DIR"
+              exit 1
+            fi
+            printf '%-8s %-12s %9s bytes  ceiling %s\n' "$1" "$2" "$bytes" "$3" >> "$WEIGHTS"
+          }
+          for name in ns-run mesh-search; do
+            expect_weight aarch64 "$name" 204800
+            expect_weight x86_64 "$name" 204800
+            expect_weight armv7 "$name" -
+          done
+          # These six lines are the only reading that separates a musl build from a glibc one at the
+          # same path, so they go to stdout as well as the run summary: the summary is not readable
+          # through the REST API (…/checks/<run>/summary answers 404) and job logs only carry what the
+          # script echoes. r23's numbers came back from the installed arch/ trees instead, one build
+          # and two machine round-trips later.
+          echo "launcher build weights:"
+          cat "$WEIGHTS"
+          rm -rf "$MEMBERS_DIR"
+          echo "zte-mesh apk: $MESH_APK carries the entry script, all three architectures and the runtime"
+
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
@@ -514,3 +839,26 @@ jobs:
           name: build-log
           path: build.log
           if-no-files-found: ignore
+
+      # One line per file in the run summary, so the batch can be identified
+      # from the Actions page without downloading the artifact.
+      - name: Summarise the batch
+        if: always()
+        run: |
+          {
+            echo "### zte-mesh batch ${{ github.sha }}"
+            echo
+            echo '```'
+            ls -l dist 2>/dev/null || echo "no dist/"
+            cat dist/SHA256SUMS.txt 2>/dev/null || true
+            echo '```'
+            echo
+            echo 'Launcher build weights, one line per binary the apk carries:'
+            echo
+            echo '```'
+            cat launcher-weights.txt 2>/dev/null || echo "no launcher weights read"
+            echo '```'
+            echo
+            echo "Publishing is manual: download this artifact, install it on the"
+            echo "lab machines, and only then \`gh release create\` if it holds."
+          } >> "$GITHUB_STEP_SUMMARY"

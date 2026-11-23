@@ -1,8 +1,11 @@
 import struct
+import sys
 import tempfile
 import unittest
 import zlib
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "dev"))
 
 from jffs2 import EvidenceError, crc32, extract_file
 from prepare import checked, resolve_library
@@ -142,12 +145,28 @@ class PackagingTests(unittest.TestCase):
             lib = root / "lib"
             lib.mkdir()
             (lib / "actual.so").write_bytes(b"ok")
-            (lib / "alias.so").symlink_to("actual.so")
+            try:
+                (lib / "alias.so").symlink_to("actual.so")
+            except OSError as exc:
+                if getattr(exc, "winerror", None) != 1314:
+                    raise
+                self.skipTest(f"symlinks unavailable on this host: {exc}")
             self.assertEqual(resolve_library(lib, "alias.so"), lib / "actual.so")
             (root / "outside.so").write_bytes(b"no")
             (lib / "escape.so").symlink_to("../outside.so")
-            for name in ["escape.so", "../outside.so", "missing.so"]:
-                with self.assertRaises(EvidenceError):
+            with self.assertRaises(EvidenceError):
+                resolve_library(lib, "escape.so")
+
+    def test_resolve_file_and_reject_invalid_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lib = root / "lib"
+            lib.mkdir()
+            (lib / "actual.so").write_bytes(b"ok")
+            (root / "outside.so").write_bytes(b"no")
+            self.assertEqual(resolve_library(lib, "actual.so"), lib / "actual.so")
+            for name in ["../outside.so", "missing.so"]:
+                with self.subTest(name=name), self.assertRaises(EvidenceError):
                     resolve_library(lib, name)
 
 

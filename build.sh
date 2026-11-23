@@ -11,13 +11,13 @@ for tool in python3 docker unsquashfs; do
         printf 'missing tool: %s\n' "$tool" >&2; exit 1;
     }
 done
-python3 "$SCRIPT_DIR/prepare.py" --output "$OUT" --analysis-cspd
-python3 "$SCRIPT_DIR/schema.py" --verify-cspd "$OUT/analysis/cspd" \
+python3 "$SCRIPT_DIR/tools/dev/prepare.py" --output "$OUT" --analysis-cspd
+python3 "$SCRIPT_DIR/tools/dev/schema.py" --verify-cspd "$OUT/analysis/cspd" \
     --verify-libdb "$OUT/runtime/lib/libdb.so" --output "$OUT/multiap-cfg-schema.json" \
     --policies-output "$OUT/mesh-policy-schema.json"
-python3 "$SCRIPT_DIR/profile_schema.py" --verify-cspd "$OUT/analysis/cspd" \
+python3 "$SCRIPT_DIR/tools/dev/profile_schema.py" --verify-cspd "$OUT/analysis/cspd" \
     --verify-libdb "$OUT/runtime/lib/libdb.so" --output "$OUT/wlan-profile-schema.json"
-python3 "$SCRIPT_DIR/bridge_evidence.py" --libcfapi "$OUT/runtime/lib/libcfapi.so" \
+python3 "$SCRIPT_DIR/tools/dev/bridge_evidence.py" --libcfapi "$OUT/runtime/lib/libcfapi.so" \
     --output "$OUT/bridge-security-map.json"
 docker build --platform linux/arm64 -t "$IMAGE" "$SCRIPT_DIR"
 docker image inspect --format '{{.Id}}' "$IMAGE" > "$OUT/builder-image.txt"
@@ -32,4 +32,4 @@ docker run --rm --platform linux/arm64 --network none --read-only \
     --tmpfs /tmp:rw,nosuid,size=32m --pids-limit 64 --memory 256m \
     -e PYTHONDONTWRITEBYTECODE=1 \
     -v "$SCRIPT_DIR:/src:ro" -v "$OUT:/artifacts" "$IMAGE" \
-    python3 smoke.py --output /artifacts --qemu /usr/bin/qemu-arm-static
+    python3 tools/dev/smoke.py --output /artifacts --qemu /usr/bin/qemu-arm-static
