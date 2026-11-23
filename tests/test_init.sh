@@ -1687,5 +1687,59 @@ for needle in 'host_bin=$emulator' 'sha256sum "$host_bin"' 'copied $host_bin int
 	fi
 done
 
+# zte_mesh.main.log_level: written only when the option is set (every case above is byte-identical to what this
+# file wrote before the option existed), it accepts exactly the two spellings the service parses, and it never
+# reaches restart.sig - the service re-reads the config every second and copies the value straight through, so a
+# save is quiet from the next send with no restart. Deliberately outside block 8 above: this is a hand-set option
+# (documented in zte-mesh.config), and the LuCI test takes every option of that block as one the page must offer.
+UCI_TEXT="$BASE
+	option wifi_5g_ssid 'home-5'
+	option wifi_5g_key 'password-5g'
+	option log_level 'quiet'"
+run log-level-quiet 0 "version_mode=128
+radio0.enabled=1
+radio0.ssid=home
+radio0.key=password-24
+radio1.enabled=1
+radio1.ssid=home-5
+radio1.key=password-5g
+log.level=quiet"
+grep -q '^log.level=quiet$' "$RUNDIR/config" ||
+	{ echo "FAIL log-level-quiet: log.level not written"; fail=$((fail + 1)); }
+case "$(cat "$RUNDIR/restart.sig")" in
+*log_level*|*log.level*) { echo "FAIL log-level-quiet: log_level must not be in restart.sig"; fail=$((fail + 1)); } ;;
+*) pass=$((pass + 1)) ;;
+esac
+UCI_TEXT="$BASE
+	option wifi_5g_ssid 'home-5'
+	option wifi_5g_key 'password-5g'
+	option log_level 'info'"
+run log-level-info 0 "version_mode=128
+radio0.enabled=1
+radio0.ssid=home
+radio0.key=password-24
+radio1.enabled=1
+radio1.ssid=home-5
+radio1.key=password-5g
+log.level=info"
+# Absent = info = the legacy file: no log.level line at all (the service reads an absent key as info).
+UCI_TEXT="$BASE
+	option wifi_5g_ssid 'home-5'
+	option wifi_5g_key 'password-5g'"
+run log-level-absent 0 "version_mode=128
+radio0.enabled=1
+radio0.ssid=home
+radio0.key=password-24
+radio1.enabled=1
+radio1.ssid=home-5
+radio1.key=password-5g"
+grep -q 'log.level' "$RUNDIR/config" &&
+	{ echo "FAIL log-level-absent: log.level written without the option"; fail=$((fail + 1)); }
+# A third spelling would be silently ignored by the reader below (it accepts only info/quiet), so it is refused
+# here instead: a typo that quietly leaves the log at full volume is the failure this case exists to catch.
+UCI_TEXT="$BASE
+	option log_level 'verbose'"
+run log-level-bad 1 "log_level must be info or quiet"
+
 echo "init test: $pass passed, $fail failed"
 [ "$fail" = 0 ]

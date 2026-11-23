@@ -84,6 +84,11 @@ struct service_config {
     struct action_intent intents[ACTION_MAX];
     unsigned int intent_count;
     unsigned int ban_minutes;
+    /* log.level=quiet: the AP Metric Query heartbeat prints only when the send failed (status != 0). info (the
+     * default, and what an absent line means) prints every send - the line H-15 greps in logread for evidence
+     * the query really went out. Purely a printing decision: no daemon row, no plan, so a change is picked up
+     * by the next config read and needs no restart (it is deliberately not in restart.sig). */
+    int log_quiet;
 };
 
 struct config_stamp { dev_t device; ino_t inode; off_t size; struct timespec modified; };
@@ -182,7 +187,7 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
     uint8_t bss_seen[2][4], style_seen[2] = {0, 0}, timer_seen[TIMER_RULES];
     struct timer_rule timer_tmp[TIMER_RULES];
     unsigned int roam_seen = 0, steer_seen = 0, dual_seen = 0, v2_seen = 0, mlo_seen = 0, force_seen = 0, role_seen = 0, suffix_seen = 0, offset_seen = 0;
-    unsigned int ban_minutes_seen = 0;
+    unsigned int ban_minutes_seen = 0, log_seen = 0;
     struct wlan_acl_rule acl_slots[WLAN_ACL_RULES];
     unsigned char acl_seen[WLAN_ACL_RULES];
     struct stat info;
@@ -301,6 +306,16 @@ static int parse_config(struct service_config *config, struct config_stamp *stam
                 reject(__LINE__);
             config->mlo_enable = equals[0] - '0';
             mlo_seen = 1;
+            continue;
+        }
+        if (!strcmp(line, "log.level")) {
+            /* Optional, and purely about what this service prints: "quiet" turns the per-send AP Metric Query
+             * heartbeat off (only failed sends are logged), "info" keeps every send. An absent line is info,
+             * so a config written before this key exists behaves exactly as it did. */
+            if (log_seen || (strcmp(equals, "info") && strcmp(equals, "quiet")))
+                reject(__LINE__);
+            config->log_quiet = !strcmp(equals, "quiet");
+            log_seen = 1;
             continue;
         }
         if (!strcmp(line, "ban.mac") || !strcmp(line, "kick.mac")) {
@@ -1303,8 +1318,13 @@ static void mlo_reconcile(const struct service_config *cfg, struct mlo_push push
  *
  * The settle delay is the one the radio push uses: an agent drops what we send until it has learned this controller,
  * so a query before that is a query with no answer. A node that leaves the topology stops being asked, and its files
- * age out by themselves - which is what tells "this child reports nothing" from "this child is gone". */
-static void ap_metrics_reconcile(struct ap_metric_query peers[AP_METRIC_PEERS], time_t now)
+ * age out by themselves - which is what tells "this child reports nothing" from "this child is gone".
+ *
+ * The per-send line is the one unbounded printer in this file (one per node per 10 s, so ~17k lines a day on a
+ * two-child mesh), which is what zte_mesh.main.log_level=quiet exists for: a failed send is an event and is always
+ * logged, a successful one is suppressed. info - the default, and what an absent key means - logs every send, which
+ * is the line docs/PLAN.md H-15 greps in logread to prove the query really went out. */
+static void ap_metrics_reconcile(struct ap_metric_query peers[AP_METRIC_PEERS], time_t now, int log_quiet)
 {
     struct controller_node nodes[MAX_NODES];
     unsigned int count, i, j, k, offset, octets[6];
@@ -1355,8 +1375,12 @@ static void ap_metrics_reconcile(struct ap_metric_query peers[AP_METRIC_PEERS], 
             continue;
         status = controller_ap_metrics_query(mac);
         peers[k].next = now + AP_METRIC_INTERVAL;
-        printf("ZTE_MESH_SERVICE ap_metric_query mac=%s status=%d epoch=%ld\n", nodes[i].mac, status, (long)time(NULL));
-        fflush(NULL);
+        /* A send that failed is an event: it goes out at every level, because "the query stopped going out" is
+         * exactly what a reader of the log has to be able to see in quiet mode too. */
+        if (status || !log_quiet) {
+            printf("ZTE_MESH_SERVICE ap_metric_query mac=%s status=%d epoch=%ld\n", nodes[i].mac, status, (long)time(NULL));
+            fflush(NULL);
+        }
         asked = 1;
         cursor = (i + 1) % count;
     }
@@ -1627,6 +1651,10 @@ static void apply_new_config(struct service_config *current, struct config_stamp
     }
     *stamp = fresh;
     state->config_error[0] = 0;
+    /* log.level is a printing decision of this process, not a row the daemon knows: copy it straight through.
+     * It is read by the main loop below on the next tick, so a save on the page is quiet from the next send
+     * with no restart - which is why it stays out of restart.sig. */
+    current->log_quiet = next.log_quiet;
     sched_reset(&next, current, state);
     sched_mask(&next, state);
     if (next.version_mode != current->version_mode) {
@@ -2161,7 +2189,7 @@ int controller_service(void)
             if (!slave) {
                 radio_reconcile(&config, &state, radio_push, &radio_agent, now.tv_sec);
                 mlo_reconcile(&config, mlo_push, now.tv_sec);
-                ap_metrics_reconcile(metric_query, now.tv_sec);
+                ap_metrics_reconcile(metric_query, now.tv_sec, config.log_quiet);
                 if (!state.respawn_pending)
                     action_reconcile(1);
                 policy_notify_reconcile(&state, now.tv_sec);

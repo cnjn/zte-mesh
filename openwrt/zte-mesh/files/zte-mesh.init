@@ -764,6 +764,20 @@ write_config() {
 	config_foreach client_section zte_mesh_client
 	[ -z "$CLIENT_FAIL" ] || { rm -f "$CFG_TMP" "$PLAN_EXTRA"; return 1; }
 
+	# Service log verbosity, written only when the option is set: an untouched config keeps writing exactly the
+	# file it wrote before this option existed (the host test compares it byte for byte). `quiet` stops the per-send
+	# AP Metric Query heartbeat - the one unbounded printer in the service, one line per child every 10 s - and keeps
+	# only the sends that failed; `info` (also what an absent option means) logs every send, which is the line the
+	# install verification greps in logread. Deliberately NOT in restart.sig: the service re-reads this file every
+	# second and copies the value straight through, so a save is quiet from the next send with no restart.
+	config_get v main log_level ""
+	if [ -n "$v" ]; then
+		case "$v" in
+		info|quiet) emit log.level "$v" ;;
+		*) bad "log_level must be info or quiet"; rm -f "$CFG_TMP" "$PLAN_EXTRA"; return 1 ;;
+		esac
+	fi
+
 	mv "$CFG_TMP" "$RUNDIR/config" || { rm -f "$CFG_TMP"; return 1; }
 	echo "$VERSION_MODE" > "$RUNDIR/version_mode.host"
 
