@@ -27,6 +27,7 @@
 #include "agent-sync.h"
 #include "wlan-profiles.h"
 #include "mesh-policies.h"
+#include "zte-log-level.h"
 
 #define SERVICE_DIR "/run/zte-mesh"
 #define CONFIG_PATH SERVICE_DIR "/config"
@@ -1355,7 +1356,10 @@ static void ap_metrics_reconcile(struct ap_metric_query peers[AP_METRIC_PEERS], 
             continue;
         status = controller_ap_metrics_query(mac);
         peers[k].next = now + AP_METRIC_INTERVAL;
-        printf("ZTE_MESH_SERVICE ap_metric_query mac=%s status=%d epoch=%ld\n", nodes[i].mac, status, (long)time(NULL));
+        /* A healthy mesh sends this every ten seconds per child forever; the answer is what
+         * tells online from silent, and the failure is what a reader needs to see. */
+        if (status || zte_log_debug())
+            printf("ZTE_MESH_SERVICE ap_metric_query mac=%s status=%d epoch=%ld\n", nodes[i].mac, status, (long)time(NULL));
         fflush(NULL);
         asked = 1;
         cursor = (i + 1) % count;

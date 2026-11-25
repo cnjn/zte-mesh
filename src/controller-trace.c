@@ -22,6 +22,7 @@
 #include "controller-log.h"
 #include "controller-peer.h"
 #include "agent-ap-metrics.h"
+#include "zte-log-level.h"
 #define EXPORT __attribute__((visibility("default")))
 
 static struct log_gate gate;
@@ -224,8 +225,11 @@ static void answer_ap_metrics(int fd, const uint8_t *frame, size_t bytes, const 
     memcpy(target.sll_addr, dest, 6);
     sent = send_real(fd, reply, used, 0, (struct sockaddr *)&target, sizeof(target));
     saved = errno;
-    message("ZTE_CONTROLLER_TRACE ap_metrics_answer bytes=%u ifindex=%d sent=%d errno=%d\n",
-            (unsigned int)used, target.sll_ifindex, (int)sent, sent < 0 ? saved : 0);
+    /* One answer per query, and a query arrives every ten seconds for as long as the mesh
+     * runs: only a failed send is news at info. */
+    if (sent < 0 || zte_log_debug())
+        message("ZTE_CONTROLLER_TRACE ap_metrics_answer bytes=%u ifindex=%d sent=%d errno=%d\n",
+                (unsigned int)used, target.sll_ifindex, (int)sent, sent < 0 ? saved : 0);
     errno = saved;
 }
 EXPORT ssize_t recvfrom(int fd, void *data, size_t length, int flags,

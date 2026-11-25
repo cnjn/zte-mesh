@@ -27,6 +27,7 @@
 #include "controller-wsc-crypto.h"
 #include "controller-service.h"
 #include "agent-sync.h"
+#include "zte-log-level.h"
 #include "startup-views.inc"
 /* Where the agent role publishes the host-side Wi-Fi plan (agent-sync.c, applied by wlan-sync). */
 #define AGENT_WLAN_PLAN "/run/zte-mesh/wlan-plan"
@@ -1165,10 +1166,13 @@ int controller_agent_startup(void)
             if (slot < 8 && last_cmdu[slot] < 0) {
                 last_cmdu[slot] = (int)frame.cmdu;
                 last_mid[slot] = (int)frame.mid;
-                printf("ZTE_AGENT_WIRE rx cmdu=0x%04x mid=0x%04x bytes=%u wsc_msg_type=%u service=%u,%u epoch=%ld\n",
-                       frame.cmdu, frame.mid, frame.bytes, frame.wsc_message, frame.service_count,
-                       frame.service_first, (long)time(NULL));
-                fflush(NULL);
+                /* Every frame of a running mesh lands here, heartbeats included: shape tracing at info. */
+                if (zte_log_debug()) {
+                    printf("ZTE_AGENT_WIRE rx cmdu=0x%04x mid=0x%04x bytes=%u wsc_msg_type=%u service=%u,%u epoch=%ld\n",
+                           frame.cmdu, frame.mid, frame.bytes, frame.wsc_message, frame.service_count,
+                           frame.service_first, (long)time(NULL));
+                    fflush(NULL);
+                }
                 seen++;
             }
             if (!have_daemon) {
@@ -1189,7 +1193,8 @@ int controller_agent_startup(void)
                 unsigned int band = frame.band > 1 ? 0 : frame.band;
                 search++;
                 status = controller_autoconfig_response(frame.src, band, frame.mid);
-                printf("ZTE_AGENT_WIRE search_reply band=%u mid=0x%04x status=%d\n", band, frame.mid, status);
+                if (zte_log_debug())
+                    printf("ZTE_AGENT_WIRE search_reply band=%u mid=0x%04x status=%d\n", band, frame.mid, status);
                 fflush(NULL);
             } else if (frame.cmdu == 0x0000) {
                 /* Topology Discovery: the answer that makes the agent record us as its controller. */
@@ -1198,8 +1203,9 @@ int controller_agent_startup(void)
                 status = controller_topology_query(frame.src, 0x1200 + discovery, service);
                 topo_sent++;
                 last_topo = elapsed;
-                printf("ZTE_AGENT_WIRE topology_query mid=0x%04x discovery=%u service=%u status=%d\n",
-                       0x1200 + discovery, discovery, service, status);
+                if (zte_log_debug())
+                    printf("ZTE_AGENT_WIRE topology_query mid=0x%04x discovery=%u service=%u status=%d\n",
+                           0x1200 + discovery, discovery, service, status);
                 fflush(NULL);
             } else if (frame.cmdu == 0x0009 && frame.wsc_message == 4) {
                 /* WSC M1: the agent (enrollee) is asking for the configuration of one radio. The lab peer is
@@ -1217,11 +1223,12 @@ int controller_agent_startup(void)
                 m1_seen++;
                 m1_bytes = frame.bytes;
                 last_m1 = elapsed;
-                printf("ZTE_AGENT_WIRE radio_id=%02x:%02x:%02x:%02x:%02x:%02x text=%.6s band=%d "
-                       "mid=0x%04x duplicate=%d\n",
-                       frame.radio[0], frame.radio[1], frame.radio[2], frame.radio[3], frame.radio[4],
-                       frame.radio[5], frame.radio_bytes >= 6 ? (const char *)frame.radio : "?", band, frame.mid,
-                       duplicate);
+                if (zte_log_debug())
+                    printf("ZTE_AGENT_WIRE radio_id=%02x:%02x:%02x:%02x:%02x:%02x text=%.6s band=%d "
+                           "mid=0x%04x duplicate=%d\n",
+                           frame.radio[0], frame.radio[1], frame.radio[2], frame.radio[3], frame.radio[4],
+                           frame.radio[5], frame.radio_bytes >= 6 ? (const char *)frame.radio : "?", band, frame.mid,
+                           duplicate);
                 if (reboot) {
                     /* After the restart only the question "does it re-enrol" is open, so the M1 is counted
                      * and left unanswered: answering it would rewrite the rows with the same profile and

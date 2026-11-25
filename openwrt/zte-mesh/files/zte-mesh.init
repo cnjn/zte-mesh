@@ -1031,8 +1031,13 @@ start_service() {
 	# model (no serial) and the child's market code, as mreplay.py --identity passes them. Without them
 	# the child rejects the ZTE layer (reason=1/2): no ZTE node data, no LED or reboot actions.
 	real_model=$(model_for_radio "$(radio_class)")
+	# Info keeps the transitions and the failures; the ten-second poll successes and every received
+	# frame are debug. One switch for the service and the preload libraries alike.
+	local log_level
+	config_get log_level main log_level "info"
+	[ "$log_level" = "debug" ] || log_level=info
 	procd_set_param env ZTE_MESH_REAL_MANUFACTURER=ZTE "ZTE_MESH_REAL_MODEL=$real_model" \
-		ZTE_MESH_REAL_MARKET_SIGN=8000 "ZTE_MESH_AL_LAST=$al_last" $emulated
+		ZTE_MESH_REAL_MARKET_SIGN=8000 "ZTE_MESH_AL_LAST=$al_last" "ZTE_MESH_LOG_LEVEL=$log_level" $emulated
 	procd_set_param respawn 3600 5 0
 	procd_set_param stderr 1
 	procd_set_param stdout 1
