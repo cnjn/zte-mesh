@@ -171,7 +171,10 @@ jobs:
                    arm-linux-gnueabi-gcc --version | head -1 &&
                    ldd --version | head -1 &&
                    python3 tools/build/bootstrap-out.py &&
-                   make out/db-engine-probe ARTIFACTS=out \
+                   make out/db-engine-probe \
+                     "$PWD/out/runtime/lib/libzte_controller_trace.so" \
+                     "$PWD/out/runtime/lib/libzte_controller_profile.so" \
+                     "$PWD/out/runtime/lib/libzte_controller_route.so" ARTIFACTS=out \
                      ARMCC="arm-linux-gnueabi-gcc -D_TIME_BITS=32"' >>"$LOG" 2>&1
           rc=$?
           # The container writes out/ as root; only the copied binary has to stay
@@ -187,6 +190,18 @@ jobs:
             arm-linux-gnueabi-nm -u prebuilt/db-engine-probe 2>/dev/null | grep -E '__time64|__clock_gettime64|__ioctl_time64|__isoc23_' >>"$LOG" 2>&1 &&
               { echo "new-glibc symbols leaked into the link" >>"$LOG"; rc=3; }
             sha256sum prebuilt/db-engine-probe > prebuilt/db-engine-probe.sha256
+            # The preload libraries write the device log and call time()/clock_gettime()
+            # just like the probe, so they are compiled in the same container with the
+            # same pinned 32-bit time bits; built on the runner's glibc 2.39 they would
+            # reference __time64/__clock_gettime64, which the factory glibc 2.26 lacks.
+            for lib in libzte_controller_trace.so libzte_controller_profile.so libzte_controller_route.so; do
+              cp "out/runtime/lib/$lib" "prebuilt/$lib"
+              file "prebuilt/$lib" >>"$LOG" 2>&1
+              ls -l "prebuilt/$lib" >>"$LOG"
+              arm-linux-gnueabi-nm -u "prebuilt/$lib" 2>/dev/null | grep -E '__time64|__clock_gettime64|__ioctl_time64|__isoc23_' >>"$LOG" 2>&1 &&
+                { echo "new-glibc symbols leaked into $lib" >>"$LOG"; rc=3; }
+              sha256sum "prebuilt/$lib" > "prebuilt/$lib.sha256"
+            done
           fi
           cat "$LOG"
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
