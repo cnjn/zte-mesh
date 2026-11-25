@@ -99,10 +99,13 @@ EXPORT int GetRouteIFInfo(const char *instance, void *output)
     memcpy(data + 172, mac, sizeof(mac));
     memcpy(data + 192, &mtu, sizeof(mtu));
     memcpy(output, data, sizeof(data));
-    /* Fixed metadata only, no actual MAC/identity/profile value. */
+    /* Fixed metadata only, no actual MAC/identity/profile value. Once per process: the
+     * daemon reads this interface on every Renew, and the shape does not change. */
     {
+        static int noted;
         static const char note[] = "ZTE_CONTROLLER_ROUTE actual_private_if=1 route_bytes=532 l3_supported=0\n";
-        emit(note, sizeof(note) - 1);
+        if (!__sync_lock_test_and_set(&noted, 1))
+            emit(note, sizeof(note) - 1);
     }
     return 0;
 failed:

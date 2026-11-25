@@ -65,7 +65,12 @@ static void log_status(const char *api, int status)
     static atomic_uint count;
     char text[128];
     int n;
-    if (atomic_fetch_add(&count, 1) >= 48) return;
+    /* A successful read is the steady state, not news: the daemon asks again on every
+     * Renew, and 48 of those lines were what a reader saw instead of the failures. Only
+     * the failures are logged, still capped so a view that can never be read cannot
+     * fill the ring by itself. */
+    if (status == 0) return;
+    if (atomic_fetch_add(&count, 1) >= 16) return;
     n = snprintf(text, sizeof(text), "ZTE_CM_PROFILE api=%s status=%d logical_profile=1 hardware_claimed=0\n", api, status);
     if (n > 0 && (size_t)n < sizeof(text)) emit(text, (size_t)n);
 }

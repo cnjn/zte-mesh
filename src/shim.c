@@ -91,7 +91,7 @@ static void *next_symbol(const char *name)
 /* qemu-user cannot honour a fixed-address shmat(): the attach is emulated as an
  * mmap() over the reservation that holds the guest address space, and that mmap
  * fails with EINVAL unless SHM_REMAP lets it replace the placeholder mapping
- * (measured on qemu 6.2 with a fixed-address shmat() probe: every fixed address fails,
+ * (measured on qemu 6.2 with tools/lab/shm-fixed.c: every fixed address fails,
  * the same address with SHM_REMAP succeeds). The factory database engine attaches
  * its segment at a fixed address and dereferences the result, so an emulated lab
  * run needs the flag. A device run must keep the exact semantics the daemon
@@ -184,15 +184,21 @@ EXPORT int DBShmCliInit(void)
 
 EXPORT int dbAPIGetView(const char *view, const char *instance, void *data)
 {
+    static unsigned read_calls, read_failures;
     int (*real_get)(const char *, const char *, void *);
     int result;
-    log_record("ZTE_MESH_SHIM call=dbAPIGetView view=%.64s\n", view ? view : "(null)");
+    /* The first few calls name every view this sandbox reads; after that the same
+     * sentence repeated per Renew is what filled the ring. Failures keep their own cap,
+     * because an unreadable view is the one thing here worth seeing again. */
+    if (__sync_fetch_and_add(&read_calls, 1) < 16)
+        log_record("ZTE_MESH_SHIM call=dbAPIGetView view=%.64s\n", view ? view : "(null)");
     if (!trace_mode) {
         log_record("ZTE_MESH_SHIM stop reason=unexpected-database-read-in-probe exit=78\n");
         _exit(PROBE_STOP);
     }
     real_get = (int (*)(const char *, const char *, void *))next_symbol("dbAPIGetView");
     result = real_get(view, instance, data);
-    log_record("ZTE_MESH_SHIM return=dbAPIGetView status=%d\n", result);
+    if (result && __sync_fetch_and_add(&read_failures, 1) < 16)
+        log_record("ZTE_MESH_SHIM return=dbAPIGetView status=%d\n", result);
     return result;
 }
