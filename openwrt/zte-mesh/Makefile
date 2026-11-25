@@ -31,7 +31,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=zte-mesh
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=28
+PKG_RELEASE:=29
 PKG_LICENSE:=GPL-2.0-only
 # The tarball carries proprietary ARM32 vendor code; keep it out of shared builds.
 PKG_FLAGS:=nonshared
