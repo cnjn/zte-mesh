@@ -706,3 +706,15 @@ msgstr "还没看到任何设备：本机没有 DHCP 租约、没有邻居表记
 
 msgid "What this router can see itself: its DHCP leases, the neighbour table and the stations on its own access points. A device attached to another router of the mesh is not here, because the controller learns a station count per network and not which stations those are."
 msgstr "本机自己看得到的设备：它的 DHCP 租约、邻居表，以及关联在它自己无线网络上的终端。挂在组网中别的路由器上的设备不在这里——控制器只知道每个网络有几个终端，不知道是哪几个。"
+
+msgid "Service log level"
+msgstr "服务日志级别"
+
+msgid "Info: log every query send"
+msgstr "详细：记录每次发送"
+
+msgid "Quiet: log only failed sends"
+msgstr "静默：只记录发送失败的"
+
+msgid "How much the mesh service writes to the system log. Info (default): one line for every AP Metric Query the controller sends, one per child router every 10 seconds. Quiet: only sends that failed are logged; role, topology, schedule and error lines appear at both levels. Takes effect on the next send, no restart needed."
+msgstr "服务写入系统日志的详细程度。详细（默认）：控制器每次发送 AP Metric Query 都记一行，每个子节点每 10 秒一行；静默：只记录发送失败的查询，角色、拓扑、定时和错误行在两个级别下都会记录。下一次发送即生效，无需重启。"

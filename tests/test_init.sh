@@ -328,7 +328,8 @@ UCI_TEXT="config zte_mesh 'main'
 	option extra_slots '1'
 	option backhaul 'multi_ap'
 	option wifi_2g 'radio2'
-	option wifi_5g 'radio1'"
+	option wifi_5g 'radio1'
+	option log_level 'quiet'"
 run all-options 0 "version_mode=128
 radio0.enabled=1
 radio0.ssid=cc
@@ -356,7 +357,8 @@ band_steer.rssi24=-60
 band_steer.rssi5=-110
 roam.rssi24=-60
 roam.rssi5=-70
-ban.minutes=30"
+ban.minutes=30
+log.level=quiet"
 [ "$(cat "$RUNDIR/restart.sig")" = "band_steer.enabled band_steer.rssi24 band_steer.rssi5 mesh.role mlo.enable roam.force roam.rssi24 roam.rssi5 wifi.dual_band_sync 128 role=master local=on backhaul=multi_ap extra_slots=1 pin2g=radio2 pin5g=radio1 bridge=br-lan al_last= emulator= " ] ||
 	{ echo "FAIL all-options: restart.sig='$(cat "$RUNDIR/restart.sig")'"; fail=$((fail + 1)); }
 # 8b. without dual-band sync the 5 GHz band keeps its own hidden flag, security and MAC filter policy
@@ -388,7 +390,8 @@ band_steer.rssi24=-60
 band_steer.rssi5=-110
 roam.rssi24=-60
 roam.rssi5=-70
-ban.minutes=30"
+ban.minutes=30
+log.level=quiet"
 
 # 8c. mesh_role slave: the child side of the same switch, emitted verbatim (the service reads it)
 UCI_TEXT="$BASE

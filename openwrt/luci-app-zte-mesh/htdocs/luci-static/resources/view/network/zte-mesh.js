@@ -550,6 +550,15 @@ return view.extend({
 		o.default = '1';
 		o.description = _('Tell child routers whether multi-link operation is on (factory default: on). Only Wi-Fi 7 children act on it.');
 
+		/* The per-send AP Metric Query heartbeat only exists on a controller (a child never asks), so the
+		 * switch is not rendered there -- and on a child it would have nothing to quiet. */
+		o = s.taboption('general', form.ListValue, 'log_level', _('Service log level'));
+		o.value('info', _('Info: log every query send'));
+		o.value('quiet', _('Quiet: log only failed sends'));
+		o.default = 'info';
+		o.optional = true;
+		o.description = _('How much the mesh service writes to the system log. Info (default): one line for every AP Metric Query the controller sends, one per child router every 10 seconds. Quiet: only sends that failed are logged; role, topology, schedule and error lines appear at both levels. Takes effect on the next send, no restart needed.');
+
 		o = s.taboption('wifi', form.Flag, 'wifi_dual_band_sync', _('Same name and password on both bands'));
 		o.default = '1';
 		o.rmempty = false;
