@@ -15,16 +15,17 @@ name: Build lab tools
 #              recompiled here keeps the device on the old behaviour while the
 #              config it is fed already uses the new keys.
 #
-# Everything lands in the runner's prebuilt/ and is published only as the
-# "lab-tools" artifact -- nothing is committed back (prebuilt/ is git-ignored).
-# The artifact is uploaded even when a build fails, so the *-build.log files are
-# always there to read; the job conclusion still reports the truth.
-# To ship a rebuilt db-engine-probe / shim, unpack the artifact into prebuilt/ and
-# run openwrt/repack-runtime.py (docs/DEVELOPMENT.md section 10).
+# Nothing here is part of a router image, and nothing lands in the repository: the
+# outputs are published as the `lab-tools` artifact of the run. To use them, download
+# that artifact, unpack it into prebuilt/ (git-ignored) and repack the runtime with
+# `openwrt/repack-runtime.py --replace`.
 #
-# Nothing here is part of a router image.
+# The build log travels with the artifact even when a build fails, which is the only
+# way to read a failure log without a token in this setup.
 
-# Manual only.
+# Manual only. This used to run on every push to the lab-tools branch and commit its
+# own output back; nothing here should fire on its own any more (a commit landing on
+# main would otherwise start Build APK).
 on:
   workflow_dispatch:
 
@@ -57,6 +58,8 @@ jobs:
         id: nsrunarm
         run: |
           set +e
+          # prebuilt/ is git-ignored, so a fresh checkout has no such directory:
+          # the log below is the first thing that needs it.
           mkdir -p prebuilt
           LOG=prebuilt/build-aarch64.log
           : > "$LOG"
@@ -76,7 +79,7 @@ jobs:
             echo "=== aarch64-linux-gnu-gcc $opt ===" >>"$LOG"
             aarch64-linux-gnu-gcc $opt -O2 -std=c11 -static -Wall -Wextra -Werror \
               -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
-              ns-run.c controller-net.c -o prebuilt/ns-run-aarch64 >>"$LOG" 2>&1 && { rc=0; break; }
+              src/ns-run.c src/controller-net.c -o prebuilt/ns-run-aarch64 >>"$LOG" 2>&1 && { rc=0; break; }
           done
           echo "rc=$rc" >>"$LOG"
           if [ $rc -eq 0 ]; then
@@ -96,12 +99,12 @@ jobs:
           : > "$LOG"
           # Same sources and flags as the Makefile's ns-run rule; only
           # $(ROUTERCC) changes. Ubuntu's gcc predefines _FORTIFY_SOURCE, which
-          # turns the ignored write() return in controller-net.c into -Werror.
+          # turns the ignored write() return in src/controller-net.c into -Werror.
           FLAGS="-O2 -std=c11 -static -Wall -Wextra -Werror -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
           rc=1
           for cc in "musl-gcc" "gcc"; do
             echo "=== ns-run with $cc ===" >>"$LOG"
-            $cc $FLAGS ns-run.c controller-net.c -o prebuilt/ns-run-x86_64 >>"$LOG" 2>&1 \
+            $cc $FLAGS src/ns-run.c src/controller-net.c -o prebuilt/ns-run-x86_64 >>"$LOG" 2>&1 \
               && { echo "built with $cc" >>"$LOG"; rc=0; break; }
             echo "failed with $cc" >>"$LOG"
           done
@@ -130,7 +133,7 @@ jobs:
             -fno-unwind-tables -fno-asynchronous-unwind-tables \
             -march=armv7-a -mfloat-abi=soft -shared -nostdlib \
             -Wl,-z,defs -Wl,-soname,libzte_mesh_shim.so \
-            -L"$L" -Wl,-rpath-link,"$L" shim.c \
+            -L"$L" -Wl,-rpath-link,"$L" src/shim.c \
             -l:libdl.so.2 -l:libc.so.6 -l:ld-linux.so.3 -lgcc \
             -o prebuilt/libzte_mesh_shim.so >>"$LOG" 2>&1
           rc=$?
@@ -208,7 +211,7 @@ jobs:
             -fno-unwind-tables -fno-asynchronous-unwind-tables \
             -march=armv7-a -mfloat-abi=soft -shared -nostdlib \
             -Wl,-z,defs -Wl,-soname,libzte_agent_mm.so \
-            -L"$L" -Wl,-rpath-link,"$L" agent-mm.c \
+            -L"$L" -Wl,-rpath-link,"$L" src/agent-mm.c \
             -l:libdl.so.2 -l:libc.so.6 -l:ld-linux.so.3 -lgcc \
             -o prebuilt/libzte_agent_mm.so >>"$LOG" 2>&1
           rc=$?
