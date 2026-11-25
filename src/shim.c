@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/shm.h>
+#include <time.h>
 #include <unistd.h>
 
 #if !defined(__arm__) && !defined(ZTE_MESH_HOST_TEST)
@@ -22,6 +23,34 @@ static int trace_mode;
 static int emulated_lab;
 static unsigned int records;
 static __thread int logging;
+
+/* One line per distinct text per minute. A single startup reads the same handful of views a dozen
+ * times and the daemon repeats them on every Renew, so the identical sentence was most of what this
+ * library put in the ring. Failures name the view (below), so two different failed views still give
+ * two lines; the window only drops the repetition. */
+static int first_in_window(const char *text)
+{
+    enum { SLOTS = 16, WINDOW = 60 };
+    static struct { unsigned int hash; long window; } seen[SLOTS];
+    static unsigned int next;
+    struct timespec monotonic;
+    unsigned int i, hash = 2166136261u;
+    long window;
+    if (clock_gettime(CLOCK_MONOTONIC, &monotonic))
+        monotonic.tv_sec = 0;
+    window = monotonic.tv_sec / WINDOW;
+    while (*text)
+        hash = (hash ^ (unsigned char)*text++) * 16777619u;
+    if (!hash)
+        hash = 1;
+    for (i = 0; i < SLOTS; i++)
+        if (seen[i].hash == hash && seen[i].window == window)
+            return 0;
+    seen[next].hash = hash;
+    seen[next].window = window;
+    next = (next + 1) % SLOTS;
+    return 1;
+}
 
 /* Log API metadata only: no instance/key, returned buffers, PSKs or pointers. */
 static void log_record(const char *format, ...)
@@ -40,6 +69,11 @@ static void log_record(const char *format, ...)
     va_start(args, format);
     length = vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
+    if (length > 0 && !first_in_window(buffer)) {
+        logging = 0;
+        errno = saved_errno;
+        return;
+    }
     if (length > 0) {
         size_t total = (size_t)length < sizeof(buffer) ? (size_t)length : sizeof(buffer) - 1;
         size_t offset = 0;
@@ -199,6 +233,6 @@ EXPORT int dbAPIGetView(const char *view, const char *instance, void *data)
     real_get = (int (*)(const char *, const char *, void *))next_symbol("dbAPIGetView");
     result = real_get(view, instance, data);
     if (result && __sync_fetch_and_add(&read_failures, 1) < 16)
-        log_record("ZTE_MESH_SHIM return=dbAPIGetView status=%d\n", result);
+        log_record("ZTE_MESH_SHIM return=dbAPIGetView view=%.64s status=%d\n", view ? view : "(null)", result);
     return result;
 }

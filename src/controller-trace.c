@@ -290,8 +290,11 @@ EXPORT int dbAPILstView(const char *view, const char *instance, void *data)
     int result = real(view, instance, data), saved = errno;
     if (view && data && !strcmp(view, "P1905AcdBssCfg")) {
         uint32_t count = 0;
+        char key[48];
         if (!result) memcpy(&count, (uint8_t *)data + 8, 4);
-        message("ZTE_CONTROLLER_TRACE bss_config list_status=%d count=%u body_logged=0\n", result, count);
+        snprintf(key, sizeof(key), "bss_list:%d:%u", result, count);
+        if (first_in_window(key))
+            message("ZTE_CONTROLLER_TRACE bss_config list_status=%d count=%u body_logged=0\n", result, count);
     }
     /* Failed list reads were only visible through the vendor's "list view failed VID(%s) RVN(%s)" line,
      * which names neither the view nor anything a reader can act on, and repeats once a minute while
@@ -310,11 +313,15 @@ EXPORT int dbAPIGetView(const char *view, const char *instance, void *data)
     int result = real(view, instance, data), saved = errno;
     if (view && data && !strcmp(view, "P1905AcdBssCfg")) {
         uint32_t tag = 0, enabled = 0;
+        char key[56];
         if (!result) {
             memcpy(&tag, (uint8_t *)data + 228, 4);
             memcpy(&enabled, (uint8_t *)data + 260, 4);
         }
-        message("ZTE_CONTROLLER_TRACE bss_config get_status=%d tag=%u enabled=%u body_logged=0\n", result, tag, enabled);
+        snprintf(key, sizeof(key), "bss_get:%d:%u:%u", result, tag, enabled);
+        if (first_in_window(key))
+            message("ZTE_CONTROLLER_TRACE bss_config get_status=%d tag=%u enabled=%u body_logged=0\n", result, tag,
+                    enabled);
     }
     if (view && result) {
         /* Only a failed read is actionable here. A success is the steady state: every
@@ -410,8 +417,14 @@ EXPORT int vsnprintf(char *buffer, size_t size, const char *format, va_list ap)
                 message("ZTE_TRACE_POLL text=%.200s\n", buffer);
         }
         if (strstr(format, "Bss") || strstr(format, "bss") || strstr(format, "WLANCFG") ||
-            strstr(format, "PWKey") || strstr(format, "WEP") || strstr(format, "Wep") || strstr(format, "BeaconType"))
-            message("ZTE_CONTROLLER_TRACE bss_config vendor_format=%.120s\n", format);
+            strstr(format, "PWKey") || strstr(format, "WEP") || strstr(format, "Wep") || strstr(format, "BeaconType")) {
+            /* One startup reads the same BSS rows two dozen times; the same sentence twice is not a
+             * second fact. Keyed by the text, so a different config complaint still shows. */
+            char key[136];
+            snprintf(key, sizeof(key), "bss_fmt:%.120s", format);
+            if (first_in_window(key))
+                message("ZTE_CONTROLLER_TRACE bss_config vendor_format=%.120s\n", format);
+        }
         /* Fixed protocol rejection labels retain no MAC/SSID/key varargs and
          * have an independent packet budget; repeated DB errors cannot hide them. */
         if (strstr(format, "No one care the msg,type:"))
