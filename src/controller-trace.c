@@ -90,6 +90,17 @@ static int verbose_enabled(void)
         cached = access("/run/zte-mesh/trace-all", F_OK) == 0;
     return cached;
 }
+/* liboss writes four format-only lines when a message has no cspd to go to: the SSEND ERROR summary,
+ * "SSEND socket Message ... failed", "send msg fail" and "list view failed". The fact is permanent in
+ * this sandbox and the text is useless -- every placeholder prints as %s or %d. The same failures are
+ * now reported with their address by libzte_controller_route (bus_no_service, once a minute, with
+ * destination and event), and a failing list view is named by the dbAPILstView wrapper below, so info
+ * drops these four. Debug keeps them for a run that is watching the bus itself. */
+static int bus_failure_format(const char *format)
+{
+    return strstr(format, "SSEND to [%s],MsgId") || strstr(format, "SSEND socket Message") ||
+           strstr(format, "send msg fail") || strstr(format, "list view failed");
+}
 static void message(const char *fmt, ...)
 {
     char buffer[384];
@@ -282,6 +293,15 @@ EXPORT int dbAPILstView(const char *view, const char *instance, void *data)
         if (!result) memcpy(&count, (uint8_t *)data + 8, 4);
         message("ZTE_CONTROLLER_TRACE bss_config list_status=%d count=%u body_logged=0\n", result, count);
     }
+    /* Failed list reads were only visible through the vendor's "list view failed VID(%s) RVN(%s)" line,
+     * which names neither the view nor anything a reader can act on, and repeats once a minute while
+     * cspd is absent. Name the view here instead, keyed by status so a changed error still shows. */
+    if (view && result) {
+        char key[48];
+        snprintf(key, sizeof(key), "lst:%.40s:%d", view, result);
+        if (first_in_window(key))
+            message("ZTE_CONTROLLER_TRACE db_lst_view view=%.40s status=%d\n", view, result);
+    }
     errno = saved; return result;
 }
 EXPORT int dbAPIGetView(const char *view, const char *instance, void *data)
@@ -364,6 +384,10 @@ EXPORT int vsnprintf(char *buffer, size_t size, const char *format, va_list ap)
     result = format_real(buffer, size, format, ap); saved = errno;
     if (dladdr(__builtin_return_address(0), &info) && info.dli_sname &&
         (!strcmp(info.dli_sname, "ProcUserLog") || !strcmp(info.dli_sname, "ProcOssLogType"))) {
+        if (bus_failure_format(format) && !zte_log_debug()) {
+            errno = saved;
+            return result;
+        }
         if (strstr(format, "M1") || strstr(format, "M2") || strstr(format, "WSC"))
             message("ZTE_CONTROLLER_TRACE wsc_status vendor_format=%.120s\n", format);
         /* Opt-in firehose: while a frame shape is still being matched, the daemon's own objections are the

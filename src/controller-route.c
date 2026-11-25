@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 #define EXPORT __attribute__((visibility("default")))
 /* glibc marks write() __warn_unused_result and GCC refuses `(void)write(...)`
@@ -114,6 +115,63 @@ failed:
     return -1;
 }
 
+/* Without cspd every message addressed to it fails, and liboss prints the failure itself: four lines
+ * with no values, once a minute, forever. The address is the part a reader needs -- which endpoint the
+ * daemon is missing, with which event -- and liboss never prints it. One line per endpoint and event
+ * per minute, carrying the count of the previous minute so a one-off and a burst do not look alike;
+ * the first line of a new endpoint prints immediately with count 1. Keys are service names and event
+ * ids only: no MAC, SSID or key can reach this line. */
+static void bus_note(const char *destination, unsigned int event, int status, int error)
+{
+    enum { SLOTS = 8, WINDOW = 60 };
+    static struct { char dest[40]; unsigned int event, count; long window; int error; } seen[SLOTS];
+    static unsigned int pick;
+    long window = (long)time(NULL) / WINDOW;
+    char note[160];
+    unsigned int i, slot = SLOTS;
+    int n;
+
+    for (i = 0; i < SLOTS; i++) {
+        if (!seen[i].dest[0]) {
+            if (slot == SLOTS)
+                slot = i;
+            continue;
+        }
+        if (seen[i].event == event && !strcmp(seen[i].dest, destination)) {
+            if (seen[i].window == window) {
+                seen[i].count++;
+                return;
+            }
+            /* The window turned over: report what the previous minute saw, then start again. */
+            n = snprintf(note, sizeof(note),
+                         "ZTE_CONTROLLER_ROUTE bus_no_service dest=%s event=0x%x status=%d errno=%d count=%u\n",
+                         seen[i].dest, seen[i].event, status, seen[i].error, seen[i].count);
+            if (n > 0 && (size_t)n < sizeof(note))
+                emit(note, (size_t)n);
+            seen[i].window = window;
+            seen[i].count = 1;
+            seen[i].error = error;
+            return;
+        }
+        if (slot == SLOTS && seen[i].window != window)
+            slot = i;
+    }
+    if (slot == SLOTS) {
+        slot = pick % SLOTS;
+        pick++;
+    }
+    snprintf(seen[slot].dest, sizeof(seen[slot].dest), "%s", destination);
+    seen[slot].event = event;
+    seen[slot].window = window;
+    seen[slot].count = 1;
+    seen[slot].error = error;
+    n = snprintf(note, sizeof(note),
+                 "ZTE_CONTROLLER_ROUTE bus_no_service dest=%s event=0x%x status=%d errno=%d count=1\n",
+                 seen[slot].dest, event, status, error);
+    if (n > 0 && (size_t)n < sizeof(note))
+        emit(note, (size_t)n);
+}
+
 /* Stand-in for cspd's multiapd_mgr on one request. After a physical link-up event the ACD arms a 3 s timer; when it
  * fires, acdsCheckMultiapdRestart asks cspd.cspd.multiapd_mgr (SSEND event 0xa96e, 6 s timeout) how often the daemon
  * has been started and sends the first AP-autoconfiguration Renew of both bands only if the count is above 1, i.e.
@@ -128,6 +186,7 @@ EXPORT int SSEND(unsigned int event, void *in, unsigned int length, unsigned int
     int (*real)(unsigned int, void *, unsigned int, unsigned int, void *, void *, const char *, void *, void *, void *) =
         dlsym(RTLD_NEXT, "SSEND");
     const char *count = getenv("ZTE_MESH_START_COUNT");
+    int result, saved;
     if (event == 0xa96e && count && out && destination && !strcmp(destination, "cspd.cspd.multiapd_mgr")) {
         uint32_t reply[3] = { 0, 0, (uint32_t)strtoul(count, NULL, 10) };
         uint16_t reply_length = sizeof(reply);
@@ -137,5 +196,11 @@ EXPORT int SSEND(unsigned int event, void *in, unsigned int length, unsigned int
         return 0;
     }
     if (!real) { errno = ENOSYS; return -1; }
-    return real(event, in, length, timeout, out, out_length, destination, a7, a8, a9);
+    result = real(event, in, length, timeout, out, out_length, destination, a7, a8, a9);
+    saved = errno;
+    /* The four lines liboss prints for this carry no values; this one carries the endpoint. */
+    if (result && destination)
+        bus_note(destination, event, result, saved);
+    errno = saved;
+    return result;
 }
