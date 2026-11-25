@@ -1534,6 +1534,40 @@ for needle in 'config_get backhaul main backhaul off' \
 	fi
 done
 
+# The log level is read inside the sandbox, whose environment ns-run clears, so it travels as a flag file in the
+# exchange directory (trace-all is read the same way). The path in the header and the one written here have to be
+# the same file, or the switch compiles and is never seen. No restart either: the level is switched on to catch a
+# fault that is happening now, and a restart would drop the child routers out of the topology for a minute.
+SRC=$(dirname "$INIT")/../../../src/zte-log-level.h
+if grep -q 'ZTE_LOG_FLAG "/run/zte-mesh/log-debug"' "$SRC"; then
+	pass=$((pass + 1))
+else
+	fail=$((fail + 1)); echo "FAIL log level: the library does not read /run/zte-mesh/log-debug"
+fi
+log_level_case() {  # $1 = 1 when the flag has to exist; $2 = the UCI file
+	local got
+	rm -rf "$RUNDIR"; UCI=$T/uci; printf '%s\n' "$2" > "$UCI"
+	for _v in $LOADED; do unset "$_v"; done
+	if ! write_log_level; then
+		fail=$((fail + 1)); echo "FAIL log level: write_log_level failed"; return
+	fi
+	if [ -e "$RUNDIR/log-debug" ]; then got=1; else got=0; fi
+	if [ "$got" != "$1" ]; then
+		fail=$((fail + 1)); echo "FAIL log level: want flag=$1, $RUNDIR has '$(ls -A "$RUNDIR" 2>/dev/null | tr '\n' ' ')'"
+	elif [ "$1" = 1 ] && { [ ! -f "$RUNDIR/log-debug" ] || [ -L "$RUNDIR/log-debug" ]; }; then
+		fail=$((fail + 1)); echo "FAIL log level: the flag is not a regular file"
+	else
+		pass=$((pass + 1))
+	fi
+}
+log_level_case 0 "$BASE"
+log_level_case 1 "$BASE
+	option log_level 'debug'"
+log_level_case 0 "$BASE
+	option log_level 'info'"
+log_level_case 0 "$BASE
+	option log_level '7'"
+
 # One judgement decides two things: whether a wlan-sync instance runs, and whether the restart signature carries the
 # backhaul mode. If the two ever disagree, a save either restarts a box that applies nothing at all or leaves an
 # applier running on a mode it will never be shown -- and the instance line lives in start_service(), which this

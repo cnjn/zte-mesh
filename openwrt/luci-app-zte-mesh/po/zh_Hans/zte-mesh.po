@@ -104,6 +104,18 @@ msgstr "启用"
 msgid "LAN bridge"
 msgstr "LAN 桥"
 
+msgid "Log level"
+msgstr "日志级别"
+
+msgid "Info (quiet)"
+msgstr "info（静默）"
+
+msgid "Debug (everything)"
+msgstr "debug（全量）"
+
+msgid "Info: only the state changes and the failures reach the system log, so the ring (about a thousand lines) stays readable and this router's own Wi-Fi and DHCP lines are not pushed out by poll results. Debug: also every ten-second poll success and every received mesh frame, for chasing a fault. Takes effect within a second, without restarting the mesh."
+msgstr "info：系统日志里只留状态变化和失败，约一千行的环形缓冲区保持可读，本机 Wi-Fi、DHCP 的日志不会被轮询结果顶掉。debug：另外输出每次十秒轮询的成功行和每一帧收到的组网报文，用于排查问题。保存后一秒内生效，不重启组网。"
+
 msgid "%s enabled"
 msgstr "启用 %s"
 

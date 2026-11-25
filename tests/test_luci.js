@@ -175,7 +175,7 @@ const result = fn(...names.map(n => mocks[n]), s => s, E);
 		}
 	}
 	const text = fs.readFileSync(initTest, 'utf8');
-	const wanted = { zte_mesh: new Set(['enabled', 'bridge', 'al_last']), /* read by start_service, not by write_config */ zte_mesh_bss: new Set(['band', 'slot', 'enabled', 'ssid', 'key', 'hidden', 'security', 'acl_policy', 'access_minutes', 'force_wifi5']),
+	const wanted = { zte_mesh: new Set(['enabled', 'bridge', 'al_last', 'log_level']), /* read by start_service/reload_service, not by write_config */ zte_mesh_bss: new Set(['band', 'slot', 'enabled', 'ssid', 'key', 'hidden', 'security', 'acl_policy', 'access_minutes', 'force_wifi5']),
 	                 zte_mesh_acl: new Set(['mac', 'name', 'band', 'bss']), zte_mesh_timer: new Set(['start', 'end', 'days', 'scope']),
 	                 zte_mesh_client: new Set(['mac', 'action']), zte_mesh_node: new Set(['mac', 'name']) };
 	const block = text.slice(text.indexOf('# 8. every optional main option'), text.indexOf('run all-options'));
@@ -221,7 +221,7 @@ const result = fn(...names.map(n => mocks[n]), s => s, E);
 		/* extra_slots is not a controller setting: on a child it decides whether the slots the controller sends are put
 		 * on this router's own air, which is exactly the child's business. The two radio pins are the same: a child
 		 * with two cards on one band has to name its own. */
-		const forbidden = Object.keys(m).filter(n => n !== 'enabled' && n !== 'bridge' && n !== 'mesh_role' && n !== 'backhaul' && n !== 'extra_slots' && n !== 'wifi_2g' && n !== 'wifi_5g');
+		const forbidden = Object.keys(m).filter(n => n !== 'enabled' && n !== 'bridge' && n !== 'mesh_role' && n !== 'backhaul' && n !== 'extra_slots' && n !== 'wifi_2g' && n !== 'wifi_5g' && n !== 'log_level');
 		if (forbidden.length) { console.log('child form still offers controller settings:', forbidden.join(' ')); bad++; }
 		if (!m.backhaul) { console.log('child form lacks the backhaul choice'); bad++; }
 		if (!m.wifi_2g || !m.wifi_5g) { console.log('child form lacks the radio pins'); bad++; }

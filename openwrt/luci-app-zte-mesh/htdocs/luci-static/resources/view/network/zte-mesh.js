@@ -446,6 +446,16 @@ return view.extend({
 		o.rmempty = false;
 		o.description = _('The bridge the child routers are cabled to (up to 15 characters, default br-lan).');
 
+		/* Both roles run the service, so the level is offered on both. The init script turns it into a flag file in
+		 * the exchange directory rather than an environment variable (ns-run clears the environment), and a save
+		 * reaches the running processes within a second -- no restart, which is the point of switching it on. */
+		o = s.taboption('general', form.ListValue, 'log_level', _('Log level'));
+		o.value('info', _('Info (quiet)'));
+		o.value('debug', _('Debug (everything)'));
+		o.default = 'info';
+		o.optional = true;
+		o.description = _('Info: only the state changes and the failures reach the system log, so the ring (about a thousand lines) stays readable and this router\'s own Wi-Fi and DHCP lines are not pushed out by poll results. Debug: also every ten-second poll success and every received mesh frame, for chasing a fault. Takes effect within a second, without restarting the mesh.');
+
 		/* The controller identity a ZTE child matches on. Only the last byte is open: the first five bytes are the
 		 * shape the child's admission check expects, so a free-form address would simply be refused. The byte exists
 		 * for the one case a derivation cannot solve -- two boxes with the same LAN MAC (a cloned image). */

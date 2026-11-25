@@ -808,6 +808,33 @@ write_config() {
 	  echo "bridge=$bridge al_last=$al_last_override emulator=$emulator"; } | tr '\n' ' ' > "$RUNDIR/restart.sig"
 }
 
+# A temporary file for an atomic replace, created in the host parent of the exchange directory rather than
+# inside it: the sandbox runs as the same UID and may pre-place a symlink under any name it can guess, and a
+# write through one would land on a host file as root. Only $RUNDIR is bind-mounted into the chroot, so the
+# parent is out of its reach, and mktemp refuses a name that already exists.
+rundir_tmp() {
+	local dir=${RUNDIR%/*}
+	[ -n "$dir" ] && [ "$dir" != "$RUNDIR" ] || dir=.
+	mktemp "$dir/.zte-mesh.XXXXXX"
+}
+
+# The log level travels as a flag file, not an environment variable: ns-run clears the environment before the
+# daemon starts, so only ZTE_MESH_REAL_* crosses into the sandbox (the trace library reads trace-all the same
+# way). Both start and reload write it, so switching it on the page reaches the running service without a
+# restart -- which is the point: the level is switched on to catch a fault while it is happening.
+write_log_level() {
+	local level tmp
+	config_load zte_mesh
+	config_get level main log_level "info"
+	if [ "$level" != debug ]; then
+		rm -f "$RUNDIR/log-debug"
+		return 0
+	fi
+	mkdir -p "$RUNDIR" || return 1
+	tmp=$(rundir_tmp) || return 1
+	: > "$tmp" && mv -fT "$tmp" "$RUNDIR/log-debug" || { rm -f "$tmp"; return 1; }
+}
+
 # The three refusals that belong before procd ever gets an instance, split out of start_service() so the host
 # test can run them without /sys or procd. Each one is its own line because each is repaired differently --
 # see the comments on the three branches below (tests/test_init.sh reads the log line each branch writes).
@@ -1032,12 +1059,11 @@ start_service() {
 	# the child rejects the ZTE layer (reason=1/2): no ZTE node data, no LED or reboot actions.
 	real_model=$(model_for_radio "$(radio_class)")
 	# Info keeps the transitions and the failures; the ten-second poll successes and every received
-	# frame are debug. One switch for the service and the preload libraries alike.
-	local log_level
-	config_get log_level main log_level "info"
-	[ "$log_level" = "debug" ] || log_level=info
+	# frame are debug. The level is a flag file in the exchange directory (write_log_level), not an
+	# environment variable: ns-run clears the environment, so a variable set here would not arrive.
+	write_log_level || log "could not write $RUNDIR/log-debug; the log level stays as it was"
 	procd_set_param env ZTE_MESH_REAL_MANUFACTURER=ZTE "ZTE_MESH_REAL_MODEL=$real_model" \
-		ZTE_MESH_REAL_MARKET_SIGN=8000 "ZTE_MESH_AL_LAST=$al_last" "ZTE_MESH_LOG_LEVEL=$log_level" $emulated
+		ZTE_MESH_REAL_MARKET_SIGN=8000 "ZTE_MESH_AL_LAST=$al_last" $emulated
 	procd_set_param respawn 3600 5 0
 	procd_set_param stderr 1
 	procd_set_param stdout 1
@@ -1127,6 +1153,9 @@ reload_service() {
 		stop
 		return 1
 	fi
+	# Before the signature is compared: the level reaches the running processes through this file, so a save
+	# takes effect even when nothing about the instance set changed (and no restart is needed for it).
+	write_log_level || log "could not write $RUNDIR/log-debug; the log level stays as it was"
 	new=$(cat "$RUNDIR/restart.sig" 2>/dev/null)
 	# Values are picked up by the running controller. A different VersionMode, or an optional policy key that appeared
 	# or disappeared (the service reads those once at start), needs a restart.
@@ -1139,5 +1168,6 @@ stop_service() {
 	ip link del lab-peer >/dev/null 2>&1
 	# The plan describes a state the next start publishes again; keeping it could re-apply a stale profile.
 	# The same holds for the station counts: an old table beside a daemon that no longer runs would be answered from.
-	rm -f "$RUNDIR/state.json" "$RUNDIR/config" "$RUNDIR/restart.sig" "$RUNDIR/wlan-plan" "$RUNDIR/ap-sta"
+	rm -f "$RUNDIR/state.json" "$RUNDIR/config" "$RUNDIR/restart.sig" "$RUNDIR/wlan-plan" "$RUNDIR/ap-sta" \
+		"$RUNDIR/log-debug"
 }
