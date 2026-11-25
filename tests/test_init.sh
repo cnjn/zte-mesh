@@ -1724,5 +1724,28 @@ for needle in 'host_bin=$emulator' 'sha256sum "$host_bin"' 'copied $host_bin int
 	fi
 done
 
+# The ABI answer is a property of the CPU, so ask it with `uname` stubbed instead of calling start_service()
+# (which wants /sys and procd). The stub lives inside the command substitution, so it cannot leak into the cases
+# around this one. A 32-bit ARM userland used to fall into the catch-all: the one machine that runs the daemon
+# natively was told its CPU could not, and a qemu-arm-static in the private root was stacked on top of it.
+native_case() { # NAME UNAME-M WANT
+	local got
+	got=$(U="$2"; uname() { echo "$U"; }; arm32_native)
+	if [ "$got" = "$3" ]; then
+		pass=$((pass + 1))
+	else
+		fail=$((fail + 1)); echo "FAIL $1: arm32_native says '$got' for $2, want $3"
+	fi
+}
+native_case 'armv7l runs the daemon natively' armv7l 1
+native_case 'armv8l (32-bit userland on arm64) runs it natively' armv8l 1
+native_case 'x86_64 needs an emulator' x86_64 0
+# ... and start_service() has to ask this helper rather than carry its own copy of the table.
+if grep -qF -- 'compat=$(arm32_native)' "$INIT"; then
+	pass=$((pass + 1))
+else
+	fail=$((fail + 1)); echo 'FAIL arm32_native: start_service does not call the helper'
+fi
+
 echo "init test: $pass passed, $fail failed"
 [ "$fail" = 0 ]

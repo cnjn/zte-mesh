@@ -877,6 +877,50 @@ launcher_ready() {
 	return 0
 }
 
+# Does this kernel exec the 32-bit ARM daemon natively? 1 = yes, 0 = an emulator is needed. Split out of
+# start_service() so the host test can answer it with a stubbed `uname`; the answer depends on the CPU and, on
+# arm64, on the kernel config and nothing else in that function.
+#
+# A 32-bit ARM userland (uname -m says armv7l, armv6l, armv8l ...) is the daemon's own ABI: no COMPAT bit to
+# look for and nothing to emulate. This used to fall into the catch-all branch, which logged "this kernel
+# cannot run the 32-bit ARM daemon" on the one machine that runs it natively -- and, worse, picked up a
+# qemu-arm-static sitting in the private root and put a needless emulation layer under the daemon.
+arm32_native() {
+	case "$(uname -m)" in
+	aarch64|arm64)
+		# /proc/config.gz is the authoritative answer, but most firmware builds (the stock
+		# ImmortalWrt image on an ax3600 among them) do not ship it, and "no answer" must not
+		# be read as "no COMPAT": a board that does support it would then be pushed onto the
+		# emulator, which is not in the package, and the service would fail with execv errno=8
+		# for no reason. So when the config is missing, ask the kernel directly: exec the
+		# 32-bit loader with no arguments. Where ELF32 works it prints its own usage text;
+		# where it does not the shell falls back to reading the file as a script and reports a
+		# syntax error instead. Same trick the shell uses, just read on purpose.
+		if (zcat /proc/config.gz 2>/dev/null || cat /proc/config 2>/dev/null) | grep -q '^CONFIG_COMPAT=y$'; then
+			echo 1
+		elif [ -x "$ROOT/lib/ld-linux.so.3" ] &&
+			case "$("$ROOT/lib/ld-linux.so.3" 2>&1)" in
+			*sage:*) true ;;
+			*) false ;;
+			esac
+		then
+			echo 1
+		else
+			echo 0
+		fi
+		;;
+	armv*)
+		# 32-bit ARM userland: the daemon's own ABI, so no kernel question to ask. `armv*` cannot match
+		# the arm64 names above, and it stops at a bare `arm` -- no OpenWrt target reports that.
+		echo 1
+		;;
+	*)
+		# x86-64 and the other non-ARM CPUs can never run it natively.
+		echo 0
+		;;
+	esac
+}
+
 # The model this router advertises as its 1905 identity. A real ZTE child checks the vendor and market code
 # (REAL_CHILD.md section 2), not this string; the page and the controller list show it as the broadcasting node's
 # model, so it follows what the radios are: no radio -> ZXSLC SR1010, Wi-Fi 5 -> ZXHN Z506, Wi-Fi 6 -> ZXHN E2631,
@@ -985,31 +1029,8 @@ start_service() {
 	if [ "$emulator" = none ]; then
 		emulator=""
 	elif [ -z "$emulator" ]; then
-		compat=0
-		case "$(uname -m)" in
-		aarch64|arm64)
-			# /proc/config.gz is the authoritative answer, but most firmware builds (the stock
-			# ImmortalWrt image on an ax3600 among them) do not ship it, and "no answer" must not
-			# be read as "no COMPAT": a board that does support it would then be pushed onto the
-			# emulator, which is not in the package, and the service would fail with execv errno=8
-			# for no reason. So when the config is missing, ask the kernel directly: exec the
-			# 32-bit loader with no arguments. Where ELF32 works it prints its own usage text;
-			# where it does not the shell falls back to reading the file as a script and reports a
-			# syntax error instead. Same trick the shell uses, just read on purpose.
-			if (zcat /proc/config.gz 2>/dev/null || cat /proc/config 2>/dev/null) | grep -q '^CONFIG_COMPAT=y$'; then
-				compat=1
-			elif [ -x "$ROOT/lib/ld-linux.so.3" ]; then
-				case "$("$ROOT/lib/ld-linux.so.3" 2>&1)" in
-					*sage:*) compat=1 ;;
-					*) compat=0 ;;
-				esac
-			fi
-			;;
-		*)
-			# x86-64 and anything else can never run the ARM32 daemon natively.
-			compat=0
-			;;
-		esac
+		# Native or emulated: arm32_native() above holds the table (and why armv7l is on the native side).
+		compat=$(arm32_native)
 		if [ "$compat" = 0 ]; then
 			# The emulator is exec'd after the chroot, so it has to live inside the private root;
 			# the value passed on is the path as the sandbox sees it.
