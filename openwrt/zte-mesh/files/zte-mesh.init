@@ -826,6 +826,10 @@ write_log_level() {
 	local level tmp
 	config_load zte_mesh
 	config_get level main log_level "info"
+	# quiet is the spelling an earlier patch used for the same thing; a router that already carries it must keep
+	# booting after this image is installed, so it is read as info rather than refused. The page only offers the
+	# two current names (info / debug), and the first save from it writes one of those.
+	[ "$level" = quiet ] && level=info
 	if [ "$level" != debug ]; then
 		rm -f "$RUNDIR/log-debug"
 		return 0

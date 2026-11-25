@@ -1567,6 +1567,9 @@ log_level_case 0 "$BASE
 	option log_level 'info'"
 log_level_case 0 "$BASE
 	option log_level '7'"
+# quiet was the name an earlier patch gave info; a router already carrying it keeps booting quietly.
+log_level_case 0 "$BASE
+	option log_level 'quiet'"
 
 # One judgement decides two things: whether a wlan-sync instance runs, and whether the restart signature carries the
 # backhaul mode. If the two ever disagree, a save either restarts a box that applies nothing at all or leaves an

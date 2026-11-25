@@ -72,7 +72,7 @@
 | `backhaul` | **不写进服务配置**：`wlan-sync` 自己读这个 UCI 选项 | 回程模式，`off`（默认）或 `multi_ap`；其余取值 `write_config` 拒绝（`multi-ap` 会被当成 `off`，等于一个"设了却不动"的开关）。按角色写成两端之一，见下面"设备角色"一节 |
 | `extra_slots`、`wifi_2g`、`wifi_5g` | **不写进服务配置**：同上，`wlan-sync` 自己读 | 额外网络开关 + 两块射频的指定（`wifi-device` 段名，如 `radio1`；只在"一个频段有两块射频"时需要）。页面上和 `backhaul` 同一批，只给跑 applier 的两个角色；改任何一项都会重启 applier，见下 |
 | `band_steer*`、`roam*` | `band_steer.*`、`roam.*` | 两个频段的阈值必须成对给出 |
-| `log_level` | **不写进服务配置**：沙箱进程读 `/run/zte-mesh/log-debug` 标志文件 | `info`（默认）只留状态变化和失败；`debug` 打开十秒轮询的成功行和每一帧收到的 1905。`ns-run` 进沙箱前会 `clearenv()`，环境变量到不了守护进程和预加载库，所以走标志文件（与 `trace-all` 同一机制）；`start_service` 与 `reload_service` 都写这个文件，保存后一秒内生效、**不重启**，`log_level` 也不进 `restart.sig`。没有 `cspd` 造成的同步总线失败（`SSEND`/视图读取）在 info 下由 `libzte_controller_route` 聚合成每分钟一行 `bus_no_service dest=… event=0x… status=… errno=… count=…`（`count` 是上一分钟的次数；主控角色实测是 `dest=cspd.wlan_manage.wlan_mgr event=0x2402 errno=9`，每分钟 4 次），失败的视图由 `db_lst_view view=… status=…` 指名；原厂那四行只有占位符的格式串只在 debug 出现 |
+| `log_level` | **不写进服务配置**：沙箱进程读 `/run/zte-mesh/log-debug` 标志文件 | `info`（默认）只留状态变化和失败；`debug` 打开十秒轮询的成功行和每一帧收到的 1905。`ns-run` 进沙箱前会 `clearenv()`，环境变量到不了守护进程和预加载库，所以走标志文件（与 `trace-all` 同一机制）；`start_service` 与 `reload_service` 都写这个文件，保存后一秒内生效、**不重启**，`log_level` 也不进 `restart.sig`。没有 `cspd` 造成的同步总线失败（`SSEND`/视图读取）在 info 下由 `libzte_controller_route` 聚合成每分钟一行 `bus_no_service dest=… event=0x… status=… errno=… count=…`（`count` 是上一分钟的次数；主控角色实测是 `dest=cspd.wlan_manage.wlan_mgr event=0x2402 errno=9`，每分钟 4 次），失败的视图由 `db_lst_view view=… status=…` 指名；原厂那四行只有占位符的格式串只在 debug 出现。`quiet` 是 `info` 的旧拼写（另一份实现用的名字），照 `info` 处理，不拒绝启动 |
 | `ban_minutes` | `ban.minutes` | 0..1440 分钟，0 = 直到删除记录；对所有封禁生效，是"从第一次下发算起"的绝对时长 |
 
 ### 设备角色（两个开关）
