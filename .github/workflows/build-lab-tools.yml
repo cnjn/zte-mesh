@@ -131,7 +131,7 @@ jobs:
           # nothing newer than the gLibc 2.26 the daemon actually links against.
           arm-linux-gnueabi-gcc -O2 -std=c11 -Wall -Wextra -Werror -fPIC -fvisibility=hidden \
             -fno-unwind-tables -fno-asynchronous-unwind-tables \
-            -march=armv7-a -mfloat-abi=soft -shared -nostdlib \
+            -march=armv7-a -mfloat-abi=soft -shared -nostdlib -D_TIME_BITS=32 \
             -Wl,-z,defs -Wl,-soname,libzte_mesh_shim.so \
             -L"$L" -Wl,-rpath-link,"$L" src/shim.c \
             -l:libdl.so.2 -l:libc.so.6 -l:ld-linux.so.3 -lgcc \
