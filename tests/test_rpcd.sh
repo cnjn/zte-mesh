@@ -7,6 +7,9 @@ T=$(mktemp -d) || exit 1
 # refuse; going through pwd gives the POSIX form there and changes nothing on Linux.
 T=$(cd "$T" && pwd)
 trap 'kill $SVC 2>/dev/null; rm -rf "$T"' EXIT
+# Git Bash installs the interpreter as `python`; OpenWrt hosts and the CI container only have `python3`.
+PY=$(command -v python3 || command -v python) || { echo "test_rpcd: no python3/python" >&2; exit 1; }
+export PY
 export ZTE_MESH_RUNDIR=$T/run ZTE_MESH_ACTION_WAIT=3
 mkdir -p "$T/run/actions"
 # The stub is a python file run through a shell function of the sourcing shell: the container that runs make test-host mounts
@@ -34,12 +37,34 @@ PY
 export ZTE_JF="$T/jf.py" ZTE_PLUGIN="$PLUGIN"
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then pass=$((pass + 1)); else echo "FAIL $1: got '$2' want '$3'"; fail=$((fail + 1)); fi; }
-call() { printf '%s\n' "$2" | sh -c 'jsonfilter() { python3 "$ZTE_JF" "$@"; }; m=$1; set -- call "$m"; . "$ZTE_PLUGIN"' _ "$1" | tr -d ' \n'; }
+call() { printf '%s\n' "$2" | sh -c 'jsonfilter() { "$PY" "$ZTE_JF" "$@"; }; uci() { [ "${1:-}" = -q ] && shift
+	case "$2" in
+	zte_mesh.main.mesh_role) [ -n "$UCI_ROLE" ] && { printf "%s\n" "$UCI_ROLE"; return 0; }; return 1 ;;
+	zte_mesh.main.apply_local) [ -n "$UCI_LOCAL" ] && { printf "%s\n" "$UCI_LOCAL"; return 0; }; return 1 ;;
+	esac
+	return 1; }; m=$1; set -- call "$m"; . "$ZTE_PLUGIN"' _ "$1" | tr -d ' \n'; }
+# The same call without the whitespace squeeze: the devices answer is JSON relayed from another program, spaces and
+# all, so it is compared as it came out.
+callraw() { printf '%s\n' "$2" | sh -c 'm=$1; set -- call "$m"; . "$ZTE_PLUGIN"' _ "$1"; }
 
 # no running service (no state.json): -5
 check no-state "$(call reboot_node '{"mac":"d4:b7:09:0d:77:30"}')" '{"result":-5}'
 # list declares the methods
-check list "$(sh -c 'set -- list; . "$ZTE_PLUGIN"' | tr -d ' ')" '{"status":{},"restart":{},"reboot_node":{"mac":"str"},"light_node":{"mac":"str","on":true}}'
+check list "$(sh -c 'set -- list; . "$ZTE_PLUGIN"' | tr -d ' ')" '{"status":{},"restart":{},"devices":{},"reboot_node":{"mac":"str"},"light_node":{"mac":"str","on":true}}'
+
+# devices relays the collector's JSON untouched, and a collector that is gone or does not answer is an empty list with
+# epoch -1: the device list is read-only, so a router missing the script must still answer the page.
+printf '#!/bin/sh\ncat "$ZTE_DEV_FIX"\n' > "$T/devices.sh"
+printf '#!/bin/sh\nexit 1\n' > "$T/devices-broken.sh"
+printf '{ "epoch": 1, "devices": [ { "mac": "aa:bb:cc:dd:ee:ff", "ip": "192.168.1.7", "name": "", "ssid": "", "iface": "", "lease_end": 0, "sources": "neigh", "node": false } ] }\n' > "$T/devices.json"
+export ZTE_DEV_FIX=$T/devices.json
+export ZTE_MESH_DEVICE_LIST=$T/devices.sh
+check devices-relay "$(callraw devices '{}')" "$(cat "$T/devices.json")"
+export ZTE_MESH_DEVICE_LIST=$T/absent
+check devices-missing "$(callraw devices '{}' | tr -d ' \n')" '{"epoch":-1,"devices":[]}'
+export ZTE_MESH_DEVICE_LIST=$T/devices-broken.sh
+check devices-broken "$(callraw devices '{}' | tr -d ' \n')" '{"epoch":-1,"devices":[]}'
+unset ZTE_MESH_DEVICE_LIST
 
 # fake service: answer status 0 for every request, remember the request text
 echo '{"actions":[]}' > "$T/run/state.json"
@@ -50,6 +75,23 @@ case "$status_out" in
 *'"role":"master"'*) pass=$((pass + 1)) ;;
 *) echo "FAIL status-role: got '$status_out'"; fail=$((fail + 1)) ;;
 esac
+
+# The two axes the page draws its title from: mesh_role and apply_local. `main`/`auto` are the old spelling of a
+# broadcasting controller and must report as master with local=true, so an upgraded configuration is not shown as
+# something else; a child is never local, whatever its file says.
+for case_line in 'master||master|false' 'main||master|true' 'auto||master|true' 'master|1|master|true' \
+	'master|0|master|false' 'slave|1|slave|false'; do
+	IFS='|' read -r UCI_ROLE UCI_LOCAL want_role want_local <<EOF
+$case_line
+EOF
+	export UCI_ROLE UCI_LOCAL
+	status_out=$(call status '{}')
+	case "$status_out" in
+	*"\"role\":\"$want_role\""*"\"local\":$want_local"*) pass=$((pass + 1)) ;;
+	*) echo "FAIL status-axes: $case_line -> $status_out"; fail=$((fail + 1)) ;;
+	esac
+	unset UCI_ROLE UCI_LOCAL
+done
 
 # status also reports what the child-side applier did last: it runs outside the sandbox, so the service cannot know.
 printf 'epoch=1761740000\nresult=ok\nchanged=1\nbands=2g 5g\nmessage=\n' > "$T/run/wlan-sync.status"

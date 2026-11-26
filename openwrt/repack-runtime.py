@@ -18,8 +18,7 @@ Two reasons it exists:
     setter and another M1.
 
 Order, modes and the SHA256SUMS format follow make-runtime.py so the result is
-the same archive it would have produced with those files in out/. prebuilt/ below is
-where the lab-tools artifact of build-lab-tools.yml was unpacked (ignored by git).
+the same archive it would have produced with those files in out/.
 
   python3 openwrt/repack-runtime.py \\
       --replace root/lib/libzte_mesh_shim.so=prebuilt/libzte_mesh_shim.so \\

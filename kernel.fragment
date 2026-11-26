@@ -1,6 +1,0 @@
-# Requirements for native ARM32 vendor libraries on an ARM64 OpenWrt kernel.
-# NOT automatically applied. Rebuild the actual OpenWrt kernel separately;
-# do not replace the live firmware or use the diagnostic FIT builder blindly.
-CONFIG_COMPAT=y
-CONFIG_SYSVIPC=y
-CONFIG_PACKET=y
